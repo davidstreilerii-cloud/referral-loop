@@ -71,16 +71,24 @@ Work: `store.py` gains a content-key column and a second dedup path with its own
 
 ## RESOLVED 2026-07-26 — persistent MRN alias table
 
-**Decision: build it.** Four sub-decisions taken with it:
+**Decision: build it.** The four sub-decisions come from spec `c9680b3`, **not** from the earlier draft of this section. I wrote three of them wrong here first and the commit that claimed to correct them corrected the dispatch message, not this file. Corrected now; the superseded versions are recorded at the bottom because getting them wrong is instructive.
 
-- **No expiry.** An alias records a fact the hospital asserted — these are one patient — and that does not decay. The mistyped-`A40` risk is handled by correctability instead: a later `A40` supersedes an earlier one, latest-wins, both stay in the log. An expiring alias is strictly worse, because it silently resumes stranding loops at an arbitrary future moment with no event to explain why.
-- **Aliases chain.** A→B then B→C resolves A→C, or the second hop strands everything the first moved.
-- **Cycles terminate.** A→B→A is a real registration outcome: detect, stop, log, return where you stopped, and cap chain depth so a pathological chain cannot hang the interface.
-- **Resolution at write time, covering matching as well as creation.** `open_loop` resolves before storing, so loops always carry the current identifier and every existing query keeps working. A result arriving on a retired MRN has the same problem as an order, so the matcher resolves too.
+- **No expiry.** An alias records a fact the hospital asserted — these are one patient — and that does not decay. Expiry is the wrong instrument for the mistyped-`A40` risk that motivates it: it makes *correct* aliases fail while doing nothing about incorrect ones, which do their damage immediately. The mitigation is an explicit **administrative reversal**, recorded as an event exactly like the acknowledgement reversal in rule 4, never a deletion — plus surfacing alias creation on the worklist so a coordinator sees a merge happen rather than inferring it from missing work.
+- **Aliases chain, and compress on WRITE.** A→B then B→C resolves A→C, and the compression happens when B→C is recorded, not when A is looked up. Read-time chasing puts unbounded work on every inbound message and turns a cycle into a hang; write-time compression makes resolution a single lookup forever and concentrates the one place a cycle can be detected.
+- **A circular merge is REFUSED, not resolved.** If compressing would leave any identifier pointing at itself, the merge is rejected: alias table unmodified, no loop moved, event logged, flagged for a human. Last-writer-wins would silently pick an arbitrary survivor and strand every loop on the losing side — this section's own failure mode, chosen deliberately. A circular merge is an upstream registration error and needs a person, not a tiebreak. Same posture as the confidence floor: decline rather than guess.
+- **Resolution happens ONCE, at ingest, before registry or matcher.** Not in `open_loop` and again in the matcher — "two call sites that will eventually disagree". Tiers 3 and 4 both key on MRN, so an unresolved alias silently demotes a matchable result to an orphan. The raw archive keeps the message verbatim; everything downstream sees the surviving identifier.
 
-Stored in an append-only `mrn_alias_events` table under the same `BEFORE DELETE`/`BEFORE UPDATE` triggers as `loop_events` — an alias silently edited is a patient's loops silently redirected. `open_loop` records the pre-resolution value as `submitted_mrn`, so an auditor asking why a loop sits on a patient the message did not name has an answer in the log.
+Stored as append-only `mrn_alias_events` under the same tamper triggers as `loop_events`, with `mrn_aliases(retired_mrn, surviving_mrn, established_at, established_by)` as the compressed projection over it, so §10.5 reconstruction still holds.
 
-The original problem statement follows, for the record.
+**One guard sits inside `open_loop` despite the single-resolution-point rule, and it is not a second call site.** Resolving at ingest opens a window: the listener resolves, a merge commits, and the loop is then written onto an MRN retired microseconds ago — invisible to the surviving patient *and* to that merge's straggler scan, which has already run. The guard never chooses an identity; it only refuses one that has stopped being current, converting a silent invisibility into a loud retryable error. Accepted.
+
+### Superseded — what I got wrong, and why it mattered
+
+1. *"Cycles terminate: detect, stop, return where you stopped, cap chain depth."* This is last-writer-wins wearing a safety word. Something has to give when a cycle resolves, and what gives is every loop on the losing side — the precise failure this table exists to prevent. "Make it terminate" answered the wrong question; the right one is what happens to the loops.
+2. *"`open_loop` resolves, and the matcher resolves too."* Two independent resolution points that drift apart, which the spec had already ruled out.
+3. *"Walk the chain at read time with a depth cap."* Unbounded per-message work on the hot path, and a cycle becomes a hang rather than a refusal.
+
+The pattern in all three: I invented new reasoning where the spec already had a principle — decline rather than guess — that answered it.
 
 ---
 
