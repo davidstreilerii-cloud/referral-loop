@@ -1,7 +1,12 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from healthcare_rag.referral_loop.errors import FramingError
 from healthcare_rag.referral_loop.mllp import VT, FS, CR, build_ack, deframe, frame
+from healthcare_rag.referral_loop.parse_hl7 import (
+    MSH_CONTROL_ID, MSH_MESSAGE_TYPE, parse_hl7_text,
+)
 
 
 def test_frame_wraps_in_vt_fs_cr():
@@ -40,6 +45,22 @@ def test_empty_but_well_formed_frame_returns_empty_string():
     assert deframe(VT + FS + CR) == ""
 
 
+def test_frame_rejects_embedded_fs():
+    """A body containing FS would let a stream reader split one message into
+    two -- the truncated half parses cleanly and would be answered AA while the
+    remainder is silently discarded."""
+    with pytest.raises(FramingError):
+        frame("MSH|^~\\&|OK\x1cORC|NW|CRITICAL-ORDER")
+
+
+def test_deframe_rejects_embedded_fs():
+    """Even if a hostile/malformed frame reaches deframe directly (bypassing
+    frame()), an embedded FS must not be silently accepted as message content."""
+    hostile = VT + b"MSH|^~\\&|OK\x1cORC|NW|CRITICAL-ORDER" + FS + CR
+    with pytest.raises(FramingError):
+        deframe(hostile)
+
+
 @pytest.mark.parametrize("hostile", [
     "CTRL|INJECTED",
     "CTRL\rMSH|^~\\&|EVIL|EVIL|||||ADT^A40|FORGED|P|2.5.1",
@@ -47,12 +68,12 @@ def test_empty_but_well_formed_frame_returns_empty_string():
     "A" * 100,
     "",
     "^~\\&",
+    "REF.MSH",
+    "MSA",
 ])
 def test_ack_cannot_be_injected_through_control_id(hostile):
     """control_id is MSH-10 of an untrusted inbound message."""
     ack = build_ack(hostile, "AA")
-    assert ack.count("MSH|") == 1, "a forged second MSH segment was emitted"
-    assert ack.count("MSA|") == 1
     assert ack.endswith("\r")
     # Exactly two segments, and the MSH must still have its fields in place.
     segments = [s for s in ack.split("\r") if s]
@@ -61,15 +82,47 @@ def test_ack_cannot_be_injected_through_control_id(hostile):
 
 
 def test_sanitized_ack_round_trips_through_our_own_parser():
-    """The ACK we emit must parse as the ACK we meant to emit."""
-    from healthcare_rag.referral_loop.parse_hl7 import (
-        MSH_CONTROL_ID, MSH_MESSAGE_TYPE, parse_hl7_text,
+    """The ACK we emit must parse as the ACK we meant to emit. MSH-10 is now a
+    fresh id generated for the ACK itself (not the echoed inbound control id),
+    so pin it via the ack_id parameter for a deterministic assertion."""
+    ack = build_ack(
+        "CTRL\rMSH|^~\\&|EVIL|EVIL|||||ADT^A40|FORGED|P|2.5.1",
+        "AA",
+        ack_id="ACKFIXED123",
     )
-    ack = build_ack("CTRL\rMSH|^~\\&|EVIL|EVIL|||||ADT^A40|FORGED|P|2.5.1", "AA")
     parsed = parse_hl7_text(ack)
     assert parsed.segments["MSH"][0][MSH_MESSAGE_TYPE] == "ACK"
-    assert parsed.segments["MSH"][0][MSH_CONTROL_ID] == "CTRLMSHEVILEVILADTA4"
+    assert parsed.segments["MSH"][0][MSH_CONTROL_ID] == "ACKFIXED123"
 
 
 def test_control_id_that_sanitizes_to_nothing_gets_a_placeholder():
     assert "UNKNOWN" in build_ack("|||", "AE")
+
+
+def test_ack_msh7_datetime_is_populated():
+    """MSH-7 (Date/Time of Message) is required in v2.5.1. A strict
+    conformance profile rejects an ACK with it empty, which means the engine
+    retries forever -- the exact failure sanitize_control_id exists to avoid."""
+    fixed_now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+    ack = build_ack("CTRL1", "AA", now=fixed_now)
+    msh = ack.splitlines()[0].split("|")
+    assert msh[6] == "20260726120000"
+
+
+def test_ack_msh10_differs_from_inbound_control_id_msa2_echoes_it():
+    """MSH-10 must be a fresh id for the ACK; the inbound control id belongs in
+    MSA-2. Reusing the inbound id in MSH-10 lets an engine that de-duplicates
+    on MSH-10 drop the ACK as a replay of the original message."""
+    ack = build_ack("CTRL1", "AA")
+    msh_fields = ack.splitlines()[0].split("|")
+    msa_fields = ack.splitlines()[1].split("|")
+    assert msh_fields[9] != "CTRL1"
+    assert msa_fields[2] == "CTRL1"
+
+
+def test_two_acks_for_same_inbound_id_have_different_msh10():
+    ack1 = build_ack("CTRL1", "AA")
+    ack2 = build_ack("CTRL1", "AA")
+    msh10_1 = ack1.splitlines()[0].split("|")[9]
+    msh10_2 = ack2.splitlines()[0].split("|")[9]
+    assert msh10_1 != msh10_2
