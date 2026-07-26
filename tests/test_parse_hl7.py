@@ -60,3 +60,39 @@ def test_unknown_message_type_never_raises():
     msg = parse_hl7_text(unknown)
     assert msg.message_type == "ZZZ^Z99"
     assert msg.is_known_type is False
+
+
+def test_prefix_colliding_segment_id_is_not_allowlisted():
+    """OBXTRA starts with OBX but is not OBX. An allowlist that prefix-matches
+    is not an allowlist -- it would let a non-allowlisted segment's content
+    reach Python objects."""
+    msg = parse_hl7_text(
+        "MSH|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|CTRL0001|P|2.5.1\r"
+        "OBXTRA|1|TX|CODE||SENTINEL_LEAK||||||F\r"
+    )
+    assert msg.segments.get("OBX") is None
+    import dataclasses, json
+    assert "SENTINEL_LEAK" not in json.dumps(dataclasses.asdict(msg), default=str)
+
+
+def test_msh_lookalike_does_not_set_a_wrong_control_id():
+    """MSH-10 is the idempotency key. A silently wrong value is worse than none."""
+    msg = parse_hl7_text("MSHX|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|CTRL0001|P|2.5.1\r")
+    assert msg.control_id == ""
+    assert msg.message_type == ""
+
+
+def test_bare_three_char_segment_is_still_accepted():
+    """len(raw) == 3 is a valid, empty segment -- it must still be flagged for
+    review rather than silently dropped by the new exactness check."""
+    msg = parse_hl7_text(
+        "MSH|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|CTRL0001|P|2.5.1\r"
+        "OBR\r"
+    )
+    assert "OBR" in msg.flags_for_review
+
+
+def test_run_together_segment_ids_are_rejected():
+    msg = parse_hl7_text("MSHPIDOBROBX\r")
+    assert msg.segments == {}
+    assert msg.control_id == ""

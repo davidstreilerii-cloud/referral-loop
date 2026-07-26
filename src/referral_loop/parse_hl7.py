@@ -49,14 +49,16 @@ def parse_hl7_text(text: str) -> ParsedMessage:
     message_type = ""
 
     for raw in raw_segments:
+        # Exact segment-id match, not a prefix match. `raw[:3] in ALLOWED_SEGMENTS`
+        # alone would ingest "OBXTRA|..." as an OBX, letting a non-allowlisted
+        # segment's content reach Python objects -- the one thing the allowlist
+        # exists to prevent. HL7 v2 ids are always exactly 3 characters, so a
+        # conformant sender never trips this; that is precisely the reasoning this
+        # module rejects for denylists, so it is enforced rather than assumed.
         seg_id = raw[:3]
-        if seg_id not in ALLOWED_SEGMENTS:
+        if seg_id not in ALLOWED_SEGMENTS or not (len(raw) == 3 or raw[3] == "|"):
             continue
-        try:
-            fields = _split_fields(raw)
-        except Exception:
-            flags.append(seg_id)
-            continue
+        fields = _split_fields(raw)
 
         if seg_id == "MSH":
             # MSH-1 is the field separator itself, so MSH fields shift by one.
