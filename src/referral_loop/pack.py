@@ -16,12 +16,15 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .errors import PackVerificationError
+from .parse_hl7 import ALLOWED_SEGMENTS
 
-# SEG-N or SEG-N.C: a 3-letter HL7 segment id, a positive field number, and an
-# optional positive component number (components are ^-delimited within a
-# field). Field *placement* varies by site/RIS; field *concept* names (this
-# regex governs what a placement string may look like) do not.
-_FIELD_REF_RE = re.compile(r"^[A-Z]{3}-[1-9][0-9]*(\.[1-9][0-9]*)?$")
+# SEG-N or SEG-N.C: a 3-character HL7 segment id (a letter followed by two
+# alphanumeric characters -- HL7 segment ids are not always all-letters, e.g.
+# PV1, RF1, NK1, GT1), a positive field number, and an optional positive
+# component number (components are ^-delimited within a field). Field
+# *placement* varies by site/RIS; field *concept* names (this regex governs
+# what a placement string may look like) do not.
+_FIELD_REF_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-[1-9][0-9]*(\.[1-9][0-9]*)?$")
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,12 @@ class RulePack:
         Raises PackVerificationError for an unknown concept rather than returning
         an empty tuple -- a typo'd concept silently matching nothing is exactly the
         failure mode that turns a tier into a false negative.
+
+        Behaviour note for callers walking this list (the matcher, Task 8): a
+        candidate naming a segment-field absent from the message is not an
+        error. Fall through to the next candidate for that concept; if all are
+        absent, the tier simply does not fire. Never raise, never a partial
+        match on a missing field.
         """
         try:
             return tuple(self.field_map[concept])
@@ -137,6 +146,19 @@ def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
             if not isinstance(entry, str) or not _FIELD_REF_RE.match(entry):
                 raise PackVerificationError(
                     f"field_map['{concept}'] has a malformed field reference: {entry!r}"
+                )
+            # A pack must not be able to widen the parser's read surface. NK1
+            # (next of kin) and GT1 (guarantor) are deliberately excluded from
+            # ALLOWED_SEGMENTS; a field map naming them would turn the signed
+            # pack into a route around parse_hl7's PHI boundary. This is the
+            # mistake case, not an attacker-without-the-key case: someone
+            # onboarding a site maps a concept to whatever field a sample
+            # message happened to show.
+            segment = entry.split("-", 1)[0]
+            if segment not in ALLOWED_SEGMENTS:
+                raise PackVerificationError(
+                    f"field_map['{concept}'] names segment {segment!r}, which is "
+                    f"outside ALLOWED_SEGMENTS; refusing to widen the parser's read surface"
                 )
 
     try:

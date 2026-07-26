@@ -217,3 +217,33 @@ def test_field_candidates_priority_order_preserved():
         "OBR-3", "ORC-3", "OBR-18", "OBR-19",
     )
     assert pack.field_candidates("mrn") == ("PID-3.1",)
+
+
+@pytest.mark.parametrize("out_of_allowlist_entry", ["NK1-2", "GT1-3", "NTE-3"])
+def test_field_map_segment_outside_allowlist_refused(tmp_path, out_of_allowlist_entry):
+    """A pack must not be able to widen the parser's read surface.
+
+    NK1 (next of kin) and GT1 (guarantor) are deliberately excluded from
+    ALLOWED_SEGMENTS so a PHI-sentinel proof has something real to assert. A
+    field map naming them would turn the signed pack into a route around
+    parse_hl7's PHI boundary -- this is the mistake case (someone onboarding a
+    site maps a concept to whatever field a sample message happened to show),
+    not an attacker-without-the-key case.
+    """
+    broken = {
+        **PACK,
+        "field_map": {**PACK["field_map"], "mrn": [out_of_allowlist_entry]},
+    }
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="ALLOWED_SEGMENTS"):
+        load_pack(tmp_path, pubkey)
+
+
+def test_legal_remap_within_allowlist_still_loads(tmp_path):
+    remapped = {
+        **PACK,
+        "field_map": {**PACK["field_map"], "filler_order_number": ["OBR-18"]},
+    }
+    pubkey = _write_pack(tmp_path, remapped)
+    pack = load_pack(tmp_path, pubkey)
+    assert pack.field_candidates("filler_order_number") == ("OBR-18",)
