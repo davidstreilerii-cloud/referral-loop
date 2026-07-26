@@ -1,4 +1,10 @@
-from healthcare_rag.referral_loop.parse_hl7 import ALLOWED_SEGMENTS, parse_hl7_text
+from healthcare_rag.referral_loop.parse_hl7 import (
+    ALLOWED_SEGMENTS,
+    OBR_FILLER_ORDER_NUMBER,
+    OBR_PLACER_ORDER_NUMBER,
+    OBX_RESULT_STATUS,
+    parse_hl7_text,
+)
 
 ORU = (
     "MSH|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|CTRL0001|P|2.5.1\r"
@@ -32,9 +38,9 @@ def test_parses_control_id_and_type():
 def test_extracts_allowlisted_fields():
     msg = parse_hl7_text(ORU)
     obr = msg.segments["OBR"][0]
-    assert obr[2] == "PLACER987"   # OBR-2 placer order number
-    assert obr[3] == "FILLER654"   # OBR-3 filler order number
-    assert msg.segments["OBX"][0][11] == "F"  # OBX-11 result status
+    assert obr[OBR_PLACER_ORDER_NUMBER] == "PLACER987"
+    assert obr[OBR_FILLER_ORDER_NUMBER] == "FILLER654"
+    assert msg.segments["OBX"][0][OBX_RESULT_STATUS] == "F"
 
 
 def test_unparseable_segment_is_skipped_message_kept():
@@ -96,3 +102,23 @@ def test_run_together_segment_ids_are_rejected():
     msg = parse_hl7_text("MSHPIDOBROBX\r")
     assert msg.segments == {}
     assert msg.control_id == ""
+
+
+def test_long_segments_keep_every_field():
+    """PV1 and OBR legitimately exceed 32 fields. Dropping the tail silently
+    would be the one thing this parser promises not to do."""
+    long_pv1 = "PV1|" + "|".join(str(i) for i in range(1, 60))
+    msg = parse_hl7_text(
+        "MSH|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|CTRL0001|P|2.5.1\r"
+        + long_pv1 + "\r"
+    )
+    pv1 = msg.segments["PV1"][0]
+    assert pv1[59] == "59", "field 59 must survive"
+
+
+def test_short_segments_are_padded_for_safe_indexing():
+    msg = parse_hl7_text(
+        "MSH|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|CTRL0001|P|2.5.1\r"
+        "OBR|1|PLACER1\r"
+    )
+    assert msg.segments["OBR"][0][11] == "", "indexing past the end must not raise"
