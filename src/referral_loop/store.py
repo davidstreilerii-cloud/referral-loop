@@ -895,9 +895,14 @@ class LoopStore:
             finally:
                 conn.close()
         self.rebuild_alias_projection()
+        # Neither identifier and, above all, not the reason. A log record is one
+        # of the four artifacts spec test 14 greps, and the reason is free text a
+        # human typed about a patient -- the unbounded free-text channel. Both are already
+        # in mrn_alias_events, which is append-only and where the audit needs
+        # them; this line exists so an operator sees a reversal happened.
         logger.warning(
-            "MRN alias %s -> %s reversed by %s (%s): %s",
-            retired_mrn, surviving, actor, role, reason,
+            "An MRN alias was reversed by %s (%s) under control id %r; the identifiers "
+            "and the reason are recorded in mrn_alias_events.", actor, role, control_id,
         )
         return retired_mrn, surviving
 

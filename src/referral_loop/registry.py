@@ -69,6 +69,22 @@ aliases do not expire and are undone only by an explicit reversal
 is one lookup (store._apply_alias); a merge that would make an identity cyclic
 is refused outright rather than resolved by rule (errors.CircularMergeError);
 and resolution happens at one call site rather than at each writer.
+
+Audit. Five methods here change clinical-facing state on a human's or an
+administrator's say-so -- acknowledge, reverse_acknowledgement, dismiss_orphan,
+merge_patient, reverse_merge -- and each is wrapped in `audit.audited`, which
+appends one row to the immutable audit database per *attempt*, refusals
+included. Wrapped rather than called at the end of the happy path, because a
+refused acknowledgement on a preliminary read is exactly the event a risk
+officer asks about, and an audit that only records successes cannot answer them.
+
+Nothing else here is audited. The message-driven transitions -- open_loop,
+orphan, schedule, cancel, record_result -- are already held verbatim and durably
+in the raw archive, so copying them into a second exportable database would
+double the PHI footprint for no added assurance.
+
+The audit never blocks a transition and never receives an MRN, a reason, or any
+other message-derived string; audit.py owns both decisions and the reasoning.
 """
 from __future__ import annotations
 
@@ -77,6 +93,13 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
+from .audit import (
+    ENGINE_ACTOR,
+    SYSTEM_ROLE,
+    AuditAction,
+    RefusalCode,
+    audited,
+)
 from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
 from .events import Loop, LoopEvent, LoopState
 from .store import LoopStore
@@ -330,6 +353,23 @@ class Registry:
         open across thousands of loops in one transaction would block the
         interface instead.
         """
+        # Message-driven, so the actor is the engine rather than a person, and
+        # neither MRN reaches the audit: the identifiers are the one part of the
+        # alias log that must not leave the building. What is recorded is that a
+        # merge happened, when, and how many loops it moved -- the MSH-10 join
+        # lives in mrn_alias_events, which the same auditor already has.
+        with audited(
+            AuditAction.PATIENT_MERGED, actor=ENGINE_ACTOR, role=SYSTEM_ROLE
+        ) as scope:
+            return self._merge_patient(prior_mrn, surviving_mrn, control_id, message_at, scope)
+
+    def _merge_patient(self, prior_mrn, surviving_mrn, control_id, message_at, scope) -> list[str]:
+        """The body of merge_patient, split out only so the audit wraps it.
+
+        Same reason as _reverse_merge: the audited block must cover the circular-
+        merge refusal too, and re-indenting the whole method to get that would
+        make the diff unreadable.
+        """
         if not prior_mrn or not surviving_mrn:
             # An empty surviving MRN would blank the identifier on every loop it
             # touched, which open_loop refuses for exactly the same reason: the
@@ -348,9 +388,14 @@ class Registry:
             # become acceptable. Logged because it is more likely to mean the
             # MRG-1 field map is wrong than that registration really merged a
             # patient into themselves.
+            # The control id and not the MRN. A log record is one of the four
+            # artifacts spec test 14 greps, and an identifier is an identifier
+            # whether it arrived on a page or in a log line; the MSH-10 is
+            # enough to find the message, and the message is in the archive.
             logger.warning(
-                "ADT^A40 %s merges MRN %s into itself; no loops moved", control_id, prior_mrn
+                "ADT^A40 %s merges an MRN into itself; no loops moved", control_id
             )
+            scope.loops_moved = 0
             return []
 
         moved: list[str] = []
@@ -377,8 +422,8 @@ class Registry:
             surviving = self.store.resolve_mrn(surviving_mrn)
             if applied is None:
                 logger.info(
-                    "ADT^A40 %s: %s is already retired into %s; no new alias recorded",
-                    control_id, prior_mrn, surviving,
+                    "ADT^A40 %s: the prior MRN is already retired into the surviving one; "
+                    "no new alias recorded", control_id,
                 )
 
             if not self.store.loops_for_mrn(surviving):
@@ -429,6 +474,7 @@ class Registry:
                 moved.append(loop.loop_id)
 
         logger.info("ADT^A40 %s: carried %d loop(s) to the surviving MRN", control_id, len(moved))
+        scope.loops_moved = len(moved)
         return moved
 
     def reverse_merge(
@@ -453,6 +499,22 @@ class Registry:
 
         State is untouched, here as everywhere: the carry-back is another
         non-transitional merged_in.
+        """
+        with audited(
+            AuditAction.MERGE_REVERSED, actor=actor, role=role, reason_required=True
+        ) as scope:
+            carried = self._reverse_merge(retired_mrn, actor, role, reason, control_id)
+            scope.loops_moved = len(carried)
+            return carried
+
+    def _reverse_merge(
+        self, retired_mrn: str, actor: str, role: str, reason: str, control_id: str
+    ) -> list[str]:
+        """The body of reverse_merge, split out only so the audit wraps it.
+
+        Split rather than indented: the audited block has to cover the whole
+        attempt including the refusals reverse_alias raises, and re-indenting
+        forty lines would bury that in a diff nobody can read.
         """
         with self._lock:
             retired, surviving = self.store.reverse_alias(
@@ -485,8 +547,9 @@ class Registry:
                 carried.append(loop.loop_id)
 
         logger.warning(
-            "Merge %s -> %s reversed by %s; %d loop(s) returned to %s",
-            retired, surviving, actor, len(carried), retired,
+            "A patient merge was reversed by %s under control id %s; %d loop(s) returned "
+            "to the previously retired identifier. Both identifiers are in mrn_alias_events.",
+            actor, control_id, len(carried),
         )
         return carried
 
@@ -575,36 +638,45 @@ class Registry:
         would make a correction whose MSH-7 predates it look stale, and safety
         rule 2 would stop firing without any test noticing.
         """
-        if not actor or not role:
-            raise ReferralLoopError(
-                "An acknowledgement needs a named actor and role; a resolution attributed "
-                "to nobody cannot answer who vouched for the match or on what authority"
-            )
-
-        with self._lock:
-            loop = self.get(loop_id)
-            if loop.state not in _ACKNOWLEDGEABLE_FROM:
-                raise ReferralLoopError(f"Cannot acknowledge a loop in state {loop.state}")
-
-            status = self._latest_result_status(loop_id)
-            if status not in _ACKNOWLEDGEABLE_STATUSES:
+        with audited(
+            AuditAction.ACKNOWLEDGED, loop_id=loop_id, actor=actor, role=role
+        ) as scope:
+            if not actor or not role:
                 raise ReferralLoopError(
-                    f"Loop {loop_id} has no final or corrected result (latest OBX-11 {status!r}); "
-                    "ACKNOWLEDGED is unreachable"
+                    "An acknowledgement needs a named actor and role; a resolution attributed "
+                    "to nobody cannot answer who vouched for the match or on what authority"
                 )
 
-            at = _now()
-            self.store.append_event(
-                LoopEvent(
-                    loop_id, "acknowledged", at, control_id,
-                    {
-                        "ack_by": actor,
-                        "ack_role": role,
-                        "ack_at": at.isoformat(),
-                        "ack_result_status": status,
-                    },
+            with self._lock:
+                loop = self.get(loop_id)
+                if loop.state not in _ACKNOWLEDGEABLE_FROM:
+                    scope.refusal = RefusalCode.WRONG_STATE
+                    raise ReferralLoopError(f"Cannot acknowledge a loop in state {loop.state}")
+
+                status = self._latest_result_status(loop_id)
+                if status not in _ACKNOWLEDGEABLE_STATUSES:
+                    # Spec rule 1, and the one refusal a risk officer will ask
+                    # about by name. "ReferralLoopError" cannot distinguish it
+                    # from the state check above, and the message that could is
+                    # exactly what must not be copied into the audit.
+                    scope.refusal = RefusalCode.PRELIMINARY_NOT_ACKNOWLEDGEABLE
+                    raise ReferralLoopError(
+                        f"Loop {loop_id} has no final or corrected result "
+                        f"(latest OBX-11 {status!r}); ACKNOWLEDGED is unreachable"
+                    )
+
+                at = _now()
+                self.store.append_event(
+                    LoopEvent(
+                        loop_id, "acknowledged", at, control_id,
+                        {
+                            "ack_by": actor,
+                            "ack_role": role,
+                            "ack_at": at.isoformat(),
+                            "ack_result_status": status,
+                        },
+                    )
                 )
-            )
 
     def reverse_acknowledgement(
         self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
@@ -627,34 +699,42 @@ class Registry:
         data, which is the most valuable label the system produces -- and an
         unexplained label teaches nothing.
         """
-        if not actor or not role or not reason:
-            raise ReferralLoopError(
-                "A reversal needs a named actor, role and reason: it is both an audit "
-                "record of undoing someone's resolution and a labeled false positive"
-            )
-
-        with self._lock:
-            loop = self.get(loop_id)
-            if loop.state is not LoopState.ACKNOWLEDGED:
+        with audited(
+            AuditAction.ACKNOWLEDGEMENT_REVERSED, loop_id=loop_id, actor=actor, role=role,
+            reason_required=True,
+        ) as scope:
+            if not actor or not role or not reason:
                 raise ReferralLoopError(
-                    f"Cannot reverse an acknowledgement on a loop in state {loop.state}"
+                    "A reversal needs a named actor, role and reason: it is both an audit "
+                    "record of undoing someone's resolution and a labeled false positive"
                 )
 
-            at = _now()
-            self.store.append_event(
-                LoopEvent(
-                    loop_id, "reversed", at, control_id,
-                    {
-                        # Clearing these is what returns the loop to
-                        # resulted_unacknowledged() and therefore to a human.
-                        **_CLEARED_ACK,
-                        "reversed_by": actor,
-                        "reversed_role": role,
-                        "reversed_reason": reason,
-                        "reversed_at": at.isoformat(),
-                    },
+            with self._lock:
+                loop = self.get(loop_id)
+                if loop.state is not LoopState.ACKNOWLEDGED:
+                    scope.refusal = RefusalCode.WRONG_STATE
+                    raise ReferralLoopError(
+                        f"Cannot reverse an acknowledgement on a loop in state {loop.state}"
+                    )
+
+                at = _now()
+                self.store.append_event(
+                    LoopEvent(
+                        loop_id, "reversed", at, control_id,
+                        {
+                            # Clearing these is what returns the loop to
+                            # resulted_unacknowledged() and therefore to a human.
+                            **_CLEARED_ACK,
+                            "reversed_by": actor,
+                            "reversed_role": role,
+                            # Stays here and reaches no artifact: free text a
+                            # human typed about a patient. The audit records
+                            # only that one was given (see audit.py).
+                            "reversed_reason": reason,
+                            "reversed_at": at.isoformat(),
+                        },
+                    )
                 )
-            )
 
     def dismiss_orphan(
         self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
@@ -669,31 +749,36 @@ class Registry:
         Never automatic: nothing in this module calls it, and no message reaches
         it. A human decides an orphan is unattachable, and says why.
         """
-        if not actor or not role or not reason:
-            raise ReferralLoopError(
-                "A dismissal needs a named actor, role and reason; it retires a result "
-                "permanently and 'someone dismissed it' is not an answer to why"
-            )
-
-        with self._lock:
-            loop = self.get(loop_id)
-            if loop.state is not LoopState.ORPHAN:
+        with audited(
+            AuditAction.ORPHAN_DISMISSED, loop_id=loop_id, actor=actor, role=role,
+            reason_required=True,
+        ) as scope:
+            if not actor or not role or not reason:
                 raise ReferralLoopError(
-                    f"Only an orphan can be dismissed; loop {loop_id} is in state {loop.state}"
+                    "A dismissal needs a named actor, role and reason; it retires a result "
+                    "permanently and 'someone dismissed it' is not an answer to why"
                 )
 
-            at = _now()
-            self.store.append_event(
-                LoopEvent(
-                    loop_id, "dismissed", at, control_id,
-                    {
-                        "dismissed_by": actor,
-                        "dismissed_role": role,
-                        "dismissed_reason": reason,
-                        "dismissed_at": at.isoformat(),
-                    },
+            with self._lock:
+                loop = self.get(loop_id)
+                if loop.state is not LoopState.ORPHAN:
+                    scope.refusal = RefusalCode.WRONG_STATE
+                    raise ReferralLoopError(
+                        f"Only an orphan can be dismissed; loop {loop_id} is in state {loop.state}"
+                    )
+
+                at = _now()
+                self.store.append_event(
+                    LoopEvent(
+                        loop_id, "dismissed", at, control_id,
+                        {
+                            "dismissed_by": actor,
+                            "dismissed_role": role,
+                            "dismissed_reason": reason,
+                            "dismissed_at": at.isoformat(),
+                        },
+                    )
                 )
-            )
 
     # ------------------------------------------------------------------ helpers
 

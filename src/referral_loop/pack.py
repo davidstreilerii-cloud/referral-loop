@@ -15,6 +15,7 @@ from types import MappingProxyType
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from .audit import SYSTEM_ACTOR, SYSTEM_ROLE, AuditAction, audited
 from .errors import PackVerificationError
 from .parse_hl7 import ALLOWED_SEGMENTS
 
@@ -86,7 +87,27 @@ class RulePack:
 
 
 def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
-    """Load and verify the pack. Raises PackVerificationError on any doubt."""
+    """Load and verify the pack. Raises PackVerificationError on any doubt.
+
+    Audited, because which pack is in force is an answer an auditor needs: the
+    pack carries the field map and the tiers, so it decides which result is
+    attributed to which order. A refusal is audited too -- "the site booted on
+    pack 1.4.0" and "the site refused to boot on a pack that failed
+    verification" are both facts about what was running, and the second is the
+    more interesting one.
+
+    Only the version reaches the audit row, and only if it matches
+    `audit._PACK_VERSION_RE`. Not the pack path: a filesystem path is a site
+    detail with no auditable value here, and it is the sort of string that turns
+    out to contain a hospital's name.
+    """
+    with audited(AuditAction.PACK_LOADED, actor=SYSTEM_ACTOR, role=SYSTEM_ROLE) as _audit:
+        pack = _load_pack(pack_dir, public_key_raw)
+        _audit.pack_version = pack.version
+        return pack
+
+
+def _load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
     pack_path = Path(pack_dir) / "pack.json"
     sig_path = Path(pack_dir) / "pack.sig"
 
