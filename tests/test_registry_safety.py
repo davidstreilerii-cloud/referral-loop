@@ -527,13 +527,22 @@ _OPS = [
     ("reverse", lambda reg, lid: reg.reverse_acknowledgement(
         lid, actor="a", role="r", reason="w")),
     ("dismiss", lambda reg, lid: reg.dismiss_orphan(lid, actor="a", role="r", reason="w")),
+    # Task 15's two coordinator actions. Omitting them would silently narrow
+    # what this sweep claims: "no coordinator action reaches CLOSED" is only
+    # worth asserting over every coordinator action there is.
+    ("undo_match", lambda reg, lid: reg.undo_match(lid, actor="a", role="r", reason="w")),
+    # Attaching a record to itself. The self-attachment is refused, which is the
+    # point -- the sweep is over what a caller can *invoke*, not over what
+    # succeeds, and a refusal that left state half-applied is exactly the kind of
+    # path a hand-written test does not think to try.
+    ("attach_self", lambda reg, lid: reg.attach_orphan(lid, lid, actor="a", role="r")),
 ]
 
 
 @pytest.mark.parametrize("seed_orphan", [False, True])
 def test_closed_is_unreachable_by_any_sequence_of_coordinator_actions(registry, seed_orphan):
     """Spec test 5. Every sequence of every public mutating call, to depth 3,
-    from both a real loop and an orphan -- 584 sequences each. No message, no
+    from both a real loop and an orphan -- 1110 sequences each. No message, no
     coordinator action and no replay path reaches CLOSED.
 
     A sweep rather than a hand-picked path: CLOSED being unreachable is a claim
@@ -555,7 +564,8 @@ def test_closed_is_unreachable_by_any_sequence_of_coordinator_actions(registry, 
                 state = registry.get(loop_id).state
                 assert state is not LoopState.CLOSED, f"reached CLOSED via {combo}"
             checked += 1
-    assert checked == 8 + 64 + 512
+    ops = len(_OPS)
+    assert checked == ops + ops**2 + ops**3 == 1110
 
 
 # --------------------------------- spec test 6: acknowledgement is reversible

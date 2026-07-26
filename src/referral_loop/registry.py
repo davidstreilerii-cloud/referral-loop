@@ -70,9 +70,44 @@ is one lookup (store._apply_alias); a merge that would make an identity cyclic
 is refused outright rather than resolved by rule (errors.CircularMergeError);
 and resolution happens at one call site rather than at each writer.
 
-Audit. Five methods here change clinical-facing state on a human's or an
+The flywheel, and why undoing a match is not undoing an acknowledgement.
+Spec section 7 makes coordinator judgements the corpus a pack revision is
+evaluated against, so four of the actions here also append a row to
+store.labels: attach_orphan, undo_match, reverse_acknowledgement and
+dismiss_orphan.
+
+undo_match and reverse_acknowledgement look adjacent and are not. They differ in
+subject, in target state, and -- decisively -- in what they are evidence of:
+
+  * reverse_acknowledgement is about the HUMAN's claim. A coordinator confirmed
+    a match and now withdraws that confirmation. The result stays on the loop;
+    only the vouching is taken back, so ACKNOWLEDGED returns to RESULTED and the
+    loop re-queues for someone to confirm it properly.
+  * undo_match is about the MATCHER's claim. A coordinator says this result was
+    never this loop's. The result does not stay: the loop returns to awaiting
+    one, and the detached result becomes an orphan again so a human can put it
+    where it belongs.
+
+Neither is expressible as the other. reverse_acknowledgement cannot detach a
+result and undo_match cannot withdraw a confirmation, and an undo_match from
+ACKNOWLEDGED is refused precisely so that a coordinator undoing a match a human
+had already vouched for records both facts rather than silently discarding the
+first. That case -- a false match somebody acknowledged -- is the worst one
+available, and it is the one that most deserves two entries in the history.
+
+Spec section 4 rule 4 calls every acknowledgement reversal "a labeled false
+positive", and section 7 says the same of every undone auto-match. Read as one
+rule that would put clerical error into false-match rate, which section 7 makes
+an absolute release veto -- so a coordinator who mis-clicks would block a pack
+release no pack change could unblock. They are therefore recorded as two label
+types with two outcomes (events.LabelOutcome), which satisfies both sentences:
+every reversal is labeled, and only what the matcher actually got wrong counts
+as a false match.
+
+Audit. Seven methods here change clinical-facing state on a human's or an
 administrator's say-so -- acknowledge, reverse_acknowledgement, dismiss_orphan,
-merge_patient, reverse_merge -- and each is wrapped in `audit.audited`, which
+attach_orphan, undo_match, merge_patient, reverse_merge -- and each is wrapped
+in `audit.audited`, which
 appends one row to the immutable audit database per *attempt*, refusals
 included. Wrapped rather than called at the end of the happy path, because a
 refused acknowledgement on a preliminary read is exactly the event a risk
@@ -101,7 +136,7 @@ from .audit import (
     audited,
 )
 from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
-from .events import Loop, LoopEvent, LoopState
+from .events import LabelType, Loop, LoopEvent, LoopState
 from .store import LoopStore
 
 logger = logging.getLogger(__name__)
@@ -129,8 +164,31 @@ _RESULT_EVENTS = frozenset({"resulted", "reopened"})
 
 # Terminal or otherwise result-proof states. A result recorded against any of
 # these would leave the loop on no worklist, or retire it by a route no
-# coordinator chose.
-_NO_RESULT_FROM = frozenset({LoopState.ORPHAN, LoopState.DISMISSED})
+# coordinator chose. ATTACHED is here for the same reason as ORPHAN: the record
+# is a result, not an expectation, and a result landing on one would resurrect a
+# retired orphan into the acknowledgement queue.
+_NO_RESULT_FROM = frozenset({LoopState.ORPHAN, LoopState.DISMISSED, LoopState.ATTACHED})
+
+# The only state a match may be undone from. Not ACKNOWLEDGED, deliberately: see
+# the module note on undo_match versus reverse_acknowledgement.
+_UNMATCHABLE_FROM = frozenset({LoopState.RESULTED})
+
+# Detail key naming the orphan a result was attached from. Its presence is what
+# distinguishes a matcher's false positive from a human's mistaken attachment
+# when the result is later detached -- see undo_match.
+_ATTACHED_FROM = "attached_from"
+
+# Detail key carrying the tier a match fired at, written by the listener onto
+# the resulting event. The single most useful feature on a false-match label: it
+# names which rule misfired, which is what a pack revision has to act on.
+_MATCH_TIER = "match_tier"
+
+# Where an orphan's OBX-11 lives. The listener writes `result_status`;
+# `obx11` is accepted as a second name because hand-built orphans in this
+# codebase and in the plan use it, and an orphan whose status cannot be read is
+# refused attachment rather than defaulted -- so a silent disagreement between
+# the two names would refuse real work instead of merely reading nothing.
+_ORPHAN_STATUS_KEYS = ("result_status", "obx11")
 
 # Scheduling and cancellation describe where an order sits in the workflow, so
 # they are only meaningful while the loop is still waiting on a result.
@@ -167,8 +225,16 @@ def _as_utc(value: datetime) -> datetime:
 
 
 class Registry:
-    def __init__(self, store: LoopStore):
+    def __init__(self, store: LoopStore, pack_version: str = ""):
         self.store = store
+        # Stamped on every label. A label whose pack version is unknown cannot
+        # be attributed to the rules that produced the judgement, which is what
+        # spec section 7 evaluates a revision against -- so a deployment passes
+        # `pack.version` here, and an unset one records "unknown" rather than
+        # inventing a value. Kept as a plain string rather than a RulePack:
+        # nothing else in this module needs the pack, and holding one would
+        # invite matching decisions to migrate into the state machine.
+        self.pack_version = pack_version
         # Every rule here is check-then-append, and the check is worthless if
         # another thread appends between the two. Concretely: a correction and
         # an acknowledgement racing each other both pass their checks, the
@@ -579,9 +645,29 @@ class Registry:
             )
 
     def record_result(
-        self, loop_id: str, obx11: str, control_id: str, message_at: datetime | None = None
+        self,
+        loop_id: str,
+        obx11: str,
+        control_id: str,
+        message_at: datetime | None = None,
+        match_tier: int | None = None,
+        attached_from: str = "",
     ) -> None:
-        """Apply an arriving result. OBX-11 decides which transition is legal."""
+        """Apply an arriving result. OBX-11 decides which transition is legal.
+
+        `match_tier` and `attached_from` record HOW this result came to be this
+        loop's, and both exist for undo_match. Without the tier, the most
+        valuable label the system produces -- a human saying the matcher was
+        wrong -- would not say which rule was wrong, and a pack revision has
+        nothing to act on. Without `attached_from`, undoing a result a
+        *coordinator* attached would be counted as a matcher false positive,
+        putting human error into the metric that vetoes pack releases.
+
+        Both are allowlisted, non-identifying values: an integer tier and a
+        minted loop id. Omitted from the detail when unset rather than written
+        as empty, so an event written before this existed and one written by the
+        listener today are the same shape.
+        """
         with self._lock:
             loop = self.get(loop_id)
 
@@ -606,18 +692,24 @@ class Registry:
 
             self._refuse_if_stale(loop_id, message_at, f"result {obx11!r}")
 
+            provenance: dict = {"obx11": obx11}
+            if match_tier is not None:
+                provenance[_MATCH_TIER] = int(match_tier)
+            if attached_from:
+                provenance[_ATTACHED_FROM] = attached_from
+
             # Rule 2, generalised. A correction always reopens review; so does
             # any result landing on a loop somebody has already acknowledged,
             # because that acknowledgement was made against a read this message
             # supersedes.
             if obx11 == CORRECTED or loop.state is LoopState.ACKNOWLEDGED:
-                detail = self._stamp({"obx11": obx11, **_CLEARED_ACK}, message_at)
+                detail = self._stamp({**provenance, **_CLEARED_ACK}, message_at)
                 self.store.append_event(LoopEvent(loop_id, "reopened", _now(), control_id, detail))
                 return
 
             self.store.append_event(
                 LoopEvent(
-                    loop_id, "resulted", _now(), control_id, self._stamp({"obx11": obx11}, message_at)
+                    loop_id, "resulted", _now(), control_id, self._stamp(provenance, message_at)
                 )
             )
 
@@ -736,6 +828,21 @@ class Registry:
                     )
                 )
 
+                # Spec rule 4 calls a reversal a labeled false positive; spec
+                # section 7 says the same of an undone auto-match. They are not
+                # the same claim -- this one withdraws a human's confirmation and
+                # leaves the result attached -- so it gets its own label type and
+                # an outcome that is deliberately not FALSE_MATCH. See the module
+                # note: folding it in would let a mis-click veto a pack release.
+                self._label(
+                    LabelType.ACKNOWLEDGEMENT_REVERSED,
+                    loop_id=loop_id,
+                    modality=loop.modality,
+                    service_code=loop.service_code,
+                    tier=self._latest_match_tier(loop_id),
+                    actor_role=role,
+                )
+
     def dismiss_orphan(
         self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
     ) -> None:
@@ -780,7 +887,342 @@ class Registry:
                     )
                 )
 
+                # Spec section 5 makes dismissal rate a watched number: a rising
+                # rate is a feed problem to investigate upstream, not a
+                # coordinator working faster. That only holds if dismissals are
+                # counted, which means a dismissal is a label too -- one saying
+                # the result belongs to no loop at this site.
+                self._label(
+                    LabelType.ORPHAN_DISMISSED,
+                    loop_id=loop_id,
+                    modality=loop.modality,
+                    service_code=loop.service_code,
+                    tier=self._orphan_match_tier(loop_id),
+                    actor_role=role,
+                )
+
+    # ----------------------------------------------------------- the flywheel
+
+    def attach_orphan(
+        self, orphan_id: str, target_loop_id: str, actor: str, role: str, control_id: str = ""
+    ) -> None:
+        """A coordinator says this unmatched result belongs to this loop.
+
+        Spec section 5: orphans are workflow, not failure, and every attachment
+        is a labeled example -- a human telling the matcher, on real site data,
+        about a match it declined to make.
+
+        **The result is applied through record_result, and that is the whole
+        safety design of this method.** Manual attachment must not become a back
+        door around safety rule 1: a coordinator attaching a preliminary read
+        leaves the target in RESULTED and unacknowledgeable, exactly as if the
+        ORU had matched on the wire. Writing the transition here instead would
+        duplicate rule 1, rule 2, the CANCELLED refusal and the clinical
+        ordering guard -- four safety rules, in a second place, drifting.
+
+        Which target states are legal is therefore record_result's answer, not
+        this method's, and it is the right one in every case: OPEN and SCHEDULED
+        advance; RESULTED accepts a second result, which is how a final attaches
+        to a loop that already holds the preliminary; ACKNOWLEDGED reopens under
+        rule 2, because a result arriving on a settled loop supersedes the read
+        that was settled; CANCELLED is refused by the failure matrix; ORPHAN and
+        DISMISSED are refused because they are results, not expectations.
+
+        The orphan's OBX-11 is read from its `orphaned` event directly.
+        `_latest_result_status` correctly returns "" for an orphan -- an
+        `orphaned` event is not in _RESULT_EVENTS -- so using it here would make
+        every attached orphan look statusless, and every attachment would be
+        refused. An unreadable status is refused rather than defaulted to final:
+        defaulting would advance a loop off the awaiting-result queue on the
+        strength of a status nobody could read, while refusing leaves the orphan
+        exactly where a coordinator can see it.
+        """
+        with audited(
+            AuditAction.ORPHAN_ATTACHED, loop_id=target_loop_id, actor=actor, role=role
+        ) as scope:
+            if not actor or not role:
+                raise ReferralLoopError(
+                    "An attachment needs a named actor and role: it asserts that this result "
+                    "belongs to this loop, and an assertion attributed to nobody is not one"
+                )
+            with self._lock:
+                # Both replays before anything is written. LoopNotFoundError from
+                # either is the honest answer and must precede any state change.
+                #
+                # And before every refusal below, deliberately. Those refusals
+                # compose their messages from the two ids, and worklist._refused
+                # echoes the message into an HTTP response -- one of the four
+                # artifacts spec test 14 greps. Replaying first means an id that
+                # reaches a message is one this system minted; anything else has
+                # already left through LoopNotFoundError, which echoes nothing.
+                # Found by probing this task: the self-attachment guard used to
+                # run first, so POSTing a sentinel as both ids returned it.
+                orphan = self.get(orphan_id)
+                target = self.get(target_loop_id)
+
+                if orphan_id == target_loop_id:
+                    # record_result would refuse this anyway (_NO_RESULT_FROM),
+                    # but with a message about states that sends the reader
+                    # looking for the wrong bug.
+                    raise ReferralLoopError(
+                        f"Cannot attach record {orphan_id} to itself; an orphan is attached "
+                        "to the loop that ordered the study, and a record cannot have "
+                        "ordered itself"
+                    )
+
+                if orphan.state is not LoopState.ORPHAN:
+                    scope.refusal = RefusalCode.WRONG_STATE
+                    raise ReferralLoopError(
+                        f"Only an orphan can be attached; record {orphan_id} is in state "
+                        f"{orphan.state}. Attaching the same orphan twice, or attaching a "
+                        "record that is a real loop, would copy a result onto a loop no "
+                        "coordinator has actually looked at."
+                    )
+
+                obx11 = self._orphan_result_status(orphan_id)
+                if obx11 not in (PRELIMINARY, FINAL, CORRECTED):
+                    scope.refusal = RefusalCode.UNREADABLE_RESULT_STATUS
+                    raise ReferralLoopError(
+                        f"Orphan {orphan_id} carries no readable OBX-11 (got {obx11!r}); "
+                        "refusing to attach it. Advancing a loop on a status nobody could "
+                        "read would let rule 1 be bypassed by a missing field."
+                    )
+
+                # First, because it is the step that can be refused. If the
+                # target cannot take the result, the orphan must be untouched
+                # and still on the queue -- the ordering that fails safe. The
+                # reverse order would retire an orphan whose result went nowhere.
+                self.record_result(
+                    target_loop_id, obx11=obx11, control_id=control_id, attached_from=orphan_id
+                )
+
+                at = _now()
+                self.store.append_event(
+                    LoopEvent(
+                        orphan_id, "attached", at, control_id,
+                        {
+                            "attached_to": target_loop_id,
+                            "attached_by": actor,
+                            "attached_role": role,
+                            "attached_at": at.isoformat(),
+                        },
+                    )
+                )
+
+                # The orphan's own modality and service code, not the target's:
+                # the label describes the RESULT the matcher failed to place,
+                # and the target's values are the order's. Falls back to the
+                # target only when the orphan carries none.
+                self._label(
+                    LabelType.ORPHAN_ATTACHED,
+                    loop_id=target_loop_id,
+                    modality=orphan.modality or target.modality,
+                    service_code=orphan.service_code or target.service_code,
+                    # The tier the matcher reached before declining. On a
+                    # missed-match label that is the feature that matters: tier 5
+                    # means nothing came close, tier 3 means the rule nearly
+                    # fired and its window or tie-breaker is the thing to look at.
+                    tier=self._orphan_match_tier(orphan_id),
+                    actor_role=role,
+                )
+
+        if orphan.mrn != target.mrn:
+            # No identifiers: a log record is one of the four artifacts spec
+            # test 14 greps. That the two differed is the feed-quality signal --
+            # tiers 3 and 4 both key on MRN, so an attachment across two
+            # identifiers usually means an alias that was never recorded.
+            logger.info(
+                "Orphan %s was attached to loop %s across two different patient identifiers; "
+                "check whether a merge was missed. The identifiers are in loop_events.",
+                orphan_id, target_loop_id,
+            )
+        logger.info("Orphan %s attached to loop %s via a coordinator", orphan_id, target_loop_id)
+
+    def undo_match(
+        self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> str:
+        """A coordinator says the matcher attached the wrong result. Returns the
+        id of the orphan record that now holds the detached result.
+
+        Spec section 7: the most valuable label the system produces, because a
+        human is telling you the matcher was wrong on real site data rather than
+        on a synthetic case. See the module note for why this is not
+        reverse_acknowledgement and cannot be expressed as it.
+
+        Two things have to happen and only one of them is obvious. The loop goes
+        back to awaiting a result, which is the visible half. The *result* also
+        has to go somewhere: it arrived, it is real, and it belongs to some loop
+        even if not this one. Leaving it detached would put a result nobody is
+        looking at back into a system whose entire purpose is not losing
+        results -- it would exist only in the raw archive, which no coordinator
+        reads and no queue shows. So the detached result becomes an orphan
+        again, which is precisely the queue built for a result with no home, and
+        the coordinator can then attach it where it belongs -- producing the
+        second label.
+
+        The new orphan carries the loop's MRN. That is the best available
+        evidence rather than a guess: tiers 3 and 4 require loop.mrn == key.mrn,
+        so a false match at those tiers is by construction between two orders
+        for the same patient, and at tiers 1-2 the identifier the result carried
+        is in the raw archive either way. It carries the loop's modality and
+        service code for the same reason and with the same caveat, and
+        deliberately carries no order number: an exact accession is the
+        strongest identifier here and attributing the wrong one to a result
+        would manufacture the next false match.
+
+        Refused on an ACKNOWLEDGED loop, which is not an oversight. A human
+        vouched for that match, and undoing it without an explicit reversal
+        would discard their confirmation with no `reversed` event to show it.
+        Reverse the acknowledgement first: both facts are then in the history
+        and both are labeled, which is what that case -- a false match somebody
+        signed off -- deserves.
+        """
+        with audited(
+            AuditAction.MATCH_UNDONE, loop_id=loop_id, actor=actor, role=role,
+            reason_required=True,
+        ) as scope:
+            if not actor or not role or not reason:
+                raise ReferralLoopError(
+                    "Undoing a match needs a named actor, role and reason: it is both an "
+                    "audit record of detaching a result and a labeled false positive, and "
+                    "an unexplained label teaches nothing"
+                )
+
+            with self._lock:
+                loop = self.get(loop_id)
+                if loop.state not in _UNMATCHABLE_FROM:
+                    scope.refusal = RefusalCode.WRONG_STATE
+                    raise ReferralLoopError(
+                        f"Cannot undo a match on a loop in state {loop.state}; only a "
+                        "RESULTED loop holds a match to undo. If it is ACKNOWLEDGED, "
+                        "reverse the acknowledgement first so the withdrawal of that "
+                        "confirmation is recorded too."
+                    )
+
+                event = self._latest_result_event(loop_id)
+                detail = event.detail if event else {}
+                attached_from = str(detail.get(_ATTACHED_FROM, ""))
+                tier = detail.get(_MATCH_TIER)
+                obx11 = str(detail.get("obx11", ""))
+
+                # The replacement orphan FIRST, for the same reason the alias is
+                # written before a merge moves loops: of the two orderings only
+                # this one fails safe. A failure after this point leaves a
+                # duplicate orphan and a loop still RESULTED -- visible and
+                # correctable. The other order loses the result outright.
+                orphan_id = self.orphan(
+                    control_id=control_id,
+                    mrn=loop.mrn,
+                    detail={
+                        "modality": loop.modality,
+                        "service_code": loop.service_code,
+                        "result_status": obx11,
+                        _MATCH_TIER: tier,
+                        # So the history reads as one story rather than as an
+                        # unexplained orphan appearing minutes after an undo.
+                        "detached_from": loop_id,
+                    },
+                )
+
+                at = _now()
+                self.store.append_event(
+                    LoopEvent(
+                        loop_id, "unmatched", at, control_id,
+                        {
+                            # Already clear on a RESULTED loop; written anyway so
+                            # the event states what it leaves behind rather than
+                            # relying on the state it was entered from.
+                            **_CLEARED_ACK,
+                            "unmatched_by": actor,
+                            "unmatched_role": role,
+                            # Stays here and reaches no artifact: free text a
+                            # human typed about a patient. Above all it does not
+                            # reach the label, which is the exportable one.
+                            "unmatched_reason": reason,
+                            "unmatched_at": at.isoformat(),
+                            "detached_to": orphan_id,
+                        },
+                    )
+                )
+
+                # The distinction the release gate depends on. A result a
+                # coordinator attached and then detached is a human's mistake,
+                # not the matcher's, and counting it as a false match would let a
+                # mis-click veto a pack release under section 7's absolute rule.
+                self._label(
+                    LabelType.ATTACHMENT_UNDONE if attached_from else LabelType.MATCH_UNDONE,
+                    loop_id=loop_id,
+                    modality=loop.modality,
+                    service_code=loop.service_code,
+                    # None for an undone attachment: no tier produced it.
+                    tier=None if attached_from else tier,
+                    actor_role=role,
+                )
+
+        logger.warning(
+            "Match on loop %s undone by a coordinator; the result was detached to orphan %s "
+            "and the loop is awaiting a result again.", loop_id, orphan_id,
+        )
+        return orphan_id
+
     # ------------------------------------------------------------------ helpers
+
+    def _label(self, label_type: LabelType, **fields) -> None:
+        """Append a label, best-effort. A label write never blocks the action.
+
+        The same asymmetry audit.py argues for itself, and for the same reason:
+        the clinical fact is already durable in loop_events, from which every
+        label here is derivable, so a dropped label costs a training example and
+        not a result. Failing closed would mean an unwritable labels table stops
+        coordinators attaching orphans -- the queue then only grows, which is the
+        failure spec section 5 added DISMISSED to prevent, caused this time by
+        the flywheel meant to feed on it.
+
+        Not silent: the exception *type* is logged at ERROR. Not str(exc), which
+        for a SQLite error carries the database path.
+        """
+        try:
+            self.store.record_label(label_type, pack_version=self.pack_version, **fields)
+        except Exception as exc:  # noqa: BLE001 - deliberate, see the docstring
+            logger.error(
+                "Label %s dropped for loop %s (%s); the action itself succeeded and is in "
+                "loop_events, from which the label can be rebuilt.",
+                label_type.value, fields.get("loop_id", ""), type(exc).__name__,
+            )
+
+    def _orphan_event(self, orphan_id: str) -> LoopEvent | None:
+        """The `orphaned` event that created this record, if it has one."""
+        for event in self.store.events_for(orphan_id):
+            if event.event_type == "orphaned":
+                return event
+        return None
+
+    def _orphan_result_status(self, orphan_id: str) -> str:
+        """The OBX-11 an orphan arrived with, read off its `orphaned` event.
+
+        Deliberately not _latest_result_status: `orphaned` is absent from
+        _RESULT_EVENTS -- correctly, since an orphan's detail is caller-supplied
+        and must not be able to flip a real loop's result status -- so that
+        method returns "" for every orphan and using it here would refuse every
+        attachment.
+        """
+        event = self._orphan_event(orphan_id)
+        if event is None:
+            return ""
+        for key in _ORPHAN_STATUS_KEYS:
+            value = event.detail.get(key)
+            if value:
+                return str(value)
+        return ""
+
+    def _orphan_match_tier(self, orphan_id: str) -> int | None:
+        event = self._orphan_event(orphan_id)
+        return event.detail.get(_MATCH_TIER) if event else None
+
+    def _latest_match_tier(self, loop_id: str) -> int | None:
+        """The tier the result currently on this loop matched at, if recorded."""
+        event = self._latest_result_event(loop_id)
+        return event.detail.get(_MATCH_TIER) if event else None
 
     @staticmethod
     def _stamp(detail: dict, message_at: datetime | None) -> dict:
@@ -837,8 +1279,8 @@ class Registry:
                 "regress the loop. Route for human review; the raw message is archived."
             )
 
-    def _latest_result_status(self, loop_id: str) -> str:
-        """The OBX-11 of the newest result this loop holds, or "" if none.
+    def _latest_result_event(self, loop_id: str) -> LoopEvent | None:
+        """The newest result event this loop holds, or None.
 
         Newest by clinical time, falling back to arrival. _refuse_if_stale
         already keeps arrival order equal to clinical order for anything this
@@ -846,14 +1288,26 @@ class Registry:
         something else -- a restore, a foreign writer, a future code path. That
         is exactly when getting it wrong would let a loop be acknowledged on a
         superseded read, so it is defended here rather than assumed away.
+
+        `unmatched` is deliberately NOT a result event, even though it is what a
+        detachment writes. Its timestamp is a human's clock and every other key
+        here is a message's, and mixing the two would let a coordinator's undo
+        outrank a later result whose MSH-7 is older than the moment they clicked
+        -- which would refuse acknowledgement of a genuine final read. Nothing is
+        lost: an undone loop is OPEN, and _ACKNOWLEDGEABLE_FROM is {RESULTED}.
         """
         best_key = None
-        status = ""
+        best: LoopEvent | None = None
         for index, event in enumerate(self.store.events_for(loop_id)):
             if event.event_type not in _RESULT_EVENTS:
                 continue
             key = (self._message_time(event) or _as_utc(event.occurred_at), index)
             if best_key is None or key > best_key:
                 best_key = key
-                status = str(event.detail.get("obx11", ""))
-        return status
+                best = event
+        return best
+
+    def _latest_result_status(self, loop_id: str) -> str:
+        """The OBX-11 of the newest result this loop holds, or "" if none."""
+        event = self._latest_result_event(loop_id)
+        return str(event.detail.get("obx11", "")) if event else ""

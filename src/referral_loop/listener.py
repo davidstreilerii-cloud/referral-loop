@@ -648,6 +648,13 @@ class MessageHandler:
         self.matched_count += 1
         self.registry.record_result(
             outcome.loop_id, obx11=obx11, control_id=message.control_id, message_at=message_at,
+            # The tier that produced this attribution, recorded on the event so
+            # that if a coordinator later says the match was wrong, the label
+            # names which rule misfired (spec section 7). Without it the most
+            # valuable label the system produces would say a false match
+            # happened without saying where, and a pack revision would have
+            # nothing to act on. An integer, so it is non-identifying by shape.
+            match_tier=outcome.tier,
         )
 
     def _target_loop(self, message: ParsedMessage, mrn: str, what: str) -> str | None:

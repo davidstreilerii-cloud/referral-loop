@@ -180,6 +180,14 @@ class AuditAction(str, Enum):
     ACKNOWLEDGED = "referral.acknowledged"
     ACKNOWLEDGEMENT_REVERSED = "referral.acknowledgement_reversed"
     ORPHAN_DISMISSED = "referral.orphan_dismissed"
+    # A coordinator asserting that an unmatched result belongs to a loop, and a
+    # coordinator asserting that the matcher attached one that does not. Both
+    # change clinical-facing state on a human's say-so, which is the line this
+    # module audits on; both also produce a label (spec section 7), and an
+    # auditor asking "who decided this result belongs here" must not have to
+    # read the training data to find out.
+    ORPHAN_ATTACHED = "referral.orphan_attached"
+    MATCH_UNDONE = "referral.match_undone"
     PATIENT_MERGED = "referral.patient_merged"
     MERGE_REVERSED = "referral.merge_reversed"
     PACK_LOADED = "referral.pack_loaded"
@@ -204,6 +212,11 @@ class RefusalCode(str, Enum):
 
     PRELIMINARY_NOT_ACKNOWLEDGEABLE = "preliminary_not_acknowledgeable"
     WRONG_STATE = "wrong_state"
+    # An orphan whose OBX-11 could not be read. Refusing the attachment is the
+    # safe direction -- the orphan stays visibly queued rather than advancing a
+    # loop to RESULTED on a status nobody could read -- and it is a different
+    # fact from "wrong state", which is the distinction this enum exists for.
+    UNREADABLE_RESULT_STATUS = "unreadable_result_status"
 
 
 # The keys permitted in the JSON `detail` blob. Enforced at write time rather
@@ -216,6 +229,8 @@ _RESOURCE_TYPE = {
     AuditAction.ACKNOWLEDGED: "referral_loop",
     AuditAction.ACKNOWLEDGEMENT_REVERSED: "referral_loop",
     AuditAction.ORPHAN_DISMISSED: "referral_loop",
+    AuditAction.ORPHAN_ATTACHED: "referral_loop",
+    AuditAction.MATCH_UNDONE: "referral_loop",
     AuditAction.PATIENT_MERGED: "referral_patient_merge",
     AuditAction.MERGE_REVERSED: "referral_patient_merge",
     AuditAction.PACK_LOADED: "referral_rule_pack",

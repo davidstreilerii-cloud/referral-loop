@@ -52,9 +52,10 @@ logger = logging.getLogger(__name__)
 # unsettle acknowledged work on a heuristic.
 #
 # CANCELLED is excluded by the failure matrix ("Result for a CANCELLED loop ->
-# orphan + flag"), CLOSED is reserved for v2 and unreachable, and ORPHAN and
-# DISMISSED are results, not expectations -- an orphan is retired by attachment,
-# never by matching another result onto it.
+# orphan + flag"), CLOSED is reserved for v2 and unreachable, and ORPHAN,
+# DISMISSED and ATTACHED are results, not expectations -- an orphan is retired by
+# attachment, never by matching another result onto it, and an already-attached
+# one must not be re-matched by a redelivery.
 _RESULTABLE_STATES = frozenset({LoopState.OPEN, LoopState.SCHEDULED, LoopState.RESULTED})
 _EXACT_TIER_STATES = _RESULTABLE_STATES | frozenset({LoopState.ACKNOWLEDGED})
 

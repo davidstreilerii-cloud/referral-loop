@@ -35,8 +35,8 @@ from .pack import RulePack
 # same worklist slot with a genuinely unresulted order and bury the more urgent
 # one.
 #
-# ACKNOWLEDGED, CANCELLED, and DISMISSED are terminal: nothing is being waited
-# on, so "stale" has no referent. CLOSED is reserved for v2 and unreachable in
+# ACKNOWLEDGED, CANCELLED, DISMISSED and ATTACHED are terminal: nothing is being
+# waited on, so "stale" has no referent. CLOSED is reserved for v2 and unreachable in
 # v1 (events.py, LoopStore.append_event refuses it) -- excluded on the same
 # terminal reasoning, even though no loop can ever hold it today.
 #

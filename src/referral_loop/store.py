@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -47,7 +48,13 @@ from .errors import (
     ReservedStateError,
     StoreUnavailableError,
 )
-from .events import Loop, LoopEvent, LoopState
+from .events import (
+    LABEL_OUTCOME,
+    LabelType,
+    Loop,
+    LoopEvent,
+    LoopState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +167,44 @@ CREATE TABLE IF NOT EXISTS mrn_aliases (
 -- stragglers; that is the reverse direction, so it needs its own index.
 CREATE INDEX IF NOT EXISTS idx_aliases_surviving ON mrn_aliases(surviving_mrn);
 
+-- Spec section 7's flywheel, as a table. Every row is something a coordinator
+-- taught the system: an orphan they attached, a match they undid, a dismissal.
+--
+-- It carries a STRICTER rule than loop_events, and deliberately so. loop_events
+-- legitimately holds the MRN, because matching and merges are identifier
+-- arithmetic and cannot work without it. A label is training data whose whole
+-- point is that it may eventually leave the building -- section 7 contemplates
+-- site-local labels contributed back on opt-in -- so it holds only features the
+-- matcher actually reasons over, and no identifier of a patient, an actor or a
+-- message. What is NOT here is the specification: no mrn, no accession, no
+-- placer/filler order number, no actor name, no free-text reason, no control id.
+-- record_label has no parameter that accepts any of them, which is the same
+-- control audit.py uses and a stronger one than filtering a dict a caller built.
+--
+-- created_date, not created_at. An exact timestamp on an exportable row is a
+-- quasi-identifier -- it pins a label to the hour a study resulted -- and
+-- nothing in section 7 needs sub-day resolution: ordering is label_id's job and
+-- the temporal bucket that matters for evaluation is pack_version.
+--
+-- Append-only, under the same triggers as loop_events, because these rows feed
+-- a release gate that vetoes a pack on a false-match regression. A deletable
+-- label is a gate that can be passed by deleting the evidence. Nothing is lost
+-- by that: every label is derivable by replaying loop_events, so this table is
+-- an index over the log exactly as `loops` is.
+CREATE TABLE IF NOT EXISTS labels (
+    label_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    label_type   TEXT NOT NULL,
+    outcome      TEXT NOT NULL,
+    loop_id      TEXT NOT NULL,
+    modality     TEXT NOT NULL DEFAULT '',
+    service_code TEXT NOT NULL DEFAULT '',
+    tier         INTEGER,
+    actor_role   TEXT NOT NULL DEFAULT '',
+    pack_version TEXT NOT NULL DEFAULT '',
+    created_date TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_labels_outcome ON labels(outcome);
+
 -- Append-only enforcement lives in the schema, not in the connection.
 -- _authorizer only binds to connections LoopStore itself opens; any other
 -- process opening this file would bypass it entirely. These triggers travel
@@ -183,6 +228,10 @@ CREATE TRIGGER IF NOT EXISTS applied_no_delete BEFORE DELETE ON applied_messages
 BEGIN SELECT RAISE(ABORT, 'applied_messages is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS applied_no_update BEFORE UPDATE ON applied_messages
 BEGIN SELECT RAISE(ABORT, 'applied_messages is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS labels_no_delete BEFORE DELETE ON labels
+BEGIN SELECT RAISE(ABORT, 'labels is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS labels_no_update BEFORE UPDATE ON labels
+BEGIN SELECT RAISE(ABORT, 'labels is append-only'); END;
 """
 
 _ALIAS_ESTABLISHED = "established"
@@ -190,6 +239,84 @@ _ALIAS_REVERSED = "reversed"
 
 # Event types that deliberately carry fields without changing state.
 _NON_TRANSITIONAL = frozenset({"merged_in"})
+
+# ---------------------------------------------------------------- label limits
+#
+# The same control audit.py applies to the audit database, applied to the other
+# artifact designed to leave the building. Every value written to `labels` is
+# normalised through one of these on the way in; nothing reaches the table as
+# the caller supplied it.
+#
+# Deliberately duplicated rather than imported from audit.py: a change to one
+# must not silently widen the other, and test_orphan_attach asserts the two
+# patterns still agree, so the duplication is checked rather than trusted.
+
+# Loop ids are minted as f"L-{uuid4().hex[:12]}" (orphans "O-"). Twelve hex
+# digits of uuid4 are definitionally non-identifying, which is what makes
+# carrying one into an exportable artifact safe. Anything else -- above all a
+# string a coordinator's browser put in a URL -- is recorded as unminted.
+_LABEL_LOOP_REF_RE = re.compile(r"^[LO]-[0-9a-f]{12}$")
+_UNMINTED_LOOP_REF = "unminted"
+
+# A coded clinical value: an HL7 code or a modality abbreviation, which is short
+# and drawn from a coded charset. A name, an address or a note is neither, so a
+# value that does not look like a code is dropped rather than stored.
+#
+# Defence in depth, not the primary control. The primary control is that these
+# values can only have come from the pack's field_map, and load_pack refuses a
+# field_map naming any segment outside the parser allowlist -- so NK1, GT1 and
+# NTE cannot reach here at all. This bounds what a *permitted* segment can carry.
+_CODED_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._^&+/-]{0,31}$")
+
+# A pack version, from a pack whose Ed25519 signature verified.
+_LABEL_PACK_VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+_UNKNOWN_PACK_VERSION = "unknown"
+
+# A role is the one human-typed value permitted, and it is here for the same
+# reason audit.py permits it: a label that cannot say what kind of person made
+# the judgement cannot be weighted against one made by someone else. Bounded and
+# collapsed to a single line so a pasted note cannot land in it whole. It is not
+# filtered further, and the residual risk is stated rather than hidden: a person
+# who types a patient's name into the "your role" box puts it here. That is a
+# training-time review question for whoever runs the contribution step, not
+# something a charset filter can answer -- the same conclusion audit.py reaches
+# about the actor field.
+_MAX_LABEL_ROLE = 64
+
+# Matching has five tiers (spec section 5); tier 5 is "no match". Anything
+# outside that range did not come from the matcher and is recorded as unknown.
+_MIN_TIER, _MAX_TIER = 1, 5
+
+
+def _label_loop_ref(value: object) -> str:
+    if isinstance(value, str) and _LABEL_LOOP_REF_RE.match(value):
+        return value
+    return _UNMINTED_LOOP_REF
+
+
+def _label_coded(value: object) -> str:
+    if isinstance(value, str) and _CODED_VALUE_RE.match(value.strip()):
+        return value.strip()
+    return ""
+
+
+def _label_pack_version(value: object) -> str:
+    if isinstance(value, str) and _LABEL_PACK_VERSION_RE.match(value):
+        return value
+    return _UNKNOWN_PACK_VERSION
+
+
+def _label_role(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:_MAX_LABEL_ROLE]
+
+
+def _label_tier(value: object) -> int | None:
+    """An int in 1..5, or None. bool is rejected: True would store as tier 1."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if _MIN_TIER <= value <= _MAX_TIER else None
 
 # Event type -> resulting state. Replay applies these in order.
 # No None values: a missing key must mean "unknown", and an unknown event type
@@ -206,6 +333,22 @@ _EVENT_STATE = {
     "reopened": LoopState.RESULTED,
     "reversed": LoopState.RESULTED,   # a coordinator undoing their own ack
     "dismissed": LoopState.DISMISSED,
+    # An orphan a coordinator attached to a real loop. Terminal, and off every
+    # queue -- the coordinator must not be shown the same orphan again -- while
+    # the record stays in the log. See LoopState.ATTACHED for why it is not
+    # DISMISSED or CANCELLED.
+    "attached": LoopState.ATTACHED,
+    # A coordinator saying the matcher attached the wrong result. The loop goes
+    # back to awaiting one.
+    #
+    # OPEN rather than "whatever it was before", because state comes from this
+    # map alone and the map takes no history. The loss is the appointment fact
+    # of a loop that was SCHEDULED, and it costs nothing that matters:
+    # open_loops() selects OPEN and SCHEDULED alike, so the loop lands on the
+    # same queue, staleness measures from ordered_at either way, and the SIU is
+    # still in the event log. A conditional restore would need two event types
+    # to say one thing, and would make replay depend on a lookup.
+    "unmatched": LoopState.OPEN,
 }
 
 # No event type maps to LoopState.CLOSED, and that is the whole of the v1
@@ -234,6 +377,7 @@ def _authorizer(action_code: int, arg1, arg2, *_args):
         "raw_messages",
         "mrn_alias_events",
         "applied_messages",
+        "labels",
     ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
@@ -423,6 +567,75 @@ class LoopStore:
 
     def applied_count(self) -> int:
         return self._read("SELECT COUNT(*) FROM applied_messages")[0][0]
+
+    # ---------------------------------------------------------------- labels
+
+    def record_label(
+        self,
+        label_type: LabelType,
+        *,
+        loop_id: str,
+        modality: str = "",
+        service_code: str = "",
+        tier: object = None,
+        actor_role: str = "",
+        pack_version: str = "",
+    ) -> None:
+        """Record what a coordinator taught the system. Spec section 7's flywheel.
+
+        Keyword-only past the label type, and there is no `detail`, no `reason`,
+        no `mrn`, no `actor` and no `control_id` parameter anywhere in this
+        signature. That absence is the control: a caller holding a patient name
+        and wanting it in an exportable artifact has no argument to put it in,
+        which is stronger than any filter applied to a dict a caller composed.
+        Every argument that *is* accepted is normalised on the way in, so the
+        table's contents are a property of this method rather than of its
+        callers' care.
+
+        `outcome` is derived from `label_type` through LABEL_OUTCOME rather than
+        accepted, so the release gate's false-match count cannot be moved by a
+        caller mislabelling a coordinator's slip.
+
+        Raises on an unknown label type. A label the eval harness cannot
+        interpret is worse than no label -- it would be counted as *something* --
+        and the caller is code, never a message, so the failure is a bug rather
+        than bad input.
+        """
+        if not isinstance(label_type, LabelType):
+            raise ReferralLoopError(
+                f"Refusing to record a label of unknown type {label_type!r}; "
+                f"the type must be a LabelType so its outcome is derivable"
+            )
+        row = (
+            label_type.value,
+            LABEL_OUTCOME[label_type].value,
+            _label_loop_ref(loop_id),
+            _label_coded(modality),
+            _label_coded(service_code),
+            _label_tier(tier),
+            _label_role(actor_role),
+            _label_pack_version(pack_version),
+            # Day resolution, deliberately. See the schema note.
+            datetime.now(timezone.utc).date().isoformat(),
+        )
+        with self._lock:
+            conn = self._guarded()
+            try:
+                conn.execute(
+                    "INSERT INTO labels (label_type, outcome, loop_id, modality, service_code, "
+                    "tier, actor_role, pack_version, created_date) VALUES (?,?,?,?,?,?,?,?,?)",
+                    row,
+                )
+                conn.commit()
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise StoreUnavailableError(f"Label write failed: {exc}") from exc
+            finally:
+                conn.close()
+
+    def labels(self) -> list[dict]:
+        """Every label, oldest first. The artifact a site would contribute back."""
+        return [dict(r) for r in self._read("SELECT * FROM labels ORDER BY label_id")]
 
     def append_event(self, event: LoopEvent) -> None:
         """Append an event and refresh its projection in ONE transaction.

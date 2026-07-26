@@ -269,6 +269,32 @@ _TEMPLATE_SOURCE = """<!doctype html>
 </table>
 {% else %}<p class="empty">No merges recorded.</p>{% endif %}
 
+<h2>To attach an orphan to the order it belongs to</h2>
+<p class="hint">Enter the orphan's id and the id of the loop that ordered the study. The
+ result is applied to that loop exactly as if it had matched on the wire &mdash; so a
+ preliminary read still cannot be acknowledged, and the orphan leaves this queue while
+ staying in the record.</p>
+<form method="post" action="{{ base }}/attach">
+ <input name="orphan_id" placeholder="orphan id" required>
+ <input name="target_loop_id" placeholder="attach to loop id" required>
+ <input name="actor" placeholder="your name" required>
+ <input name="role" placeholder="your role" required>
+ <button type="submit">Attach orphan</button>
+</form>
+
+<h2>To undo a match</h2>
+<p class="hint">If a result was attached to the wrong loop, undo it here. This is not the
+ same as undoing an acknowledgement: that withdraws your confirmation and leaves the
+ result where it is, while this detaches the result. The loop goes back to awaiting one
+ and the result returns to the orphan queue so it can be put where it belongs.</p>
+<form method="post" action="{{ base }}/undo_match">
+ <input name="loop_id" placeholder="loop id" required>
+ <input name="actor" placeholder="your name" required>
+ <input name="role" placeholder="your role" required>
+ <input name="reason" placeholder="reason (required)" required>
+ <button type="submit">Undo match</button>
+</form>
+
 <h2>To undo an acknowledgement</h2>
 <p class="hint">If you acknowledged the wrong loop, undo it here. The loop returns to
  the acknowledgement queue and both the original entry and the undo stay in the
@@ -354,7 +380,24 @@ def create_blueprint(store: LoopStore, registry: Registry, pack: RulePack) -> Bl
 
     @bp.errorhandler(LoopNotFoundError)
     def _not_found(exc: LoopNotFoundError):
-        return jsonify({"error": "No such loop", "loop_id": request.view_args.get("loop_id", "")}), 404
+        """404, and deliberately no echo of what was asked for.
+
+        Found by probing Task 15 and fixed in the same commit. This body used to
+        return `request.view_args["loop_id"]`, which on this route is a segment
+        the caller controls -- a coordinator's browser can POST to
+        /worklist/<anything>/acknowledge. Reflecting it made an HTTP response,
+        one of the four artifacts spec test 14 greps, echo whatever was in the
+        URL: a sentinel planted in PID came straight back out. `_refused` may
+        still echo the id because it is only reachable once the loop replayed,
+        so by then it is one this system minted.
+
+        Not logged either, for the same reason: logs are the second of those
+        four artifacts. An operator wanting to know which id was asked for has
+        the request log of whatever is in front of this, and a caller who typed
+        the id already has it.
+        """
+        logger.info("Worklist action refused: no such loop")
+        return jsonify({"error": "No such loop"}), 404
 
     @bp.errorhandler(StoreUnavailableError)
     def _unavailable(exc: StoreUnavailableError):
@@ -482,11 +525,92 @@ def create_blueprint(store: LoopStore, registry: Registry, pack: RulePack) -> Bl
         logger.warning("Orphan %s dismissed via the worklist", loop_id)
         return jsonify({"loop_id": loop_id, "state": registry.get(loop_id).state.value})
 
+    @bp.post("/<path:loop_id>/attach")
+    def attach(loop_id: str):
+        """A coordinator says this orphan belongs to that loop. Spec section 5.
+
+        The result is applied through the registry's ordinary result path, so
+        safety rule 1 still holds: attaching a preliminary read leaves the target
+        RESULTED and unacknowledgeable. Nothing about that is this route's doing
+        and nothing here may weaken it.
+        """
+        payload = _payload()
+        target = _text(payload, "target_loop_id", _MAX_ATTRIBUTION)
+        actor = _text(payload, "actor", _MAX_ATTRIBUTION)
+        role = _text(payload, "role", _MAX_ATTRIBUTION)
+        try:
+            registry.attach_orphan(
+                loop_id, target, actor=actor, role=role, control_id=CONTROL_ID
+            )
+        except LoopNotFoundError:
+            # Answered here rather than re-raised, unlike every other action on
+            # this page, and for a reason specific to taking two ids: the shared
+            # 404 handler names the one in the URL, so a coordinator who mistyped
+            # the *target* would be told their orphan does not exist. Still a
+            # 404 and never the 409 below, which is what re-raising exists to
+            # guarantee.
+            #
+            # Neither id is echoed. Both are caller-supplied here, and a response
+            # body is one of the artifacts spec test 14 greps -- reflecting
+            # whatever was posted would make this route the leak.
+            logger.info("Worklist attach refused: one of the two loop ids does not exist")
+            return jsonify({
+                "error": "No such loop; check both the orphan id and the target loop id"
+            }), 404
+        except ReferralLoopError as exc:
+            return _refused(registry, loop_id, exc)
+        logger.info("Orphan %s attached to loop %s via the worklist", loop_id, target)
+        return jsonify({
+            "orphan_id": loop_id,
+            "target_loop_id": target,
+            "state": registry.get(target).state.value,
+            "acknowledgement_means": ACKNOWLEDGEMENT_MEANS,
+        })
+
+    @bp.post("/<path:loop_id>/undo_match")
+    def undo_match(loop_id: str):
+        """A coordinator says the matcher attached the wrong result.
+
+        Distinct from reverse_acknowledgement, which withdraws a human's
+        confirmation and leaves the result attached. This detaches the result:
+        the loop goes back to awaiting one and the result returns to the orphan
+        queue so it can be put where it belongs.
+        """
+        payload = _payload()
+        actor = _text(payload, "actor", _MAX_ATTRIBUTION)
+        role = _text(payload, "role", _MAX_ATTRIBUTION)
+        reason = _text(payload, "reason", _MAX_REASON)
+        try:
+            orphan_id = registry.undo_match(
+                loop_id, actor=actor, role=role, reason=reason, control_id=CONTROL_ID
+            )
+        except LoopNotFoundError:
+            raise
+        except ReferralLoopError as exc:
+            return _refused(registry, loop_id, exc)
+        # No reason in the log line: free text a human typed, the channel PHI
+        # leaks through. It is in the append-only event log and nowhere else.
+        logger.warning("Match on loop %s undone via the worklist", loop_id)
+        return jsonify({
+            "loop_id": loop_id,
+            "state": registry.get(loop_id).state.value,
+            "detached_to": orphan_id,
+        })
+
     @bp.post("/undo")
     def undo():
         """The page's own form target for a reversal, which needs a loop id field."""
         loop_id = _text(_payload(), "loop_id", _MAX_ATTRIBUTION)
         return reverse_acknowledgement(loop_id)
+
+    @bp.post("/attach")
+    def attach_form():
+        """The page's own form target, which carries the orphan id in the body."""
+        return attach(_text(_payload(), "orphan_id", _MAX_ATTRIBUTION))
+
+    @bp.post("/undo_match")
+    def undo_match_form():
+        return undo_match(_text(_payload(), "loop_id", _MAX_ATTRIBUTION))
 
     return bp
 
