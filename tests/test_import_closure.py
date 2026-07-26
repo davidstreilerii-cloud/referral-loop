@@ -12,6 +12,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 FORBIDDEN = [
     "chromadb", "sentence_transformers", "torch", "transformers",
     "healthcare_rag.revenue_integrity", "healthcare_rag.denial_rca",
@@ -27,11 +29,21 @@ print(json.dumps(sorted(sys.modules)))
 """
 
 
+def _run_probe() -> set[str]:
+    """Import referral_loop in a clean interpreter, return everything it loaded.
+
+    Surfaces stderr on failure rather than using check=True: a real ImportError
+    inside the probe would otherwise arrive as an opaque non-zero exit with the
+    actual traceback swallowed.
+    """
+    proc = subprocess.run([sys.executable, "-c", _PROBE], capture_output=True, text=True)
+    if proc.returncode != 0:
+        pytest.fail(f"probe failed (exit {proc.returncode}):\n{proc.stderr}")
+    return set(json.loads(proc.stdout))
+
+
 def test_referral_import_closure_in_a_clean_interpreter():
-    proc = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True
-    )
-    loaded = set(json.loads(proc.stdout))
+    loaded = _run_probe()
     leaked = sorted(m for m in loaded if any(m == f or m.startswith(f + ".") for f in FORBIDDEN))
     assert leaked == [], f"referral_loop pulled in forbidden modules: {leaked}"
 
@@ -48,11 +60,7 @@ def test_anthropic_is_in_the_closure_and_that_is_expected():
     the whole suite -- an assertion about behavior, not about the import graph. A
     module being importable is not a model call.
     """
-    proc = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True
-    )
-    loaded = set(json.loads(proc.stdout))
-    assert "anthropic" in loaded, (
+    assert "anthropic" in _run_probe(), (
         "If anthropic is no longer in the closure the parent package changed; "
         "re-check that spec test 6 still proves what it claims."
     )
