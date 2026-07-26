@@ -30,5 +30,13 @@ class StoreUnavailableError(ReferralLoopError):
     """Durable write failed. Respond AE so the engine queues. Never ACK."""
 
 
+class LoopNotFoundError(ReferralLoopError):
+    """No events exist for the requested loop, so no state is derivable.
+
+    A ReferralLoopError rather than a bare KeyError so callers can handle every
+    referral-loop failure with one except clause.
+    """
+
+
 class ThresholdsNotAcceptedError(ReferralLoopError):
     """Staleness thresholds shipped as defaults but not accepted by the site."""

@@ -15,8 +15,11 @@ permissions on the database file rather than by anything this module can
 express -- say so plainly in any control narrative rather than claiming the
 file is tamper-proof:
 
-  * DROP TABLE removes the triggers with the table. SQLite has no in-file DDL
-    permission model.
+  * DDL disarms the log. DROP TRIGGER removes a guard while leaving the table
+    looking intact; DROP TABLE removes both at once; ALTER TABLE ... RENAME
+    moves the rows out from under the triggers. All three were confirmed to
+    succeed from a foreign connection. SQLite has no in-file DDL permission
+    model, so none of them can be blocked from inside the file.
   * REPLACE INTO performs its implicit delete without firing a BEFORE DELETE
     trigger unless recursive_triggers is on, and that pragma is per-connection.
     _connect() sets it, so every path through LoopStore is covered; a foreign
@@ -30,11 +33,13 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .errors import StoreUnavailableError
+from .errors import LoopNotFoundError, StoreUnavailableError
 from .events import Loop, LoopEvent, LoopState
 
-_SQLITE_DELETE = 9
-_SQLITE_UPDATE = 23
+# States that mean "still waiting on a result". Derived from LoopState rather
+# than written out as SQL string literals, so renaming a state cannot leave a
+# stale literal silently matching nothing.
+_OPEN_STATES = (LoopState.OPEN, LoopState.SCHEDULED)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_messages (
@@ -108,7 +113,10 @@ def _authorizer(action_code: int, arg1, arg2, *_args):
     an authorizer is per-connection and stops nothing that opens the file
     without one.
     """
-    if action_code in (_SQLITE_DELETE, _SQLITE_UPDATE) and arg1 in ("loop_events", "raw_messages"):
+    if action_code in (sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE) and arg1 in (
+        "loop_events",
+        "raw_messages",
+    ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
 
@@ -129,15 +137,31 @@ class LoopStore:
                 conn.close()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # Pinned, not left to SQLite's defaults. These currently match the
-        # defaults, which means nothing would fail if a later change flipped
-        # them -- and persist-before-ACK would quietly stop holding.
-        conn.execute("PRAGMA synchronous = FULL")       # fsync on commit
-        conn.execute("PRAGMA recursive_triggers = ON")  # so REPLACE fires BEFORE DELETE
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        """Open a connection, or raise StoreUnavailableError. Never a raw sqlite3 error.
+
+        Every failure this module can suffer has to reach the listener as a
+        StoreUnavailableError, because that is what Task 10 catches to answer AE
+        and let the engine queue and retry. sqlite3.connect() is lazy -- the file
+        is really opened by the first statement, which is the PRAGMA below -- so
+        disk full, unmounted volume and permission denied all surface here.
+        Those are precisely the cases the AE path exists for, and an untyped
+        OperationalError would sail straight past its handler.
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            # Pinned, not left to SQLite's defaults. These currently match the
+            # defaults, which means nothing would fail if a later change flipped
+            # them -- and persist-before-ACK would quietly stop holding.
+            conn.execute("PRAGMA synchronous = FULL")       # fsync on commit
+            conn.execute("PRAGMA recursive_triggers = ON")  # so REPLACE fires BEFORE DELETE
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
+        except sqlite3.Error as exc:
+            if conn is not None:
+                conn.close()
+            raise StoreUnavailableError(f"Cannot open store at {self.db_path}: {exc}") from exc
 
     def _guarded(self) -> sqlite3.Connection:
         conn = self._connect()
@@ -185,14 +209,29 @@ class LoopStore:
             finally:
                 conn.close()
 
-    def raw_count(self) -> int:
+    def _read(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        """Run a read and close the connection, typing any failure."""
         conn = self._connect()
         try:
-            return conn.execute("SELECT COUNT(*) FROM raw_messages").fetchone()[0]
+            return conn.execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"Store read failed: {exc}") from exc
         finally:
             conn.close()
 
+    def raw_count(self) -> int:
+        return self._read("SELECT COUNT(*) FROM raw_messages")[0][0]
+
     def append_event(self, event: LoopEvent) -> None:
+        """Append an event and refresh its projection in ONE transaction.
+
+        The event log is authoritative, but open_loops() reads ids from the
+        loops projection. Committing the event and the projection separately
+        left a window where a crash produced a brand-new referral loop that was
+        durably in the log yet invisible on the coordinator's worklist -- the
+        exact failure this product exists to prevent. Same connection, one
+        commit: they land together or not at all.
+        """
         if event.event_type not in _EVENT_STATE and event.event_type not in _NON_TRANSITIONAL:
             # Validate before the insert, not after. replay() also rejects
             # unknown types, but by then the event is committed and the log is
@@ -200,7 +239,7 @@ class LoopStore:
             # unreplayable with no way to correct it.
             raise StoreUnavailableError(
                 f"Refusing to append unknown event_type {event.event_type!r}: "
-                "it would make loop " + f"{event.loop_id} permanently unreplayable"
+                f"it would make loop {event.loop_id} permanently unreplayable"
             )
         with self._lock:
             conn = self._guarded()
@@ -216,30 +255,23 @@ class LoopStore:
                         json.dumps(event.detail, sort_keys=True),
                     ),
                 )
+                # Same connection, so this joins the transaction the INSERT
+                # opened and is covered by the single commit below.
+                self._materialize(event.loop_id, conn)
                 conn.commit()
             except sqlite3.Error as exc:
+                conn.rollback()
                 raise StoreUnavailableError(f"Event append failed: {exc}") from exc
+            except Exception:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
-            self._materialize(event.loop_id)
 
-    def events_for(self, loop_id: str) -> list[LoopEvent]:
-        """Events in arrival order (event_id), deliberately not occurred_at.
+    _EVENTS_SQL = "SELECT * FROM loop_events WHERE loop_id = ? ORDER BY event_id"
 
-        Each event was accepted by the registry, which validated the transition
-        at the moment it was applied, so arrival order IS the authoritative
-        accepted sequence and replay must reproduce exactly what the system did.
-        Reordering by occurred_at would make replay show a history that never
-        happened. Rejecting a clinically-older message that arrives late is the
-        registry's job, before the event is ever appended -- not the store's.
-        """
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM loop_events WHERE loop_id = ? ORDER BY event_id", (loop_id,)
-            ).fetchall()
-        finally:
-            conn.close()
+    @staticmethod
+    def _rows_to_events(rows) -> list[LoopEvent]:
         return [
             LoopEvent(
                 loop_id=r["loop_id"],
@@ -251,11 +283,31 @@ class LoopStore:
             for r in rows
         ]
 
+    def events_for(self, loop_id: str) -> list[LoopEvent]:
+        """Events in arrival order (event_id), deliberately not occurred_at.
+
+        Each event was accepted by the registry, which validated the transition
+        at the moment it was applied, so arrival order IS the authoritative
+        accepted sequence and replay must reproduce exactly what the system did.
+        Reordering by occurred_at would make replay show a history that never
+        happened. Rejecting a clinically-older message that arrives late is the
+        registry's job, before the event is ever appended -- not the store's.
+        """
+        return self._rows_to_events(self._read(self._EVENTS_SQL, (loop_id,)))
+
+    def _replay_on(self, conn: sqlite3.Connection, loop_id: str) -> Loop:
+        """Replay through a caller-owned connection, so an in-flight
+        transaction sees its own uncommitted event."""
+        rows = conn.execute(self._EVENTS_SQL, (loop_id,)).fetchall()
+        return self._build_loop(loop_id, self._rows_to_events(rows))
+
     def replay(self, loop_id: str) -> Loop:
         """Reconstruct a loop from its events alone. Spec test 10."""
-        events = self.events_for(loop_id)
+        return self._build_loop(loop_id, self.events_for(loop_id))
+
+    def _build_loop(self, loop_id: str, events: list[LoopEvent]) -> Loop:
         if not events:
-            raise KeyError(f"No events for loop {loop_id}")
+            raise LoopNotFoundError(f"No events for loop {loop_id}")
 
         state = LoopState.OPEN
         attrs: dict = {}
@@ -294,27 +346,26 @@ class LoopStore:
             ack_at=datetime.fromisoformat(ack_at) if ack_at else None,
         )
 
-    def _materialize(self, loop_id: str) -> None:
-        """Refresh the loops row from the event log. Never the source of truth."""
-        loop = self.replay(loop_id)
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO loops (loop_id, mrn, state, placer_order_number, "
-                "filler_order_number, service_code, modality, ordering_provider, ordered_at, "
-                "ack_by, ack_role, ack_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    loop.loop_id, loop.mrn, loop.state.value, loop.placer_order_number,
-                    loop.filler_order_number, loop.service_code, loop.modality,
-                    loop.ordering_provider,
-                    loop.ordered_at.isoformat() if loop.ordered_at else None,
-                    loop.ack_by, loop.ack_role,
-                    loop.ack_at.isoformat() if loop.ack_at else None,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    def _materialize(self, loop_id: str, conn: sqlite3.Connection) -> None:
+        """Refresh the loops row from the event log. Never the source of truth.
+
+        The caller owns the transaction and the commit, so this can be enlisted
+        in the same one as the event insert that prompted it.
+        """
+        loop = self._replay_on(conn, loop_id)
+        conn.execute(
+            "INSERT OR REPLACE INTO loops (loop_id, mrn, state, placer_order_number, "
+            "filler_order_number, service_code, modality, ordering_provider, ordered_at, "
+            "ack_by, ack_role, ack_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                loop.loop_id, loop.mrn, loop.state.value, loop.placer_order_number,
+                loop.filler_order_number, loop.service_code, loop.modality,
+                loop.ordering_provider,
+                loop.ordered_at.isoformat() if loop.ordered_at else None,
+                loop.ack_by, loop.ack_role,
+                loop.ack_at.isoformat() if loop.ack_at else None,
+            ),
+        )
 
     def rebuild_projection(self) -> int:
         """Rebuild every loops row from the event log. Returns loops rebuilt.
@@ -325,38 +376,69 @@ class LoopStore:
         sitting right there. A loop vanishing silently from the worklist is the
         exact failure this product exists to prevent.
         """
-        conn = self._connect()
-        try:
-            loop_ids = [
-                r["loop_id"]
-                for r in conn.execute(
-                    "SELECT DISTINCT loop_id FROM loop_events ORDER BY loop_id"
-                ).fetchall()
-            ]
-        finally:
-            conn.close()
         with self._lock:
-            for loop_id in loop_ids:
-                self._materialize(loop_id)
+            conn = self._connect()
+            try:
+                loop_ids = [
+                    r["loop_id"]
+                    for r in conn.execute(
+                        "SELECT DISTINCT loop_id FROM loop_events ORDER BY loop_id"
+                    ).fetchall()
+                ]
+                for loop_id in loop_ids:
+                    self._materialize(loop_id, conn)
+                conn.commit()
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise StoreUnavailableError(f"Projection rebuild failed: {exc}") from exc
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
         return len(loop_ids)
 
-    def open_loops(self, mrn: str | None = None) -> list[Loop]:
-        query = "SELECT loop_id FROM loops WHERE state IN ('OPEN', 'SCHEDULED')"
-        params: tuple = ()
-        if mrn:
-            query += " AND mrn = ?"
-            params = (mrn,)
+    def _loops_where(self, clause: str, params: tuple) -> list[Loop]:
         conn = self._connect()
         try:
-            ids = [r["loop_id"] for r in conn.execute(query, params).fetchall()]
+            ids = [
+                r["loop_id"]
+                for r in conn.execute(
+                    f"SELECT loop_id FROM loops WHERE {clause}", params
+                ).fetchall()
+            ]
+            return [self._replay_on(conn, i) for i in ids]
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"Store read failed: {exc}") from exc
         finally:
             conn.close()
-        return [self.replay(i) for i in ids]
+
+    def open_loops(self, mrn: str | None = None) -> list[Loop]:
+        """Loops still awaiting a result. Not the whole worklist -- a RESULTED
+        loop nobody has acknowledged yet is in resulted_unacknowledged()."""
+        placeholders = ", ".join("?" * len(_OPEN_STATES))
+        clause = f"state IN ({placeholders})"
+        params: tuple = tuple(s.value for s in _OPEN_STATES)
+        if mrn:
+            clause += " AND mrn = ?"
+            params += (mrn,)
+        return self._loops_where(clause, params)
+
+    def resulted_unacknowledged(self, mrn: str | None = None) -> list[Loop]:
+        """Resulted loops with no acknowledgement, including reopened ones.
+
+        "reopened" maps to RESULTED, which open_loops() does not select, so a
+        loop whose acknowledgement was just cleared by safety rule 2 -- a
+        corrected result, the population most needing a human -- was returned by
+        nothing but unfiltered all_loops(). ack_at is '' when an event cleared
+        it and NULL when it was never set; both mean unacknowledged.
+        """
+        clause = "state = ? AND (ack_at IS NULL OR ack_at = '')"
+        params: tuple = (LoopState.RESULTED.value,)
+        if mrn:
+            clause += " AND mrn = ?"
+            params += (mrn,)
+        return self._loops_where(clause, params)
 
     def all_loops(self) -> list[Loop]:
-        conn = self._connect()
-        try:
-            ids = [r["loop_id"] for r in conn.execute("SELECT loop_id FROM loops").fetchall()]
-        finally:
-            conn.close()
-        return [self.replay(i) for i in ids]
+        return self._loops_where("1 = 1", ())
