@@ -52,6 +52,25 @@ class ReservedStateError(ReferralLoopError):
     """
 
 
+class CircularMergeError(ReferralLoopError):
+    """An ADT^A40 whose application would make a patient identity cyclic.
+
+    A40 says "A is retired, B survives"; a later one says "B is retired, A
+    survives". Both cannot hold. Resolving it by rule -- last writer wins, or
+    stopping the walk where it started -- silently picks an arbitrary survivor
+    and strands every loop on the losing side, which is this section's own
+    failure mode chosen deliberately rather than suffered.
+
+    So the merge is refused entirely: the alias table is unmodified, no loop
+    moves, and a human is told. A circular merge is an upstream registration
+    error and needs a person, not a tiebreak. Same posture as the confidence
+    floor -- decline rather than guess.
+
+    Not a StoreUnavailableError: the message must not be retried, because it
+    will never become acceptable without someone fixing registration.
+    """
+
+
 class StaleMessageError(ReferralLoopError):
     """A message clinically older than one already applied to the loop.
 

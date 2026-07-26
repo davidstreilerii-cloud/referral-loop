@@ -54,13 +54,21 @@ three consequences of treating it as one are all wrong:
 So MSH-7 travels with a merge under _MERGE_MESSAGE_AT, for the audit, and takes
 no part in _clinical_watermark.
 
-Aliasing is out of scope for v1 and is a real gap, stated rather than hidden.
-A merge moves the loops that exist when it is applied. An interface engine that
-keeps emitting the prior MRN afterwards -- which they do, for a while -- opens
-new loops on a retired identifier, and nothing here redirects them. Fixing that
-needs a persisted alias table consulted on every open, which is a schema change
-and a spec decision (does an alias expire? does it chain?), not something to add
-under a merge.
+Aliasing. A merge moves the loops that exist when it is applied, which is only
+half the problem: an interface engine keeps emitting the prior MRN afterwards,
+for a while, and those orders would open loops on a retired identifier that no
+query on the surviving patient returns. The other half is store.mrn_aliases, and
+identity is resolved through it exactly ONCE, by the listener at ingest, before
+this module or the matcher sees anything. Every MRN reaching this file is
+already the surviving one; the pre-resolution value travels alongside as
+submitted_mrn so the log still shows what the message said.
+
+The decisions behind that table, each justified where it is implemented:
+aliases do not expire and are undone only by an explicit reversal
+(store.record_alias, reverse_merge below); they compress on write so resolution
+is one lookup (store._apply_alias); a merge that would make an identity cyclic
+is refused outright rather than resolved by rule (errors.CircularMergeError);
+and resolution happens at one call site rather than at each writer.
 """
 from __future__ import annotations
 
@@ -153,6 +161,11 @@ class Registry:
     def get(self, loop_id: str) -> Loop:
         return self.store.replay(loop_id)
 
+    # No resolve_mrn here, deliberately. Identity is resolved exactly once, by
+    # the listener at ingest, through LoopStore.resolve_mrn -- a delegate on this
+    # class would invite a second call site, and two of those eventually
+    # disagree about who a message is about.
+
     # ---------------------------------------------------------------- creation
 
     def open_loop(
@@ -167,7 +180,15 @@ class Registry:
         ordered_at: datetime | None = None,
         loop_id: str | None = None,
         message_at: datetime | None = None,
+        submitted_mrn: str = "",
     ) -> str:
+        """Open a loop. `mrn` must already be resolved (store.resolve_mrn).
+
+        `submitted_mrn` is what the message carried before the listener resolved
+        it, and defaults to `mrn` when nothing was resolved, so the field is
+        always present -- "absent means unchanged" is exactly the implicit
+        encoding an auditor cannot distinguish from "not written yet".
+        """
         if not mrn:
             # A loop with no MRN is returned by no patient query and reviewed by
             # nobody. An unattributable result belongs in the orphan queue,
@@ -185,6 +206,19 @@ class Registry:
                 raise ReferralLoopError(
                     f"Loop {loop_id} already exists; a second 'created' event would reset its state"
                 )
+            # A guard, not a second resolution point: it never chooses an
+            # identity, it only refuses one that has stopped being current.
+            # Resolution happens at ingest, and a merge can commit between there
+            # and here -- microseconds, but the loser is a loop stored on a
+            # just-retired MRN, invisible to every query on the surviving
+            # patient and to this merge's straggler scan, which has already run.
+            # Raising turns that silent invisibility into a loud, retryable
+            # error the listener answers by re-resolving and resending.
+            if self.store.resolve_mrn(mrn) != mrn:
+                raise ReferralLoopError(
+                    f"MRN {mrn} was retired between ingest and this write; re-resolve and "
+                    "retry. Storing the loop here would hide it from the surviving patient."
+                )
             self.store.append_event(
                 LoopEvent(
                     loop_id=loop_id,
@@ -193,7 +227,16 @@ class Registry:
                     control_id=control_id,
                     detail=self._stamp(
                         {
+                            # Already the surviving identifier: the listener
+                            # resolves once at ingest, before this module sees
+                            # anything. Resolving again here would be a second
+                            # call site, and two of those eventually disagree.
                             "mrn": mrn,
+                            # What the message actually said. An auditor asking
+                            # why this loop sits on a patient the message never
+                            # named needs the answer in the log, not in the
+                            # listener's memory.
+                            "submitted_mrn": submitted_mrn or mrn,
                             "modality": modality,
                             "placer_order_number": placer_order_number,
                             "filler_order_number": filler_order_number,
@@ -210,7 +253,14 @@ class Registry:
             )
         return loop_id
 
-    def orphan(self, control_id: str, mrn: str, detail: dict, message_at: datetime | None = None) -> str:
+    def orphan(
+        self,
+        control_id: str,
+        mrn: str,
+        detail: dict,
+        message_at: datetime | None = None,
+        submitted_mrn: str = "",
+    ) -> str:
         """Create a loop-shaped record to hold a result nobody ordered.
 
         ORPHAN is not in _CLOSEABLE_FROM, so an orphan cannot be acknowledged
@@ -219,10 +269,13 @@ class Registry:
         loop_id = f"O-{uuid.uuid4().hex[:12]}"
         # mrn last: the explicit argument wins over a stray key in detail, so a
         # match key cannot silently re-attribute the record to another patient.
+        # Already resolved by the listener, like open_loop's.
         self.store.append_event(
             LoopEvent(
                 loop_id, "orphaned", _now(), control_id,
-                self._stamp({**detail, "mrn": mrn}, message_at),
+                self._stamp(
+                    {**detail, "mrn": mrn, "submitted_mrn": submitted_mrn or mrn}, message_at
+                ),
             )
         )
         return loop_id
@@ -255,16 +308,22 @@ class Registry:
         patient table here -- an MRN exists exactly insofar as loops carry it --
         so the surviving record is created by the carry itself, and logged.
 
+        Two things happen, in this order: the alias is recorded, then the
+        existing loops are carried. The alias is what makes *future* orders on
+        the retired MRN land correctly; the carry is what fixes the ones already
+        here. Neither alone is sufficient.
+
         Returns the loop ids moved. Empty is a legitimate outcome: an A40 for a
         patient with no loops, or the same A40 delivered twice.
 
         Not atomic across loops, and does not need to be. append_event owns one
         transaction per loop, so a store failure partway leaves some loops moved
-        and some not. The engine gets AE and resends; because selection is by
-        *current* MRN, the resend picks up exactly the ones still on the prior
-        identifier and finishes the job. Resumable rather than all-or-nothing --
-        which is the right shape here, since a merge held open across thousands
-        of loops in one transaction would block the interface instead.
+        and some not. The engine gets AE and resends; because the alias is
+        already durable and the resend rescans the whole chain, it picks up
+        exactly the loops still behind and finishes the job. Resumable rather
+        than all-or-nothing -- which is the right shape here, since a merge held
+        open across thousands of loops in one transaction would block the
+        interface instead.
         """
         if not prior_mrn or not surviving_mrn:
             # An empty surviving MRN would blank the identifier on every loop it
@@ -290,18 +349,51 @@ class Registry:
             return []
 
         moved: list[str] = []
-        # Held across the whole merge, not per loop. Otherwise an ORM arriving
-        # mid-merge opens a loop on the prior MRN after the scan has passed it,
-        # and that loop is stranded on a retired identifier at the one moment
-        # nobody is looking for it. Loops arriving after the merge commits are a
-        # real and separate problem -- see the module note on aliasing.
+        # Held across the whole merge, not per loop, and across the alias write
+        # too. Otherwise an ORM arriving mid-merge opens a loop on the prior MRN
+        # after the scan has passed it and before the alias exists to redirect
+        # it -- stranded on a retired identifier at the one moment nobody is
+        # looking for it. With both inside the lock there is no such window: an
+        # order either lands before the merge and is carried by the scan, or
+        # after it and is resolved by the alias.
         with self._lock:
-            if not self.store.loops_for_mrn(surviving_mrn):
+            # BEFORE the loops move, deliberately. append_event owns one
+            # transaction per loop, so the alias and the moves cannot share one;
+            # of the two orderings only this one fails safe. Alias first: a
+            # crash leaves the alias durable and some loops unmoved, so new
+            # orders already resolve correctly and the resend finishes the moves.
+            # Loops first: a crash leaves loops moved and no alias, which is
+            # precisely the invisibility gap this table was added to close.
+            #
+            # Raises CircularMergeError if the claim contradicts one on file.
+            # Nothing is written and nothing moves -- the refusal has to happen
+            # before the first append, not partway through.
+            applied = self.store.record_alias(prior_mrn, surviving_mrn, _now(), control_id)
+            surviving = self.store.resolve_mrn(surviving_mrn)
+            if applied is None:
+                logger.info(
+                    "ADT^A40 %s: %s is already retired into %s; no new alias recorded",
+                    control_id, prior_mrn, surviving,
+                )
+
+            if not self.store.loops_for_mrn(surviving):
                 logger.info(
                     "ADT^A40 %s: surviving MRN is unknown here; carrying loops onto it anyway",
                     control_id,
                 )
-            for loop in self.store.loops_for_mrn(prior_mrn):
+
+            # Every identifier retired into this patient, not only the one the
+            # message named. Two cases need that: compression, where A and B may
+            # both now point at C, and a merge interrupted partway, whose loops
+            # sit on an identifier the alias already resolves past. Scanning the
+            # preimage is what makes the resend complete the job -- and it is one
+            # indexed lookup, not a walk.
+            stragglers = [
+                loop
+                for source in self.store.retired_into(surviving)
+                for loop in self.store.loops_for_mrn(source)
+            ]
+            for loop in stragglers:
                 self.store.append_event(
                     LoopEvent(
                         loop_id=loop.loop_id,
@@ -309,7 +401,23 @@ class Registry:
                         occurred_at=_now(),
                         control_id=control_id,
                         detail=self._stamp_merge(
-                            {"mrn": surviving_mrn, "merged_from_mrn": prior_mrn}, message_at
+                            {
+                                # The RESOLVED survivor, not the identifier the
+                                # message named. With compression those differ
+                                # whenever an A40 arrives against an already
+                                # retired MRN, and storing the message's version
+                                # would put the loop on an MRN that resolves
+                                # elsewhere -- reintroducing the split patient.
+                                "mrn": surviving,
+                                # Where this loop actually was, which is not
+                                # always the prior MRN the message named: a
+                                # straggler may be sitting on a third identifier
+                                # compressed onto the same patient. The reversal
+                                # reads this to know what to carry back.
+                                "merged_from_mrn": loop.mrn,
+                                "submitted_prior_mrn": prior_mrn,
+                            },
+                            message_at,
                         ),
                     )
                 )
@@ -317,6 +425,65 @@ class Registry:
 
         logger.info("ADT^A40 %s: carried %d loop(s) to the surviving MRN", control_id, len(moved))
         return moved
+
+    def reverse_merge(
+        self, retired_mrn: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> list[str]:
+        """Undo an ADT^A40 administratively. Returns the loop ids carried back.
+
+        Aliases never expire, so without this a merge sent in error is
+        permanent -- and "these two records are one patient" is exactly the kind
+        of assertion registration sometimes gets wrong. It is the same shape as
+        rule 4's acknowledgement reversal: an explicit human act, appended and
+        never deleted, with actor, role and reason required, so the merge and its
+        undoing both stay legible in the log.
+
+        The loops go back too, and that is the part that matters clinically. An
+        alias reversal alone would stop redirecting new orders while leaving the
+        merged loops attributed to the surviving patient -- one patient's
+        referrals sitting on another's chart, which is worse than the merge it
+        was meant to undo. Only the loops this merge carried move back, found by
+        the merged_from_mrn each one recorded; loops that arrived on the
+        surviving MRN in their own right stay where they are.
+
+        State is untouched, here as everywhere: the carry-back is another
+        non-transitional merged_in.
+        """
+        with self._lock:
+            retired, surviving = self.store.reverse_alias(
+                retired_mrn, actor, role, reason, control_id
+            )
+
+            carried: list[str] = []
+            at = _now()
+            for loop in self.store.loops_for_mrn(surviving):
+                events = [e for e in self.store.events_for(loop.loop_id)
+                          if e.event_type == "merged_in"]
+                if not events or events[-1].detail.get("merged_from_mrn") != retired:
+                    continue
+                self.store.append_event(
+                    LoopEvent(
+                        loop_id=loop.loop_id,
+                        event_type="merged_in",
+                        occurred_at=at,
+                        control_id=control_id,
+                        detail={
+                            "mrn": retired,
+                            "merged_from_mrn": surviving,
+                            "merge_reversed_by": actor,
+                            "merge_reversed_role": role,
+                            "merge_reversed_reason": reason,
+                            "merge_reversed_at": at.isoformat(),
+                        },
+                    )
+                )
+                carried.append(loop.loop_id)
+
+        logger.warning(
+            "Merge %s -> %s reversed by %s; %d loop(s) returned to %s",
+            retired, surviving, actor, len(carried), retired,
+        )
+        return carried
 
     # -------------------------------------------------------------- transitions
 

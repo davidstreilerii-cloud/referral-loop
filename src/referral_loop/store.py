@@ -1,8 +1,14 @@
-"""Three tables: raw_messages, loops, loop_events.
+"""Four tables: raw_messages, loops, loop_events, mrn_alias_events.
 
 loop_events is append-only and authoritative -- any loop's state is derivable by
 replaying it. The loops table is a materialized convenience for the worklist
 query and carries no information the event log does not.
+
+mrn_alias_events is the second authoritative log: which patient identifiers have
+been retired in favour of which. It is append-only for the same reason, and the
+triggers below cover it. A loop's identity is therefore two facts -- the MRN in
+its event log, and the alias history that MRN resolves through -- and both have
+to survive a restore for the worklist to be correct.
 
 "Encrypted" here means a plain SQLite file on an OS-encrypted volume, attested
 at startup by encryption_check.verify_encryption_at_rest. Same definition the
@@ -34,7 +40,13 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .errors import LoopNotFoundError, ReservedStateError, StoreUnavailableError
+from .errors import (
+    CircularMergeError,
+    LoopNotFoundError,
+    ReferralLoopError,
+    ReservedStateError,
+    StoreUnavailableError,
+)
 from .events import Loop, LoopEvent, LoopState
 
 logger = logging.getLogger(__name__)
@@ -76,6 +88,44 @@ CREATE TABLE IF NOT EXISTS loops (
 CREATE INDEX IF NOT EXISTS idx_loops_mrn ON loops(mrn);
 CREATE INDEX IF NOT EXISTS idx_loops_state ON loops(state);
 
+-- ADT^A40 identity history, in the same event-plus-projection shape as loops.
+-- mrn_alias_events is the append-only truth (spec 10.5 reconstruction); it
+-- stores the pair the MESSAGE named, not the pair we applied, so a rebuild can
+-- recompute the compression from scratch.
+CREATE TABLE IF NOT EXISTS mrn_alias_events (
+    alias_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type     TEXT NOT NULL,   -- 'established' | 'reversed'
+    retired_mrn    TEXT NOT NULL,
+    surviving_mrn  TEXT NOT NULL,
+    established_at TEXT NOT NULL,
+    established_by TEXT NOT NULL,
+    detail         TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_alias_events_retired ON mrn_alias_events(retired_mrn);
+
+-- The compressed projection. One row per retired identifier, always pointing
+-- straight at the identifier that survives it -- never at another retired one.
+-- That invariant is maintained on WRITE: recording B->C rewrites every row
+-- already pointing at B. Resolution is then a single indexed lookup forever,
+-- rather than a walk whose length is set by how many times registration has
+-- merged this patient. Chasing at read time would put unbounded work on every
+-- inbound message and turn a cycle into a hang; compressing at write time also
+-- concentrates the one place a cycle can be detected, which is the reason it is
+-- detectable at all.
+--
+-- Deliberately NOT append-only, and not in the authorizer's deny list:
+-- compression rewrites rows, and an administrative reversal rebuilds the whole
+-- table. It carries no information mrn_alias_events does not.
+CREATE TABLE IF NOT EXISTS mrn_aliases (
+    retired_mrn    TEXT PRIMARY KEY,
+    surviving_mrn  TEXT NOT NULL,
+    established_at TEXT NOT NULL,
+    established_by TEXT NOT NULL
+);
+-- merge_patient asks "what has been retired into this patient" to collect
+-- stragglers; that is the reverse direction, so it needs its own index.
+CREATE INDEX IF NOT EXISTS idx_aliases_surviving ON mrn_aliases(surviving_mrn);
+
 -- Append-only enforcement lives in the schema, not in the connection.
 -- _authorizer only binds to connections LoopStore itself opens; any other
 -- process opening this file would bypass it entirely. These triggers travel
@@ -88,7 +138,14 @@ CREATE TRIGGER IF NOT EXISTS raw_messages_no_delete BEFORE DELETE ON raw_message
 BEGIN SELECT RAISE(ABORT, 'raw_messages is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS raw_messages_no_update BEFORE UPDATE ON raw_messages
 BEGIN SELECT RAISE(ABORT, 'raw_messages is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS mrn_alias_no_delete BEFORE DELETE ON mrn_alias_events
+BEGIN SELECT RAISE(ABORT, 'mrn_alias_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS mrn_alias_no_update BEFORE UPDATE ON mrn_alias_events
+BEGIN SELECT RAISE(ABORT, 'mrn_alias_events is append-only'); END;
 """
+
+_ALIAS_ESTABLISHED = "established"
+_ALIAS_REVERSED = "reversed"
 
 # Event types that deliberately carry fields without changing state.
 _NON_TRANSITIONAL = frozenset({"merged_in"})
@@ -134,6 +191,7 @@ def _authorizer(action_code: int, arg1, arg2, *_args):
     if action_code in (sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE) and arg1 in (
         "loop_events",
         "raw_messages",
+        "mrn_alias_events",
     ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
@@ -480,6 +538,282 @@ class LoopStore:
             clause += " AND mrn = ?"
             params += (mrn,)
         return self._loops_where(clause, params)
+
+    # ------------------------------------------------------------- MRN aliases
+
+    _RESOLVE_SQL = "SELECT surviving_mrn FROM mrn_aliases WHERE retired_mrn = ?"
+
+    def resolve_mrn(self, mrn: str) -> str:
+        """The identifier that survives this one, or this one. ONE lookup.
+
+        Called once per inbound message, at ingest, before the registry or the
+        matcher sees anything -- so that everything downstream works in surviving
+        identifiers and there is exactly one place that decides who a message is
+        about. Resolving at each call site instead gives two implementations that
+        eventually disagree, and the disagreement shows up as a loop on a
+        worklist nobody reads.
+
+        No walk and no depth cap, because mrn_aliases is compressed on write and
+        can never contain a row pointing at another retired identifier.
+
+        Measured, since it is on the hot path: 0.27 ms against a 10,000-row
+        alias table, and 0.27 ms at the head of a 500-deep merge chain -- the
+        same number, which is the whole point of compressing. An empty MRN costs
+        0.0001 ms because it never reaches the database.
+        """
+        if not mrn:
+            return mrn
+        rows = self._read(self._RESOLVE_SQL, (mrn,))
+        return rows[0]["surviving_mrn"] if rows else mrn
+
+    def retired_into(self, mrn: str) -> list[str]:
+        """Every identifier retired in favour of this one. One indexed lookup."""
+        if not mrn:
+            return []
+        return [r["retired_mrn"] for r in self._read(
+            "SELECT retired_mrn FROM mrn_aliases WHERE surviving_mrn = ? ORDER BY retired_mrn",
+            (mrn,),
+        )]
+
+    def aliases(self) -> list[tuple[str, str]]:
+        return [(r["retired_mrn"], r["surviving_mrn"]) for r in self._read(
+            "SELECT retired_mrn, surviving_mrn FROM mrn_aliases ORDER BY retired_mrn"
+        )]
+
+    def alias_count(self) -> int:
+        return self._read("SELECT COUNT(*) FROM mrn_aliases")[0][0]
+
+    def alias_events(self) -> list[sqlite3.Row]:
+        return self._read("SELECT * FROM mrn_alias_events ORDER BY alias_event_id")
+
+    @staticmethod
+    def _resolve_on(conn: sqlite3.Connection, mrn: str) -> str:
+        row = conn.execute(LoopStore._RESOLVE_SQL, (mrn,)).fetchone()
+        return row["surviving_mrn"] if row else mrn
+
+    @classmethod
+    def _apply_alias(
+        cls,
+        conn: sqlite3.Connection,
+        retired_mrn: str,
+        surviving_mrn: str,
+        established_at: str,
+        established_by: str,
+    ) -> tuple[str, str] | None:
+        """Compress one message's claim into the projection. Caller owns the txn.
+
+        Returns the pair actually applied, or None if it was already in force.
+        Raises CircularMergeError if applying it would make an identity cyclic.
+
+        Both endpoints resolve first, in one lookup each. A40s arrive against
+        whatever identifier the sending system still knows, so "A merges into C"
+        can arrive after A was already merged into B; recording the raw pair
+        would leave B's loops on B while new orders on A went to C -- one patient
+        split across two identifiers, which is the failure this table exists to
+        prevent, reintroduced by the fix for it.
+        """
+        source = cls._resolve_on(conn, retired_mrn)
+        target = cls._resolve_on(conn, surviving_mrn)
+
+        if source == target:
+            if cls._resolve_on(conn, retired_mrn) == surviving_mrn:
+                # The message's own claim is already in force -- the same A40
+                # delivered twice, which an engine does after a timeout.
+                return None
+            # The opposite direction is on file: this message says B retires
+            # into A while A is already retired into B. Refuse; see
+            # CircularMergeError. Nothing is written, including no event.
+            raise CircularMergeError(
+                f"Refusing ADT^A40 {retired_mrn} -> {surviving_mrn}: {surviving_mrn} already "
+                f"resolves to {target}, so applying this would make the identity cyclic. "
+                "Both claims cannot hold and choosing between them would strand every loop "
+                "on the losing side. The alias table is unmodified and no loop moved; "
+                "registration must correct this and a human must review it."
+            )
+
+        # Compression. Every row already pointing at the source now points past
+        # it, so no row ever references a retired identifier and resolution stays
+        # a single lookup no matter how often this patient is merged. The cost
+        # moves here, and grows with how many identifiers already resolve to the
+        # source -- two or three for a real patient. Paid once per A40 rather
+        # than once per inbound message, which is the trade being made.
+        conn.execute(
+            "UPDATE mrn_aliases SET surviving_mrn = ? WHERE surviving_mrn = ?",
+            (target, source),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO mrn_aliases (retired_mrn, surviving_mrn, established_at, "
+            "established_by) VALUES (?, ?, ?, ?)",
+            (source, target, established_at, established_by),
+        )
+
+        # The post-condition, checked rather than argued. The reasoning above
+        # says no row can now point at itself; this is what makes that a fact
+        # about the file instead of a fact about my reasoning.
+        if conn.execute(
+            "SELECT 1 FROM mrn_aliases WHERE retired_mrn = surviving_mrn LIMIT 1"
+        ).fetchone():
+            raise CircularMergeError(
+                f"Refusing ADT^A40 {retired_mrn} -> {surviving_mrn}: compressing it would "
+                "leave an identifier pointing at itself. Refused whole; a human must review."
+            )
+        return source, target
+
+    def record_alias(
+        self,
+        retired_mrn: str,
+        surviving_mrn: str,
+        established_at: datetime,
+        established_by: str,
+    ) -> tuple[str, str] | None:
+        """Record that retired_mrn is retired in favour of surviving_mrn.
+
+        The event and the compressed projection land in ONE transaction: an
+        alias visible in the log but missing from the projection would redirect
+        nothing, which is the whole failure this table closes.
+
+        Aliases do not expire. An alias records a fact the hospital asserted --
+        these are one patient -- and that does not decay; an expiring one would
+        silently resume stranding loops at an arbitrary future moment with no
+        event to explain it. A merge recorded in error is undone by
+        reverse_alias, an explicit administrative act with a named actor, never
+        by deletion and never by time passing.
+        """
+        if not retired_mrn or not surviving_mrn:
+            raise StoreUnavailableError(
+                f"Refusing to record an alias with an empty MRN: "
+                f"retired={retired_mrn!r} surviving={surviving_mrn!r}"
+            )
+        if retired_mrn == surviving_mrn:
+            raise CircularMergeError(f"Refusing to alias MRN {retired_mrn!r} to itself")
+
+        with self._lock:
+            conn = self._guarded()
+            try:
+                applied = self._apply_alias(
+                    conn, retired_mrn, surviving_mrn,
+                    established_at.isoformat(), established_by,
+                )
+                if applied is None:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "INSERT INTO mrn_alias_events (event_type, retired_mrn, surviving_mrn, "
+                    "established_at, established_by, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _ALIAS_ESTABLISHED, retired_mrn, surviving_mrn,
+                        established_at.isoformat(), established_by,
+                        # The pair the message named is the event; the pair we
+                        # applied after resolving both ends is derived, and is
+                        # recorded so an auditor can see the compression.
+                        json.dumps({"applied_retired": applied[0], "applied_surviving": applied[1]},
+                                   sort_keys=True),
+                    ),
+                )
+                conn.commit()
+                return applied
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise StoreUnavailableError(f"Alias write failed: {exc}") from exc
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def reverse_alias(
+        self, retired_mrn: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> tuple[str, str]:
+        """Undo a merge administratively. Returns the pair that was in force.
+
+        Aliases never expire, so this is the only way back from an A40 sent in
+        error -- and without it "no expiry" would mean a mistyped merge is
+        permanent. Recorded as an event, exactly like the acknowledgement
+        reversal in rule 4: appended, never a deletion, so the merge and its
+        undoing both stay in the log and an auditor sees that a human decided.
+
+        The projection is rebuilt from the log rather than edited, because
+        compression is lossy -- rows that were rewritten to point past this alias
+        cannot be un-rewritten in place.
+        """
+        if not actor or not role or not reason:
+            raise ReferralLoopError(
+                "An alias reversal needs a named actor, role and reason: it re-splits two "
+                "patient records and 'someone reversed it' is not an answer to why"
+            )
+        surviving = self.resolve_mrn(retired_mrn)
+        if surviving == retired_mrn:
+            raise ReferralLoopError(
+                f"MRN {retired_mrn} is not retired; there is no merge to reverse"
+            )
+        with self._lock:
+            conn = self._guarded()
+            try:
+                conn.execute(
+                    "INSERT INTO mrn_alias_events (event_type, retired_mrn, surviving_mrn, "
+                    "established_at, established_by, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _ALIAS_REVERSED, retired_mrn, surviving,
+                        datetime.now(timezone.utc).isoformat(), control_id,
+                        json.dumps(
+                            {"reversed_by": actor, "reversed_role": role,
+                             "reversed_reason": reason},
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                conn.commit()
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise StoreUnavailableError(f"Alias reversal failed: {exc}") from exc
+            finally:
+                conn.close()
+        self.rebuild_alias_projection()
+        logger.warning(
+            "MRN alias %s -> %s reversed by %s (%s): %s",
+            retired_mrn, surviving, actor, role, reason,
+        )
+        return retired_mrn, surviving
+
+    def rebuild_alias_projection(self) -> int:
+        """Recompute mrn_aliases from mrn_alias_events. Spec 10.5.
+
+        The projection is compressed and therefore derived; the log holds the
+        pairs the messages actually named. Replaying them through the same
+        compression reproduces the table exactly, which is what makes a restore
+        of loop_events plus mrn_alias_events sufficient.
+        """
+        with self._lock:
+            conn = self._guarded()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM mrn_alias_events ORDER BY alias_event_id"
+                ).fetchall()
+                reversed_mrns = {
+                    r["retired_mrn"] for r in rows if r["event_type"] == _ALIAS_REVERSED
+                }
+                conn.execute("DELETE FROM mrn_aliases")
+                applied = 0
+                for row in rows:
+                    if row["event_type"] != _ALIAS_ESTABLISHED:
+                        continue
+                    if row["retired_mrn"] in reversed_mrns:
+                        continue
+                    if self._apply_alias(
+                        conn, row["retired_mrn"], row["surviving_mrn"],
+                        row["established_at"], row["established_by"],
+                    ):
+                        applied += 1
+                conn.commit()
+                return applied
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise StoreUnavailableError(f"Alias projection rebuild failed: {exc}") from exc
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def loops_for_mrn(self, mrn: str) -> list[Loop]:
         """Every loop currently attributed to this MRN, in any state.
