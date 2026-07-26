@@ -24,6 +24,37 @@ The spec was corrected in three places while writing this plan. Read these befor
 
 ---
 
+## SPEC REVISION 2026-07-26 (`78abc7c`) — read before Tasks 7–16
+
+The spec changed under this plan after Task 6 was written. Four changes, each with downstream work.
+
+**1. `ACKNOWLEDGED` is v1's terminal state; `CLOSED` is reserved for v2 and must be unreachable.** A coordinator can support "this result belongs to this loop" — identifier work. They cannot support "a clinician competent to act has read it." One state named `CLOSED` entered by coordinator ack conflated the two, and the weaker claim wore the stronger one's name — a tool reporting every loop closed while no clinician saw a result, which is §1's failure with a dashboard asserting otherwise. **Affects Tasks 7, 11, 12, 15.** Everywhere this plan says `CLOSED` as a v1 terminal state, read `ACKNOWLEDGED`. Spec test 5 asserts `CLOSED` is unreachable by any path.
+
+**2. Two new transitions.** `reverse_acknowledgement` (spec rule 4) — rule 2 recovered the machine's error, nothing recovered the human's, and a coordinator who acknowledged the wrong loop left it resolved while the real one stayed open. And `dismiss_orphan` → `DISMISSED`, with a required reason: some orphans belong to no loop here, and a queue that only grows is one coordinators stop opening, silently disabling the surface the safety story and the flywheel both depend on. **Both land in Task 15's flywheel — every reversal is a labeled false positive.**
+
+**3. The tier field-map moves into pack data.** *(Task 2 pack regeneration + Task 8 matcher.)*
+
+```json
+"field_map": {
+  "placer_order_number": ["OBR-2", "ORC-2"],
+  "filler_order_number": ["OBR-3", "ORC-3", "OBR-18", "OBR-19"],
+  "service_code":        ["OBR-4.1"],
+  "modality":            ["OBR-24", "OBR-4.2"],
+  "ordering_provider":   ["OBR-16.1"],
+  "mrn":                 ["PID-3.1"]
+}
+```
+
+Candidates in priority order; first populated wins. Tier *logic* is stable everywhere — an exact accession match is strong evidence at every site. Field *placement* is not: accession lands in `OBR-3` at some sites, `OBR-18`/`ORC-3` at others, depending on the RIS and how the engine was built a decade ago. Hardcoding it meant onboarding such a site needed a code change, a release and a security review — defeating "rules as data" exactly where it matters most.
+
+Consequences: the matcher must resolve fields **through the pack**, not via Task 3's named constants (those remain correct defaults for the parser, but are no longer the matching source of truth); it must support **component notation** (`OBR-4.1`); and **`pack.json` must be regenerated and re-signed** via `scripts/sign_referral_pack.py --sign`, since the field map is covered by the signature — necessarily, because pointing `placer_order_number` at the wrong field would silently turn every tier-1 match into a false positive.
+
+**4. `false-close rate` → `false-match rate`, plus two new metrics.** Nothing closes in v1, so a metric named for closure described something the system does not do. Same definition, same role. `auto_match_rate` and `dismissal_rate` join it. The pack gains `min_auto_match_rate`.
+
+**Criterion 4 now has two halves, and this is the important one.** "False-match rate is zero" alone is passed perfectly by a matcher that attaches nothing — every result orphans, nothing is mis-attached, the safety number reads 0.000 and the gate goes green. The degenerate implementation scores best, and it fails *invisibly*: the metric everyone watches looks ideal precisely when the product has stopped working, and the only symptom is a coordinator queue quietly filling with the work the tool was bought to remove. A floor without a coverage requirement optimises toward silence. Task 12's proof was exactly this degenerate test and has been paired with a positive-match assertion; Task 14's gate now requires false-match not to regress (absolute veto), precision not to regress, and at least one target metric to improve.
+
+---
+
 ## RESOLVED: success criterion 6 was asserted against the wrong thing
 
 **Found during Task 1 review. Decision taken 2026-07-26: slim the image (option 2 below). Task 13 implements it.**
@@ -2888,9 +2919,37 @@ def test_sentinels_do_not_reach_the_audit_trail(stack, tmp_path):
 
 # ── Spec test 4: false-close gate ─────────────────────────────────────────────
 
-def test_false_close_rate_is_zero_at_the_configured_floor(stack):
-    """A false close attributes a result to the wrong order and reports the real
-    loop closed. This test blocks a pack release."""
+def test_a_confident_match_still_attaches(stack):
+    """The other half of criterion 4, and it must come FIRST.
+
+    "False-match rate is zero" is passed perfectly by a matcher that attaches
+    nothing: every result orphans, nothing is attached to the wrong loop, the
+    safety number reads 0.000 and the gate goes green. The degenerate
+    implementation scores best, and it fails invisibly -- the metric everyone
+    watches looks ideal exactly when the product has stopped working, and the
+    only symptom is a coordinator queue quietly filling with the work the tool
+    was bought to remove.
+
+    So the safety assertion below is only meaningful in the presence of this one.
+    """
+    handler, _, _ = stack
+    handler.handle(order(control_id="O1", placer="P1"))
+    handler.handle(oru_with_sentinels())   # carries placer PLACER1 -> tier 1
+
+    resulted = [loop for loop in handler.store.all_loops() if loop.state.value == "RESULTED"]
+    orphans = [loop for loop in handler.store.all_loops() if loop.state.value == "ORPHAN"]
+    assert len(resulted) == 1, "an unambiguous tier-1 match must attach, or the matcher is inert"
+    assert orphans == [], "a placer-number match must not orphan"
+
+
+def test_false_match_rate_is_zero_at_the_configured_floor(stack):
+    """A false match attributes a result to the wrong order, marks that loop
+    resolved, and leaves the real loop open while reporting it handled. This
+    test blocks a pack release.
+
+    Read together with test_a_confident_match_still_attaches above: this one
+    alone is satisfied by a matcher that does nothing.
+    """
     handler, _, _ = stack
 
     # Two same-patient CT orders one hour apart; the result names neither
@@ -3249,10 +3308,15 @@ from .store import LoopStore
 
 @dataclass(frozen=True)
 class EvalResult:
-    false_close_rate: float
+    false_match_rate: float     # safety metric; renamed from false_close_rate --
+                                # nothing closes in v1, so a name about closure
+                                # described something the system does not do
     precision: float
     recall: float
+    auto_match_rate: float      # guards the safety metric against a matcher that
+                                # resolves nothing and scores 0.000 on false-match
     orphan_rate: float
+    dismissal_rate: float       # feed health; a rising rate is an upstream problem
 
 
 @dataclass(frozen=True)
@@ -3311,22 +3375,52 @@ def replay(cases: list[LabeledCase], pack: RulePack, db_path: Path) -> EvalResul
     )
 
 
+_TARGET_METRICS = ("precision", "recall", "auto_match_rate", "orphan_rate", "dismissal_rate")
+_LOWER_IS_BETTER = frozenset({"orphan_rate", "dismissal_rate"})
+
+
 def gate_pack_release(baseline: EvalResult, candidate: EvalResult) -> tuple[bool, str]:
-    """A new pack ships only if false-close does not increase AND precision improves."""
-    if candidate.false_close_rate > baseline.false_close_rate:
+    """Three conditions, in order. The first is an absolute veto.
+
+    1. False-match rate must not regress -- regardless of every other number.
+    2. Precision must not regress.
+    3. At least one target metric must improve.
+
+    Condition 3 is not decoration. Without it a pack that changes nothing
+    measurable ships, and the changelog fills with revisions nobody can justify
+    by replay -- which is the whole mechanism that makes matching quality measurable
+    rather than asserted.
+    """
+    if candidate.false_match_rate > baseline.false_match_rate:
         return False, (
-            f"BLOCKED: false-close rate rose {baseline.false_close_rate:.4f} -> "
-            f"{candidate.false_close_rate:.4f}. Safety regression blocks release "
-            f"regardless of recall."
+            f"BLOCKED: false-match rate rose {baseline.false_match_rate:.4f} -> "
+            f"{candidate.false_match_rate:.4f}. Safety regression is an absolute veto, "
+            f"regardless of every other metric."
         )
-    if candidate.precision <= baseline.precision:
+    if candidate.precision < baseline.precision:
         return False, (
-            f"BLOCKED: precision did not improve "
+            f"BLOCKED: precision regressed "
             f"({baseline.precision:.4f} -> {candidate.precision:.4f})."
         )
+
+    improved = [
+        name for name in _TARGET_METRICS
+        if (getattr(candidate, name) < getattr(baseline, name))
+        if name in _LOWER_IS_BETTER
+    ] + [
+        name for name in _TARGET_METRICS
+        if name not in _LOWER_IS_BETTER and getattr(candidate, name) > getattr(baseline, name)
+    ]
+    if not improved:
+        return False, (
+            "BLOCKED: no target metric improved. A pack revision must be justified "
+            "by replay evidence, not by intent."
+        )
+
     return True, (
-        f"OK: false-close {baseline.false_close_rate:.4f} -> {candidate.false_close_rate:.4f}, "
-        f"precision {baseline.precision:.4f} -> {candidate.precision:.4f}."
+        f"OK: false-match {baseline.false_match_rate:.4f} -> {candidate.false_match_rate:.4f}, "
+        f"precision {baseline.precision:.4f} -> {candidate.precision:.4f}, "
+        f"improved: {', '.join(improved)}."
     )
 ```
 
