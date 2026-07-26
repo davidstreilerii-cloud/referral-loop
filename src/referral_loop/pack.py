@@ -59,11 +59,16 @@ def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
     except json.JSONDecodeError as exc:
         raise PackVerificationError("Pack is signed but not valid JSON") from exc
 
-    for required in ("_default",):
-        if required not in raw.get("date_windows_hours", {}):
-            raise PackVerificationError("date_windows_hours missing '_default'")
-        if required not in raw.get("staleness_hours", {}):
-            raise PackVerificationError("staleness_hours missing '_default'")
+    # A signed body that parses as JSON but is not an object would otherwise
+    # escape as AttributeError, and a caller catching PackVerificationError to
+    # refuse boot would crash instead of refusing.
+    if not isinstance(raw, dict):
+        raise PackVerificationError(f"Pack must be a JSON object, got {type(raw).__name__}")
+
+    if "_default" not in raw.get("date_windows_hours", {}):
+        raise PackVerificationError("date_windows_hours missing '_default'")
+    if "_default" not in raw.get("staleness_hours", {}):
+        raise PackVerificationError("staleness_hours missing '_default'")
 
     return RulePack(
         version=raw["version"],

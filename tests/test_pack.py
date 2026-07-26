@@ -71,3 +71,36 @@ def test_shipped_pack_and_signature_both_exist():
     assert (SHIPPED_PACK / "pack.sig").is_file(), (
         "load_pack refuses an unsigned pack; shipping pack.json alone cannot boot"
     )
+
+
+def test_missing_pack_file_refuses(tmp_path):
+    with pytest.raises(PackVerificationError, match="No pack"):
+        load_pack(tmp_path, b"\x00" * 32)
+
+
+def test_signed_but_non_json_body_refuses(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    body = b"this is signed but is not json"
+    (tmp_path / "pack.json").write_bytes(body)
+    (tmp_path / "pack.sig").write_bytes(key.sign(body))
+    with pytest.raises(PackVerificationError, match="not valid JSON"):
+        load_pack(tmp_path, key.public_key().public_bytes_raw())
+
+
+def test_signed_json_that_is_not_an_object_refuses(tmp_path):
+    """Must raise PackVerificationError, not AttributeError -- a caller catching
+    it to refuse boot would otherwise crash instead of refusing."""
+    key = Ed25519PrivateKey.generate()
+    body = b"[1, 2, 3]"
+    (tmp_path / "pack.json").write_bytes(body)
+    (tmp_path / "pack.sig").write_bytes(key.sign(body))
+    with pytest.raises(PackVerificationError, match="must be a JSON object"):
+        load_pack(tmp_path, key.public_key().public_bytes_raw())
+
+
+@pytest.mark.parametrize("field", ["date_windows_hours", "staleness_hours"])
+def test_missing_default_window_refuses(tmp_path, field):
+    broken = {**PACK, field: {"CT": 24}}
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match=f"{field} missing"):
+        load_pack(tmp_path, pubkey)
