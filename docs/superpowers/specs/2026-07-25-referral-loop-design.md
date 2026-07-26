@@ -89,7 +89,13 @@ A loop is an expectation of a result returning. Created by `REF^I12` or `ORM^O01
 | `CANCELLED` | `SIU^S15` / order cancel | Expectation withdrawn |
 | `ORPHAN` | ORU with no match | Result nobody ordered — needs a human |
 
-**`STALE` is derived, not stored.** Writing it into the `state` column would destroy the underlying state — a stale loop is still `OPEN` or `SCHEDULED`, and it must return to plain `OPEN` the moment a result arrives without a second transition to undo. Staleness is computed from `(state ∈ {OPEN, SCHEDULED}, age, per-modality threshold)` at read time and is the worklist's primary sort. It is listed as a state above because that is how a coordinator experiences it, not because it is one.
+**`STALE` is derived, not stored.** Three reasons, the last decisive:
+
+1. Writing it into the `state` column destroys the underlying state — a stale loop is still `OPEN` or `SCHEDULED`, and must return to plain `OPEN` the moment a result arrives, without a second transition to undo.
+2. A stored value goes wrong the instant a pack revises a threshold: loops labeled stale under the old number stay labeled until something rewrites them.
+3. **It would violate §10.5.** No message causes the `STALE` transition — it is entered by the passage of time. Since §10.5 requires every loop's state be reconstructible from `loop_events` alone, and there is no event to replay, a stored `STALE` makes that criterion unsatisfiable.
+
+Staleness is therefore computed from `(state ∈ {OPEN, SCHEDULED}, age, per-modality threshold)` at read time and is the worklist's primary sort. It is listed as a state in the table above because that is how a coordinator experiences it, not because it is one.
 
 **`ORPHAN` is a stored state on a loop-shaped record whose origin is a result rather than an order.** An unmatched `ORU` has no loop by definition, so the matcher creates one in `ORPHAN` to hold it. This keeps the coordinator queue reading a single table, and attaching an orphan is then a merge into the real loop rather than a separate workflow. Every attachment is a labeled example (§7).
 
