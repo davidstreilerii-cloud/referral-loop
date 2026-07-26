@@ -34,9 +34,37 @@ Ordering. store.replay() orders events by arrival (event_id), because every
 event was validated here at the moment it was applied, so arrival order is the
 authoritative accepted sequence. That makes rejecting a clinically-older message
 this module's job and nothing else's: see _refuse_if_stale.
+
+An ADT^A40 is exempt from that guard, deliberately, in both directions. It is an
+administrative correction about identity, not a clinical observation, and the
+three consequences of treating it as one are all wrong:
+
+  * A merge that advanced the watermark would make a result whose MSH-7 predates
+    it look stale. Registration merges a patient at 14:00; an ORU generated at
+    13:55 is still queued in the engine; that result is then refused and never
+    lands. Same reasoning that keeps acknowledge() off the watermark.
+  * A merge refused as stale strands loops on a retired MRN -- the precise
+    failure the merge exists to prevent, caused by the guard meant to prevent
+    regressions.
+  * Nothing is gained, because merge_patient selects by *current* MRN. Loops
+    already carried to B by a newer A->B are no longer on A, so a late A->C
+    finds nothing and is a no-op without any timestamp being compared. Late
+    ordering corrects itself structurally.
+
+So MSH-7 travels with a merge under _MERGE_MESSAGE_AT, for the audit, and takes
+no part in _clinical_watermark.
+
+Aliasing is out of scope for v1 and is a real gap, stated rather than hidden.
+A merge moves the loops that exist when it is applied. An interface engine that
+keeps emitting the prior MRN afterwards -- which they do, for a while -- opens
+new loops on a retired identifier, and nothing here redirects them. Fixing that
+needs a persisted alias table consulted on every open, which is a schema change
+and a spec decision (does an alias expire? does it chain?), not something to add
+under a merge.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -44,6 +72,8 @@ from datetime import datetime, timezone
 from .errors import ReferralLoopError, StaleMessageError
 from .events import Loop, LoopEvent, LoopState
 from .store import LoopStore
+
+logger = logging.getLogger(__name__)
 
 # OBX-11 result status codes we act on. HL7 table 0085.
 PRELIMINARY = "P"
@@ -83,6 +113,11 @@ _CANCELLABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
 # advance the watermark, or an acknowledgement today would make tomorrow's
 # correction look stale and safety rule 2 would silently stop working.
 _MESSAGE_AT = "message_at"
+
+# MSH-7 of an ADT^A40, recorded under its own key so the merge stays auditable
+# without joining the clinical watermark. See merge_patient and the module note
+# on why an identity correction is not a clinical observation.
+_MERGE_MESSAGE_AT = "merge_message_at"
 
 # Written by any event that supersedes an acknowledgement.
 _CLEARED_ACK = {"ack_by": "", "ack_role": "", "ack_at": ""}
@@ -191,6 +226,97 @@ class Registry:
             )
         )
         return loop_id
+
+    def merge_patient(
+        self,
+        prior_mrn: str,
+        surviving_mrn: str,
+        control_id: str,
+        message_at: datetime | None = None,
+    ) -> list[str]:
+        """ADT^A40. Move every loop from the prior MRN to the surviving one.
+
+        Spec section 4 rule 3, and the failure that breaks most homegrown
+        trackers: a loop that does not follow the surviving identifier is
+        returned by no query on the patient who still exists, so it vanishes
+        from the worklist while remaining clinically open -- and the tool then
+        reports all-clear on it. Every loop moves, in every state. An
+        ACKNOWLEDGED or DISMISSED record stranded on a retired MRN corrupts the
+        audit trail just as badly as an open one vanishing, and an ORPHAN left
+        behind can never be attached, because the coordinator searching the
+        surviving MRN does not see it.
+
+        State never changes: "merged_in" is in store._NON_TRANSITIONAL, so
+        replay carries the detail and skips the transition. A merge cannot
+        resurrect a CANCELLED loop, retire an open one, or clear an
+        acknowledgement.
+
+        An unknown surviving MRN is not an error (failure matrix). There is no
+        patient table here -- an MRN exists exactly insofar as loops carry it --
+        so the surviving record is created by the carry itself, and logged.
+
+        Returns the loop ids moved. Empty is a legitimate outcome: an A40 for a
+        patient with no loops, or the same A40 delivered twice.
+
+        Not atomic across loops, and does not need to be. append_event owns one
+        transaction per loop, so a store failure partway leaves some loops moved
+        and some not. The engine gets AE and resends; because selection is by
+        *current* MRN, the resend picks up exactly the ones still on the prior
+        identifier and finishes the job. Resumable rather than all-or-nothing --
+        which is the right shape here, since a merge held open across thousands
+        of loops in one transaction would block the interface instead.
+        """
+        if not prior_mrn or not surviving_mrn:
+            # An empty surviving MRN would blank the identifier on every loop it
+            # touched, which open_loop refuses for exactly the same reason: the
+            # loop is then returned by no patient-scoped query. An empty prior
+            # MRN would select every unattributed orphan and sweep them onto a
+            # patient at random.
+            raise ReferralLoopError(
+                "A merge needs both a prior and a surviving MRN; "
+                f"got prior={prior_mrn!r} surviving={surviving_mrn!r}"
+            )
+
+        if prior_mrn == surviving_mrn:
+            # A no-op, not a failure: nothing moves and nothing is stranded. Not
+            # raised, because a ReferralLoopError out of the listener is a
+            # message the engine will represent forever, and this one will never
+            # become acceptable. Logged because it is more likely to mean the
+            # MRG-1 field map is wrong than that registration really merged a
+            # patient into themselves.
+            logger.warning(
+                "ADT^A40 %s merges MRN %s into itself; no loops moved", control_id, prior_mrn
+            )
+            return []
+
+        moved: list[str] = []
+        # Held across the whole merge, not per loop. Otherwise an ORM arriving
+        # mid-merge opens a loop on the prior MRN after the scan has passed it,
+        # and that loop is stranded on a retired identifier at the one moment
+        # nobody is looking for it. Loops arriving after the merge commits are a
+        # real and separate problem -- see the module note on aliasing.
+        with self._lock:
+            if not self.store.loops_for_mrn(surviving_mrn):
+                logger.info(
+                    "ADT^A40 %s: surviving MRN is unknown here; carrying loops onto it anyway",
+                    control_id,
+                )
+            for loop in self.store.loops_for_mrn(prior_mrn):
+                self.store.append_event(
+                    LoopEvent(
+                        loop_id=loop.loop_id,
+                        event_type="merged_in",
+                        occurred_at=_now(),
+                        control_id=control_id,
+                        detail=self._stamp_merge(
+                            {"mrn": surviving_mrn, "merged_from_mrn": prior_mrn}, message_at
+                        ),
+                    )
+                )
+                moved.append(loop.loop_id)
+
+        logger.info("ADT^A40 %s: carried %d loop(s) to the surviving MRN", control_id, len(moved))
+        return moved
 
     # -------------------------------------------------------------- transitions
 
@@ -404,6 +530,13 @@ class Registry:
         if message_at is None:
             return detail
         return {**detail, _MESSAGE_AT: _as_utc(message_at).isoformat()}
+
+    @staticmethod
+    def _stamp_merge(detail: dict, message_at: datetime | None) -> dict:
+        """Record an A40's MSH-7 without letting it govern clinical ordering."""
+        if message_at is None:
+            return detail
+        return {**detail, _MERGE_MESSAGE_AT: _as_utc(message_at).isoformat()}
 
     @staticmethod
     def _message_time(event: LoopEvent) -> datetime | None:
