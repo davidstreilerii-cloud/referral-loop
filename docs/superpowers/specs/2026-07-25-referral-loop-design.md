@@ -55,7 +55,7 @@ Dockerfile.referral  installs healthcare_rag[referral]
 
 `db.py` and `audit_trail.py` are **not** imported, reversing an earlier assumption. `db.py` is hardwired to `rag_growth.db` and carries the RAG growth schema; importing it would drag an unrelated database into a build whose whole claim is a separate deployable. `audit_trail.log_access` delegates to `db.log_phi_access`, so importing it inherits that coupling, and its `AuditEvent` is shaped for an HTTP API (`endpoint`, `tokens_used`, `cost_usd`) with a free-text `query_summary` field — the same free-text channel shape that leaked through an unbounded free-text field in an earlier system. Referral audit therefore routes through `guardrails/immutable_audit.py`, which already owns its own append-only database and blocks `UPDATE`/`DELETE` at the SQLite authorizer — the property §6 requires of `loop_events` anyway.
 
-Both `GuardrailAuditEvent.detail` and `.resource_id` are free-text and must carry only allowlisted, non-identifying values (loop id, tier, pack version). Test 13 asserts this.
+Both `GuardrailAuditEvent.detail` and `.resource_id` are free-text and must carry only allowlisted, non-identifying values (loop id, tier, pack version). Test 14 asserts this.
 
 `guardrails/tenant_isolation.py` is deliberately **not** imported. v1 is a single-site install; importing an unexercised isolation control would suggest a guarantee the build does not test. It comes in with multi-tenancy or not at all.
 
@@ -134,7 +134,13 @@ v1 therefore keeps a persisted **alias table**, `mrn_aliases(retired_mrn, surviv
 
 **4. Resolution applies to matching as well as loop creation, because it happens before either.** A result carrying the retired MRN has the same problem and a sharper edge: tiers 3 and 4 both key on MRN (§5), so an unresolved alias silently demotes a matchable result to an orphan. Rather than call resolution from the registry and again from the matcher — two call sites that will eventually disagree — **the MRN is resolved once, at message ingest, before the registry or matcher sees it.** The raw archive keeps the message verbatim, as always; everything downstream sees the surviving identifier.
 
-Together, rule 3 handles loops that already existed and the alias table handles messages that arrive afterwards. Neither covers the other, and the gap between them is exactly where a loop goes invisible. Alias creation is recorded as an event so §10.5 reconstruction still holds.
+Together, rule 3 handles loops that already existed and the alias table handles messages that arrive afterwards. Neither covers the other, and the gap between them is exactly where a loop goes invisible.
+
+**Storage.** Aliases are an append-only `mrn_alias_events` log under the same tamper triggers as `loop_events`, with `mrn_aliases` as the write-compressed projection over it. The log is the record and the table is the index, exactly as for loops — so §10.5 reconstruction holds for identity as well as state, and an alias reversal is a new event rather than a deletion.
+
+**One refusal inside `open_loop`, and it is not a second resolution point.** Resolving at ingest is not atomic with committing a merge. A listener can resolve an MRN, a merge can commit, and the loop is then written onto an identifier retired microseconds earlier — invisible to the surviving patient *and* missed by that merge's straggler scan, which already ran. Loop creation therefore re-checks that the MRN it was handed is still current, and **refuses** if it is not.
+
+This does not violate decision 4. The guard never *chooses* an identity — it cannot, or it would be the second call site that eventually disagrees with the first. It only rejects one that has stopped being current, converting a silent invisibility into a loud, retryable error the engine will redeliver and the next resolution will get right. Choosing is one place; refusing a stale choice is a precondition, and preconditions belong where the write happens.
 
 ### Staleness is per-modality
 
@@ -287,6 +293,7 @@ Regression on false-match rate blocks release regardless of recall. That asymmet
 | `ADT^A40` that would create a cycle | **Refuse.** Alias table unmodified, no loop moved, flagged for human review (§4) |
 | Message carrying a retired MRN | Resolve to the surviving MRN at ingest, before registry or matcher. Raw archive keeps it verbatim |
 | Alias reversal requested | Recorded as an event with actor and reason; never a deletion from the alias table |
+| MRN retired between ingest resolution and loop creation | **Refuse the write.** Engine retries; the next resolution is current. Never land a loop on a retired identifier (§4) |
 | Result for a `CANCELLED` loop | Orphan + flag |
 | Future-dated observation | Accept, clamp for staleness math, flag |
 
@@ -294,7 +301,7 @@ Regression on false-match rate blocks release regardless of recall. That asymmet
 
 ## 9. Tests
 
-The first eight are safety, not correctness.
+The first nine are safety, not correctness.
 
 1. **Preliminary never resolves.** `ACKNOWLEDGED` unreachable from `OBX-11 = P`.
 2. **Corrected result reopens.** `OBX-11 = C` on `ACKNOWLEDGED` returns to `RESULTED`.
@@ -302,18 +309,19 @@ The first eight are safety, not correctness.
 4. **A loop cannot be stranded after a merge.** An `ORM` arriving with the retired MRN *after* the `A40` opens its loop on the surviving MRN. Paired with test 3, this closes both sides of the window in §4; either alone leaves a clinically open loop off the worklist.
 5. **A result carrying the retired MRN still matches.** Asserts resolution happens before matching, not only before loop creation — an unresolved alias would demote a tier-3 match to an orphan silently.
 6. **Circular merge is refused.** A→B then B→A leaves the alias table unmodified and flags for review. Assert no identifier resolves to itself and no loop moved.
-7. **False-match gate.** Replay labeled corpus; false-match rate zero at the confidence floor **while auto-match rate meets its configured minimum**. Blocks pack release. Both halves are required — see §10.4.
-8. **`CLOSED` is unreachable in v1.** No message, coordinator action, or replay path reaches it. Asserts the state reserved in §4 cannot be entered by accident before v2 defines who may enter it.
-9. **Acknowledgement is reversible.** A `reversed` event returns `ACKNOWLEDGED` to `RESULTED`, the actor is recorded, and no prior event is mutated.
-10. **Alias chains compress.** A→B then B→C resolves A→C in a single lookup, and the compression is asserted at write time rather than by chasing at read time.
-11. **No egress.** Block non-loopback `socket.connect`; full suite passes.
-12. **No model calls.** Monkeypatch `anthropic` and `claude_cli` to raise; full suite passes.
-13. **No PHI in artifacts.** Sentinels planted across `PID`, `NK1`, `GT1`, and note segments appear zero times in worklist HTML, logs, exports, and audit entries. Assert on what leaves the building, not on the parser.
-14. **Persist before ACK.** Kill between durable write and parse; replay reconstructs state.
-15. **Retry under a new control ID is not a second transition.** Redeliver an identical result with a fresh `MSH-10`; assert one transition, and that the content-key duplicate is counted separately from an `MSH-10` duplicate.
-16. **Pack tamper.** Mutate one byte; assert refusal to load. Includes a byte inside `field_map` — a mapping change must be as tamper-evident as a threshold change.
-17. **Field map drives matching.** Relocate the accession from `OBR-3` to `OBR-18` in both fixture and pack; assert tier 2 still matches with no code change. This is the claim that "rules as data" actually holds where sites differ.
-18. **State reconstruction.** Any loop's state derivable by replaying `loop_events`.
+7. **Loop creation refuses an MRN retired since ingest resolved it.** Commit a merge between resolution and loop creation; assert the write is refused rather than landing on the retired identifier. Closes the window that resolve-once-at-ingest opens (§4).
+8. **False-match gate.** Replay labeled corpus; false-match rate zero at the confidence floor **while auto-match rate meets its configured minimum**. Blocks pack release. Both halves are required — see §10.4.
+9. **`CLOSED` is unreachable in v1.** No message, coordinator action, or replay path reaches it. Asserts the state reserved in §4 cannot be entered by accident before v2 defines who may enter it.
+10. **Acknowledgement is reversible.** A `reversed` event returns `ACKNOWLEDGED` to `RESULTED`, the actor is recorded, and no prior event is mutated.
+11. **Alias chains compress.** A→B then B→C resolves A→C in a single lookup, and the compression is asserted at write time rather than by chasing at read time.
+12. **No egress.** Block non-loopback `socket.connect`; full suite passes.
+13. **No model calls.** Monkeypatch `anthropic` and `claude_cli` to raise; full suite passes.
+14. **No PHI in artifacts.** Sentinels planted across `PID`, `NK1`, `GT1`, and note segments appear zero times in worklist HTML, logs, exports, and audit entries. Assert on what leaves the building, not on the parser.
+15. **Persist before ACK.** Kill between durable write and parse; replay reconstructs state.
+16. **Retry under a new control ID is not a second transition.** Redeliver an identical result with a fresh `MSH-10`; assert one transition, and that the content-key duplicate is counted separately from an `MSH-10` duplicate.
+17. **Pack tamper.** Mutate one byte; assert refusal to load. Includes a byte inside `field_map` — a mapping change must be as tamper-evident as a threshold change.
+18. **Field map drives matching.** Relocate the accession from `OBR-3` to `OBR-18` in both fixture and pack; assert tier 2 still matches with no code change. This is the claim that "rules as data" actually holds where sites differ.
+19. **State reconstruction.** Any loop's state derivable by replaying `loop_events`.
 
 **Fixtures are synthetic,** generated from the HL7 v2 specification. No real message enters version control regardless of claimed de-identification.
 
@@ -322,7 +330,7 @@ The first eight are safety, not correctness.
 ## 10. Success criteria
 
 1. A synthetic HL7 stream runs end-to-end to a populated worklist with zero model calls and zero non-loopback connections.
-2. All eight safety tests pass.
+2. All nine safety tests pass.
 3. The PHI-sentinel proof passes on every downstream artifact.
 4. **False-match rate is zero against the labeled corpus at the configured floor, *and* auto-match rate is at or above its configured minimum.**
 5. A loop's state is reconstructible from `loop_events` alone.
@@ -345,7 +353,7 @@ This is the same reasoning as the confidence floor in §7, applied to the criter
 | Epic In Basket integration | Epic-mediated, hardest possible ingress, unnecessary given the feed |
 | Multi-tenancy | Single-site install. `tenant_isolation` is deliberately **not** imported (§3) |
 | FHIR ingress | HL7 v2 first. FHIR is the better long-term model but adds vendor approval |
-| Clinical closure (`CLOSED`) | The state is reserved in §4 and asserted unreachable by test 8. It ships when a pilot site names who may clinically disposition a finding (§12 q2) |
+| Clinical closure (`CLOSED`) | The state is reserved in §4 and asserted unreachable by test 9. It ships when a pilot site names who may clinically disposition a finding (§12 q2) |
 | Retention purge tooling | §6 requires a retention *policy*, which is a site decision. Shipping a delete path over PHI and an append-only audit archive before that policy exists is the wrong order. `referral-loop purge --older-than` lands once a site states a period |
 
 ---
@@ -354,7 +362,7 @@ This is the same reasoning as the confidence floor in §7, applied to the criter
 
 1. **MLLP listener vs file drop for the pilot.** MLLP is the real integration and the design assumes it. A file-drop mode reading messages from a watched directory would let a site pilot before IT schedules an interface build. Decide when a pilot site is identified — the parser and registry are identical either way, so this is a listener-only concern.
 
-2. ~~**Who acknowledges a loop.**~~ **Resolved by construction — see §4.** The question was whether a coordinator's acknowledgement is a clinical record or a workflow one. Rather than guess, v1 stops at `ACKNOWLEDGED` — a claim a coordinator can actually support — and reserves `CLOSED` for a clinically responsible actor, unimplemented and asserted unreachable (test 8). No metric in v1 claims a clinician saw anything.
+2. ~~**Who acknowledges a loop.**~~ **Resolved by construction — see §4.** The question was whether a coordinator's acknowledgement is a clinical record or a workflow one. Rather than guess, v1 stops at `ACKNOWLEDGED` — a claim a coordinator can actually support — and reserves `CLOSED` for a clinically responsible actor, unimplemented and asserted unreachable (test 9). No metric in v1 claims a clinician saw anything.
 
    What still needs a pilot site is the narrower question: **who may enter `CLOSED`, and does that person work from this worklist or from the EHR they already live in?** That is a v2 scoping question, and it no longer blocks v1 or shapes what v1's worklist claims.
 

@@ -1,9 +1,21 @@
 <!-- healthcare_rag/referral_loop/rules/CHANGELOG.md -->
 # Rule pack changelog
 
-Every entry records what changed and the eval delta that justified it. A pack
-ships only if, replayed against the archived corpus, false-close rate does not
-increase **and** precision improves (spec section 7).
+Every entry records what changed and the eval delta that justified it. Replayed
+against the archived corpus, a pack ships only if (spec section 7):
+
+1. **False-match rate does not regress** — absolute veto, whatever else improved.
+2. **Precision does not regress.**
+3. **At least one target metric improves** — precision, recall, auto-match rate,
+   orphan rate, or dismissal rate.
+
+Condition 3 was formerly "precision improves", which blocked a pack that only
+halved the orphan rate: a pure workload win with no safety cost, vetoed by the
+one metric it did not move.
+
+*The safety metric was renamed from **false-close rate** in spec `78abc7c`.
+Nothing closes in v1 — `CLOSED` is v2 — so a metric named for closure described
+something the system does not do. Same definition, same veto.*
 
 ## 1.1.0 — 2026-07-26
 

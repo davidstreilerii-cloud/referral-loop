@@ -1,8 +1,8 @@
 """Signed rule pack. Verified before load; an altered pack must never run.
 
 This is IP protection and a safety control at once -- a tampered pack could
-lower the confidence floor and cause false closes, the one failure the product
-exists to prevent.
+lower the confidence floor, or point a tier at the wrong field, and cause false
+matches: the one failure the product exists to prevent.
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class RulePack:
         The pack keys equivalences canonically ("CT": ["CT", "CAT"]), but sending
         systems emit either spelling. A naive .get(modality) returns {"CAT"} for
         the alias, so a CAT result would never match a CT order -- failing safe
-        (an orphan, not a false close) but silently costing recall on exactly the
+        (an orphan, not a false match) but silently costing recall on exactly the
         interface quirk this table exists to absorb.
         """
         return self._equivalence_index.get(modality, frozenset({modality}))
