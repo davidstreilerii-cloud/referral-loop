@@ -7,13 +7,27 @@ query and carries no information the event log does not.
 "Encrypted" here means a plain SQLite file on an OS-encrypted volume, attested
 at startup by encryption_check.verify_encryption_at_rest. Same definition the
 rest of the codebase uses.
+
+Scope of the append-only guarantee, for the audit story. Schema triggers reject
+DELETE and UPDATE on loop_events and raw_messages from every connection, ours
+or any other process's. Two gaps remain, and both are bounded by filesystem
+permissions on the database file rather than by anything this module can
+express -- say so plainly in any control narrative rather than claiming the
+file is tamper-proof:
+
+  * DROP TABLE removes the triggers with the table. SQLite has no in-file DDL
+    permission model.
+  * REPLACE INTO performs its implicit delete without firing a BEFORE DELETE
+    trigger unless recursive_triggers is on, and that pragma is per-connection.
+    _connect() sets it, so every path through LoopStore is covered; a foreign
+    connection that does not set it is not.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .errors import StoreUnavailableError
@@ -68,7 +82,14 @@ CREATE TRIGGER IF NOT EXISTS raw_messages_no_update BEFORE UPDATE ON raw_message
 BEGIN SELECT RAISE(ABORT, 'raw_messages is append-only'); END;
 """
 
+# Event types that deliberately carry fields without changing state.
+_NON_TRANSITIONAL = frozenset({"merged_in"})
+
 # Event type -> resulting state. Replay applies these in order.
+# No None values: a missing key must mean "unknown", and an unknown event type
+# is a replay failure, not a silent no-op. Mapping "merged_in" to None made
+# those two cases indistinguishable, so a typo'd event_type left the loop
+# silently in its prior state.
 _EVENT_STATE = {
     "created": LoopState.OPEN,
     "scheduled": LoopState.SCHEDULED,
@@ -77,7 +98,6 @@ _EVENT_STATE = {
     "cancelled": LoopState.CANCELLED,
     "orphaned": LoopState.ORPHAN,
     "reopened": LoopState.RESULTED,
-    "merged_in": None,   # carries fields, does not change state
 }
 
 
@@ -97,17 +117,26 @@ class LoopStore:
     def __init__(self, db_path: Path | str):
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        conn = None
         try:
             conn = self._connect()
             conn.executescript(_SCHEMA)
             conn.commit()
-            conn.close()
         except sqlite3.Error as exc:
             raise StoreUnavailableError(f"Cannot initialize store at {self.db_path}: {exc}") from exc
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Pinned, not left to SQLite's defaults. These currently match the
+        # defaults, which means nothing would fail if a later change flipped
+        # them -- and persist-before-ACK would quietly stop holding.
+        conn.execute("PRAGMA synchronous = FULL")       # fsync on commit
+        conn.execute("PRAGMA recursive_triggers = ON")  # so REPLACE fires BEFORE DELETE
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _guarded(self) -> sqlite3.Connection:
@@ -121,12 +150,21 @@ class LoopStore:
         This must complete before any ACK. Acknowledging then crashing during
         parse means the engine considers the message delivered and it is gone.
         """
+        if not control_id:
+            # SQLite permits repeated NULLs in a TEXT primary key, so a missing
+            # MSH-10 would insert a fresh row every time and dedup would fail
+            # silently. A message we cannot key is a message we cannot promise
+            # not to double-process; the listener must answer AE, not AA.
+            raise StoreUnavailableError(
+                "Refusing to store a message with an empty control id (MSH-10): "
+                "idempotency cannot be guaranteed without it"
+            )
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
                     "INSERT INTO raw_messages (control_id, payload, received_at) VALUES (?, ?, ?)",
-                    (control_id, payload, datetime.now().isoformat()),
+                    (control_id, payload, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
                 return True
@@ -155,6 +193,15 @@ class LoopStore:
             conn.close()
 
     def append_event(self, event: LoopEvent) -> None:
+        if event.event_type not in _EVENT_STATE and event.event_type not in _NON_TRANSITIONAL:
+            # Validate before the insert, not after. replay() also rejects
+            # unknown types, but by then the event is committed and the log is
+            # append-only -- a single typo would leave the loop permanently
+            # unreplayable with no way to correct it.
+            raise StoreUnavailableError(
+                f"Refusing to append unknown event_type {event.event_type!r}: "
+                "it would make loop " + f"{event.loop_id} permanently unreplayable"
+            )
         with self._lock:
             conn = self._guarded()
             try:
@@ -177,6 +224,15 @@ class LoopStore:
             self._materialize(event.loop_id)
 
     def events_for(self, loop_id: str) -> list[LoopEvent]:
+        """Events in arrival order (event_id), deliberately not occurred_at.
+
+        Each event was accepted by the registry, which validated the transition
+        at the moment it was applied, so arrival order IS the authoritative
+        accepted sequence and replay must reproduce exactly what the system did.
+        Reordering by occurred_at would make replay show a history that never
+        happened. Rejecting a clinically-older message that arrives late is the
+        registry's job, before the event is ever appended -- not the store's.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -204,11 +260,23 @@ class LoopStore:
         state = LoopState.OPEN
         attrs: dict = {}
         for event in events:
-            attrs.update({k: v for k, v in event.detail.items() if v not in (None, "")})
-            mapped = _EVENT_STATE.get(event.event_type)
-            if mapped is not None:
-                state = mapped
+            # No falsy filter. An event's detail contains exactly the fields it
+            # intends to change, so updating wholesale leaves everything else
+            # alone -- and lets an event deliberately CLEAR a field. Filtering
+            # out "" made it impossible for a corrected result to clear a prior
+            # acknowledgement, which is safety rule 2.
+            attrs.update(event.detail)
+            if event.event_type in _NON_TRANSITIONAL:
+                continue
+            if event.event_type not in _EVENT_STATE:
+                raise StoreUnavailableError(
+                    f"Unknown event_type {event.event_type!r} in loop {loop_id}; "
+                    "the event log cannot be replayed and state is not derivable"
+                )
+            state = _EVENT_STATE[event.event_type]
 
+        # "" means the field was deliberately cleared; treat it as absent rather
+        # than handing an empty string to fromisoformat.
         ordered_at = attrs.get("ordered_at")
         ack_at = attrs.get("ack_at")
         return Loop(
@@ -247,6 +315,30 @@ class LoopStore:
             conn.commit()
         finally:
             conn.close()
+
+    def rebuild_projection(self) -> int:
+        """Rebuild every loops row from the event log. Returns loops rebuilt.
+
+        The loops table is a projection, so it must be reconstructible. Without
+        this, a restore that replays loop_events into a fresh file leaves the
+        worklist empty -- open_loops() returns nothing while the events are
+        sitting right there. A loop vanishing silently from the worklist is the
+        exact failure this product exists to prevent.
+        """
+        conn = self._connect()
+        try:
+            loop_ids = [
+                r["loop_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT loop_id FROM loop_events ORDER BY loop_id"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        with self._lock:
+            for loop_id in loop_ids:
+                self._materialize(loop_id)
+        return len(loop_ids)
 
     def open_loops(self, mrn: str | None = None) -> list[Loop]:
         query = "SELECT loop_id FROM loops WHERE state IN ('OPEN', 'SCHEDULED')"
