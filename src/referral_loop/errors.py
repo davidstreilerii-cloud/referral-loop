@@ -38,5 +38,20 @@ class LoopNotFoundError(ReferralLoopError):
     """
 
 
+class StaleMessageError(ReferralLoopError):
+    """A message clinically older than one already applied to the loop.
+
+    loop_events is replayed in arrival order, deliberately, so nothing below the
+    registry guards clinical ordering. Applying a message whose MSH-7 predates
+    the newest one already accepted can only regress the loop -- a SIU landing
+    after an ORU would return a resulted loop to SCHEDULED, and a final that
+    predates an applied correction would re-arm CLOSED on a superseded read.
+
+    Refusing is not dropping: the raw message is already durably archived by
+    record_raw before the registry ever sees it, and this is typed so the
+    listener can route it for human review rather than swallow it.
+    """
+
+
 class ThresholdsNotAcceptedError(ReferralLoopError):
     """Staleness thresholds shipped as defaults but not accepted by the site."""
