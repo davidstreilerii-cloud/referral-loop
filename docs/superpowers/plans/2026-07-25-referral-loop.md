@@ -380,11 +380,16 @@ def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
     except json.JSONDecodeError as exc:
         raise PackVerificationError("Pack is signed but not valid JSON") from exc
 
-    for required in ("_default",):
-        if required not in raw.get("date_windows_hours", {}):
-            raise PackVerificationError("date_windows_hours missing '_default'")
-        if required not in raw.get("staleness_hours", {}):
-            raise PackVerificationError("staleness_hours missing '_default'")
+    # A signed body that parses as JSON but is not an object would otherwise
+    # escape as AttributeError, and a caller catching PackVerificationError to
+    # refuse boot would crash instead of refusing.
+    if not isinstance(raw, dict):
+        raise PackVerificationError(f"Pack must be a JSON object, got {type(raw).__name__}")
+
+    if "_default" not in raw.get("date_windows_hours", {}):
+        raise PackVerificationError("date_windows_hours missing '_default'")
+    if "_default" not in raw.get("staleness_hours", {}):
+        raise PackVerificationError("staleness_hours missing '_default'")
 
     return RulePack(
         version=raw["version"],
@@ -426,12 +431,182 @@ against. Staleness thresholds are defaults requiring explicit site acceptance
 would imply a clinical standard that is the site's call, not ours.
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Write the signing utility and produce `pack.sig`**
+
+`load_pack` refuses an unsigned pack, so a shipped `pack.json` with no `pack.sig` cannot boot. The signature is over exact bytes, so it must be generated from the file rather than by hand.
+
+**The private key never enters version control.** It is the thing that makes a tampered pack detectable; committing it would make the signature decorative. For development, generate a keypair under `~/.config/healthcare-rag/` (outside the repo) and commit only `pack.sig` and the public key.
+
+```python
+# scripts/sign_referral_pack.py
+"""Sign a referral rule pack. Private key stays outside the repo, always.
+
+Usage:
+    python scripts/sign_referral_pack.py --keygen        # once, writes to ~/.config
+    python scripts/sign_referral_pack.py --sign          # signs rules/pack.json
+    python scripts/sign_referral_pack.py --pubkey        # prints hex for REFERRAL_PACK_PUBKEY
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+KEY_DIR = Path.home() / ".config" / "healthcare-rag"
+PRIVATE_KEY = KEY_DIR / "referral_pack_ed25519.key"
+PACK_DIR = Path(__file__).parent.parent / "healthcare_rag" / "referral_loop" / "rules"
+
+
+def keygen() -> None:
+    if PRIVATE_KEY.exists():
+        sys.exit(f"Refusing to overwrite existing key at {PRIVATE_KEY}")
+    KEY_DIR.mkdir(parents=True, exist_ok=True)
+    key = Ed25519PrivateKey.generate()
+    PRIVATE_KEY.write_bytes(key.private_bytes_raw())
+    PRIVATE_KEY.chmod(0o600)
+    print(f"Wrote {PRIVATE_KEY}")
+    print(f"Public key (hex): {key.public_key().public_bytes_raw().hex()}")
+
+
+def _load_private() -> Ed25519PrivateKey:
+    if not PRIVATE_KEY.exists():
+        sys.exit(f"No signing key at {PRIVATE_KEY}. Run --keygen first.")
+    return Ed25519PrivateKey.from_private_bytes(PRIVATE_KEY.read_bytes())
+
+
+def sign() -> None:
+    key = _load_private()
+    pack_bytes = (PACK_DIR / "pack.json").read_bytes()
+    (PACK_DIR / "pack.sig").write_bytes(key.sign(pack_bytes))
+    print(f"Signed {len(pack_bytes)} bytes -> {PACK_DIR / 'pack.sig'}")
+
+
+def pubkey() -> None:
+    print(_load_private().public_key().public_bytes_raw().hex())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--keygen", action="store_true")
+    group.add_argument("--sign", action="store_true")
+    group.add_argument("--pubkey", action="store_true")
+    args = parser.parse_args()
+    if args.keygen:
+        keygen()
+    elif args.sign:
+        sign()
+    else:
+        pubkey()
+```
+
+Run, and record the public key — Task 13's CLI needs it as `REFERRAL_PACK_PUBKEY`:
 
 ```bash
-git add healthcare_rag/referral_loop/pack.py healthcare_rag/referral_loop/rules/ tests/referral_loop/test_pack.py
+python scripts/sign_referral_pack.py --keygen
+python scripts/sign_referral_pack.py --sign
+python scripts/sign_referral_pack.py --pubkey
+```
+
+Add a test proving the shipped pack actually verifies against the shipped key:
+
+```python
+# append to tests/referral_loop/test_pack.py
+import os
+from pathlib import Path
+
+SHIPPED_PACK = Path(__file__).parent.parent.parent / "healthcare_rag" / "referral_loop" / "rules"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("REFERRAL_PACK_PUBKEY"), reason="REFERRAL_PACK_PUBKEY not set"
+)
+def test_shipped_pack_verifies_against_the_shipped_public_key():
+    """A pack that cannot verify is a pack that cannot boot."""
+    pack = load_pack(SHIPPED_PACK, bytes.fromhex(os.environ["REFERRAL_PACK_PUBKEY"]))
+    assert pack.version == "1.0.0"
+    assert pack.confidence_floor == 0.9
+
+
+def test_shipped_pack_and_signature_both_exist():
+    assert (SHIPPED_PACK / "pack.json").is_file()
+    assert (SHIPPED_PACK / "pack.sig").is_file(), (
+        "load_pack refuses an unsigned pack; shipping pack.json alone cannot boot"
+    )
+```
+
+Confirm the private key is not tracked: `git check-ignore -v ~/.config/healthcare-rag/referral_pack_ed25519.key` should report the path is outside the repo, and `git status --short` must not list it.
+
+- [ ] **Step 7: Protect the signed bytes from line-ending conversion**
+
+This repo has `core.autocrlf=true` globally and no `.gitattributes`. The shipped pack survives a fresh Windows clone today only because `pack.json` happens to contain zero newline bytes — verified empirically by cloning with `--no-local --config core.autocrlf=true` and re-checking the signature.
+
+That safety is incidental. A single trailing newline — what any editor adds on save — makes checkout produce a different byte count than was signed, and the pack then fails to verify on every Windows clone. That is a customer boot path protected by "nobody ever opens this file in an editor."
+
+Create `.gitattributes` at the repo root:
+
+```gitattributes
+# The rule pack is signed over exact bytes. Any line-ending conversion breaks
+# verification and the engine then refuses to boot. Never let git rewrite these.
+healthcare_rag/referral_loop/rules/pack.json -text
+healthcare_rag/referral_loop/rules/pack.sig  -text
+```
+
+Verify it takes effect: `git check-attr text healthcare_rag/referral_loop/rules/pack.json` must report `text: unset`.
+
+- [ ] **Step 8: Cover the untested error paths**
+
+Three of the five documented failure conditions had no test. The `_default` validation in particular is exactly the kind of check a later refactor silently drops.
+
+```python
+# append to tests/referral_loop/test_pack.py
+
+def test_missing_pack_file_refuses(tmp_path):
+    with pytest.raises(PackVerificationError, match="No pack"):
+        load_pack(tmp_path, b"\x00" * 32)
+
+
+def test_signed_but_non_json_body_refuses(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    body = b"this is signed but is not json"
+    (tmp_path / "pack.json").write_bytes(body)
+    (tmp_path / "pack.sig").write_bytes(key.sign(body))
+    with pytest.raises(PackVerificationError, match="not valid JSON"):
+        load_pack(tmp_path, key.public_key().public_bytes_raw())
+
+
+def test_signed_json_that_is_not_an_object_refuses(tmp_path):
+    """Must raise PackVerificationError, not AttributeError -- a caller catching
+    it to refuse boot would otherwise crash instead of refusing."""
+    key = Ed25519PrivateKey.generate()
+    body = b"[1, 2, 3]"
+    (tmp_path / "pack.json").write_bytes(body)
+    (tmp_path / "pack.sig").write_bytes(key.sign(body))
+    with pytest.raises(PackVerificationError, match="must be a JSON object"):
+        load_pack(tmp_path, key.public_key().public_bytes_raw())
+
+
+@pytest.mark.parametrize("field", ["date_windows_hours", "staleness_hours"])
+def test_missing_default_window_refuses(tmp_path, field):
+    broken = {**PACK, field: {"CT": 24}}
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match=f"{field} missing"):
+        load_pack(tmp_path, pubkey)
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add healthcare_rag/referral_loop/pack.py healthcare_rag/referral_loop/rules/ scripts/sign_referral_pack.py tests/referral_loop/test_pack.py .gitattributes
 git commit -m "feat(referral): signed rule pack with Ed25519 verification"
 ```
+
+Verify the private key is absent from the commit: `git show --stat HEAD | grep -i key` must return nothing but the script name.
 
 ---
 
