@@ -24,6 +24,28 @@ The spec was corrected in three places while writing this plan. Read these befor
 
 ---
 
+## RESOLVED: success criterion 6 was asserted against the wrong thing
+
+**Found during Task 1 review. Decision taken 2026-07-26: slim the image (option 2 below). Task 13 implements it.**
+
+`chromadb>=1.5,<2.0` and `sentence-transformers>=5.3,<6.0` are **unconditional core dependencies** (`pyproject.toml:10-11`), along with `lightrag-hku`, `raganything[all]`, `mcp`, `ollama`, `biopython` and three `tree-sitter` packages. So `pip install ".[referral]"` — exactly what `Dockerfile.referral` runs — installs the entire ML stack plus torch, transitively.
+
+The import-closure test passes anyway, because those modules are never *imported*. They are still *installed*. Spec §10.6 says "The referral install requires neither ChromaDB nor the corpus, **asserted by import-closure test**" — but the claim is about the image a hospital's security team reviews, and it is being verified against the runtime import graph. That is the same proxy-assertion mistake as the vacuous snapshot test: measuring something adjacent to the property that matters.
+
+Three ways out were considered:
+
+1. **Move the RAG-only dependencies into an optional `rag` group** and leave core minimal. Correct long-term fix, but it changes what `pip install healthcare-rag` yields for every existing consumer — a parent-package decision with blast radius well beyond this subsystem.
+2. **Build `Dockerfile.referral` without the parent's core dependencies** — copy the needed modules and install an explicit pinned set rather than `pip install .[referral]`. **← chosen.** Fixes the artifact a security team actually reviews, leaves the parent's install contract untouched, and keeps option 1 available later.
+3. **Weaken the claim.** Rejected — it concedes the argument that motivated a separate deployable.
+
+This works because `healthcare_rag/__init__.py:4-8` wraps `install_shim()` in `try/except Exception: pass`, so the package imports cleanly with `anthropic` absent.
+
+**A useful consequence:** in the slim image `anthropic` is not installed at all, so "no model calls" becomes structurally true in production rather than only enforced by a test. Spec test 6 still earns its place — it proves the property in the dev environment where `anthropic` *is* importable.
+
+**The assertion moves from import closure to install closure.** Task 13 adds a test over the image's actual site-packages, because that — not `sys.modules` — is what success criterion 6 is really about.
+
+---
+
 ## File structure
 
 | File | Responsibility |
@@ -77,8 +99,11 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 FORBIDDEN = [
     "chromadb", "sentence_transformers", "torch", "transformers",
+    "lightrag", "raganything", "mcp", "ollama",
     "healthcare_rag.revenue_integrity", "healthcare_rag.denial_rca",
     "healthcare_rag.db", "healthcare_rag.audit_trail",
     "healthcare_rag.guardrails.tenant_isolation",
@@ -92,11 +117,23 @@ print(json.dumps(sorted(sys.modules)))
 """
 
 
-def test_referral_import_closure_in_a_clean_interpreter():
+def _run_probe() -> set[str]:
+    """Import referral_loop in a clean interpreter, return everything it loaded.
+
+    Surfaces stderr on failure rather than using check=True: a real ImportError
+    inside the probe would otherwise arrive as an opaque non-zero exit with the
+    actual traceback swallowed.
+    """
     proc = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True
+        [sys.executable, "-c", _PROBE], capture_output=True, text=True, timeout=120
     )
-    loaded = set(json.loads(proc.stdout))
+    if proc.returncode != 0:
+        pytest.fail(f"probe failed (exit {proc.returncode}):\n{proc.stderr}")
+    return set(json.loads(proc.stdout))
+
+
+def test_referral_import_closure_in_a_clean_interpreter():
+    loaded = _run_probe()
     leaked = sorted(m for m in loaded if any(m == f or m.startswith(f + ".") for f in FORBIDDEN))
     assert leaked == [], f"referral_loop pulled in forbidden modules: {leaked}"
 
@@ -113,11 +150,7 @@ def test_anthropic_is_in_the_closure_and_that_is_expected():
     whole suite -- an assertion about behavior, not about the import graph. A
     module being importable is not a model call.
     """
-    proc = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True
-    )
-    loaded = set(json.loads(proc.stdout))
-    assert "anthropic" in loaded, (
+    assert "anthropic" in _run_probe(), (
         "If anthropic is no longer in the closure the parent package changed; "
         "re-check that spec test 6 still proves what it claims."
     )
@@ -143,7 +176,16 @@ docs/superpowers/specs/2026-07-25-referral-loop-design.md section 3.
 
 ```python
 # healthcare_rag/referral_loop/errors.py
-"""Typed failures, one per row of the spec failure matrix (section 8)."""
+"""Typed failures for the referral loop subsystem.
+
+Most map to a row of the spec failure matrix (section 8). ThresholdsNotAcceptedError
+does not -- it encodes the resolution of open question 3 (section 12): staleness
+thresholds ship as defaults but the site must accept them explicitly, so a
+threshold stays the hospital's clinical decision rather than ours.
+
+Every name carries the -Error suffix, matching the convention already used
+across this codebase (AnthropicClientError, SpendLimitError, MissingColumnsError).
+"""
 
 
 class ReferralLoopError(Exception):
@@ -154,7 +196,7 @@ class FramingError(ReferralLoopError):
     """MLLP framing malformed. Respond AR; the engine retries."""
 
 
-class UnparseableSegment(ReferralLoopError):
+class UnparseableSegmentError(ReferralLoopError):
     """One segment failed to parse. Skip it, keep the message, flag for review."""
 
 
@@ -162,11 +204,11 @@ class PackVerificationError(ReferralLoopError):
     """Pack signature missing, invalid, or altered. Refuse to boot."""
 
 
-class StoreUnavailable(ReferralLoopError):
+class StoreUnavailableError(ReferralLoopError):
     """Durable write failed. Respond AE so the engine queues. Never ACK."""
 
 
-class ThresholdsNotAccepted(ReferralLoopError):
+class ThresholdsNotAcceptedError(ReferralLoopError):
     """Staleness thresholds shipped as defaults but not accepted by the site."""
 ```
 
@@ -839,7 +881,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from .errors import StoreUnavailable
+from .errors import StoreUnavailableError
 from .events import Loop, LoopEvent, LoopState
 
 _SQLITE_DELETE = 9
@@ -908,7 +950,7 @@ class LoopStore:
             conn.commit()
             conn.close()
         except sqlite3.Error as exc:
-            raise StoreUnavailable(f"Cannot initialize store at {self.db_path}: {exc}") from exc
+            raise StoreUnavailableError(f"Cannot initialize store at {self.db_path}: {exc}") from exc
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -938,7 +980,7 @@ class LoopStore:
             except sqlite3.IntegrityError:
                 return False
             except sqlite3.Error as exc:
-                raise StoreUnavailable(f"Durable write failed: {exc}") from exc
+                raise StoreUnavailableError(f"Durable write failed: {exc}") from exc
             finally:
                 conn.close()
 
@@ -966,7 +1008,7 @@ class LoopStore:
                 )
                 conn.commit()
             except sqlite3.Error as exc:
-                raise StoreUnavailable(f"Event append failed: {exc}") from exc
+                raise StoreUnavailableError(f"Event append failed: {exc}") from exc
             finally:
                 conn.close()
             self._materialize(event.loop_id)
@@ -1722,7 +1764,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import ThresholdsNotAccepted
+from healthcare_rag.referral_loop.errors import ThresholdsNotAcceptedError
 from healthcare_rag.referral_loop.events import Loop, LoopState
 from healthcare_rag.referral_loop.staleness import is_stale, require_thresholds_accepted
 from tests.referral_loop.test_matcher import PACK
@@ -1773,7 +1815,7 @@ def test_future_dated_observation_is_clamped_not_rejected():
 def test_thresholds_must_be_explicitly_accepted(monkeypatch):
     """Open question 3: shipping a default implies a clinical standard."""
     monkeypatch.delenv("REFERRAL_THRESHOLDS_ACCEPTED", raising=False)
-    with pytest.raises(ThresholdsNotAccepted):
+    with pytest.raises(ThresholdsNotAcceptedError):
         require_thresholds_accepted()
 
     monkeypatch.setenv("REFERRAL_THRESHOLDS_ACCEPTED", "1")
@@ -1804,7 +1846,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta
 
-from .errors import ThresholdsNotAccepted
+from .errors import ThresholdsNotAcceptedError
 from .events import Loop, LoopState
 from .pack import RulePack
 
@@ -1814,7 +1856,7 @@ _STALEABLE_STATES = {LoopState.OPEN, LoopState.SCHEDULED}
 def require_thresholds_accepted() -> None:
     """Refuse to compute staleness until the site has accepted the thresholds."""
     if os.environ.get("REFERRAL_THRESHOLDS_ACCEPTED", "0") != "1":
-        raise ThresholdsNotAccepted(
+        raise ThresholdsNotAcceptedError(
             "Per-modality staleness thresholds are shipped defaults, not a clinical "
             "standard. Set REFERRAL_THRESHOLDS_ACCEPTED=1 after the site has "
             "reviewed rules/pack.json staleness_hours."
@@ -1875,7 +1917,7 @@ File-drop is built alongside MLLP not as speculation but because §7 requires re
 """ACK ordering is load-bearing: never acknowledge what you cannot store."""
 import pytest
 
-from healthcare_rag.referral_loop.errors import StoreUnavailable
+from healthcare_rag.referral_loop.errors import StoreUnavailableError
 from healthcare_rag.referral_loop.listener import MessageHandler
 from healthcare_rag.referral_loop.registry import Registry
 from healthcare_rag.referral_loop.store import LoopStore
@@ -1917,7 +1959,7 @@ def test_raw_is_persisted_before_parsing(handler, monkeypatch):
 def test_store_failure_returns_ae_never_aa(handler, monkeypatch):
     """Failure matrix: DB unwritable -> AE so the engine queues."""
     def failing_record(*_a, **_kw):
-        raise StoreUnavailable("disk full")
+        raise StoreUnavailableError("disk full")
 
     monkeypatch.setattr(handler.store, "record_raw", failing_record)
     ack = handler.handle(ORM)
@@ -1977,7 +2019,7 @@ import socketserver
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .errors import FramingError, StoreUnavailable
+from .errors import FramingError, StoreUnavailableError
 from .events import LoopState
 from .matcher import ResultKey, match_result
 from .mllp import build_ack, deframe, frame
@@ -2021,7 +2063,7 @@ class MessageHandler:
         # 1. Durable write first. Never ACK what cannot be stored.
         try:
             is_new = self.store.record_raw(control_id, text)
-        except StoreUnavailable:
+        except StoreUnavailableError:
             logger.error("Durable write failed for %s; returning AE so the engine queues", control_id)
             return build_ack(control_id, "AE")
 
@@ -2758,38 +2800,106 @@ Expected: PASS — 2 passed
 
 ```dockerfile
 # Dockerfile.referral
-# Separate deployable. Installs healthcare_rag[referral] only -- no ChromaDB,
-# no sentence-transformers, no corpus. The image is the security review surface,
-# so anything not needed to track a loop must not be in it.
+# Separate deployable. The image is the security-review surface, so anything not
+# needed to track a loop must not be in it.
+#
+# Deliberately NOT `pip install .[referral]`. chromadb, sentence-transformers,
+# lightrag-hku, raganything[all], mcp, ollama, biopython and three tree-sitter
+# packages are unconditional core dependencies of healthcare-rag, so installing
+# the extra would drag the entire ML stack (and torch, transitively) into an
+# image whose whole claim is that it contains none of it.
+#
+# Instead: copy only the modules referral_loop imports, install only what they
+# need, and put the package on PYTHONPATH. healthcare_rag/__init__.py wraps
+# install_shim() in try/except, so it imports cleanly with anthropic absent --
+# which also means no model client exists in this image at all.
 FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
-COPY healthcare_rag/__init__.py healthcare_rag/__init__.py
-COPY healthcare_rag/encryption_check.py healthcare_rag/encryption_check.py
-COPY healthcare_rag/guardrails/ healthcare_rag/guardrails/
-COPY healthcare_rag/referral_loop/ healthcare_rag/referral_loop/
+RUN pip install --no-cache-dir "flask>=3.1,<4.0" "cryptography>=42.0,<47"
 
-RUN pip install --no-cache-dir ".[referral]"
+COPY healthcare_rag/__init__.py            healthcare_rag/__init__.py
+COPY healthcare_rag/encryption_check.py    healthcare_rag/encryption_check.py
+COPY healthcare_rag/guardrails/            healthcare_rag/guardrails/
+COPY healthcare_rag/referral_loop/         healthcare_rag/referral_loop/
 
+ENV PYTHONPATH=/app
 ENV PHI_MODE=full
 EXPOSE 2575 5055
 
-# Loopback only. This container makes no outbound connection, including to us.
-CMD ["referral-loop", "listen", "--host", "0.0.0.0", "--port", "2575"]
+# Loopback only by default. This container makes no outbound connection to anyone,
+# including us. Binding 0.0.0.0 here is for the container's own network namespace;
+# publish the port only to the interface engine.
+CMD ["python", "-m", "healthcare_rag.referral_loop.cli", "listen", "--host", "0.0.0.0", "--port", "2575"]
 ```
 
-- [ ] **Step 6: Verify the image builds and the entry point is wired**
+- [ ] **Step 6: Write the install-closure test**
+
+Import closure is the wrong assertion for success criterion 6 — it measures what gets imported, while the claim is about what gets installed. Assert on the image.
+
+```python
+# tests/referral_loop/test_install_closure.py
+"""Success criterion 6, asserted against the image rather than sys.modules.
+
+The referral container must not contain the ML stack. An import-closure test
+cannot show this: chromadb can be installed and simply never imported, which is
+exactly the situation `pip install .[referral]` produces, since chromadb is an
+unconditional core dependency of the parent package.
+"""
+import shutil
+import subprocess
+
+import pytest
+
+FORBIDDEN_DISTRIBUTIONS = [
+    "chromadb", "sentence-transformers", "torch", "transformers",
+    "lightrag-hku", "raganything", "mcp", "ollama", "biopython",
+]
+
+IMAGE = "referral-loop:test"
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker not available")
+def test_referral_image_contains_no_ml_stack():
+    subprocess.run(
+        ["docker", "build", "-f", "Dockerfile.referral", "-t", IMAGE, "."],
+        check=True, capture_output=True, text=True, timeout=1800,
+    )
+    listing = subprocess.run(
+        ["docker", "run", "--rm", IMAGE, "pip", "list", "--format=freeze"],
+        check=True, capture_output=True, text=True, timeout=300,
+    ).stdout.lower()
+
+    installed = {line.split("==")[0] for line in listing.splitlines() if line}
+    leaked = sorted(d for d in FORBIDDEN_DISTRIBUTIONS if d in installed)
+    assert leaked == [], f"referral image ships forbidden distributions: {leaked}"
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker not available")
+def test_referral_image_has_no_model_client_installed():
+    """Structural, not behavioral. Spec test 6 proves the dev environment; this
+    proves production cannot make a model call because no client is present."""
+    listing = subprocess.run(
+        ["docker", "run", "--rm", IMAGE, "pip", "list", "--format=freeze"],
+        check=True, capture_output=True, text=True, timeout=300,
+    ).stdout.lower()
+    assert "anthropic==" not in listing
+```
+
+- [ ] **Step 7: Verify the image builds, is slim, and the entry point works**
 
 Run:
 ```bash
-docker build -f Dockerfile.referral -t referral-loop:dev .
-docker run --rm referral-loop:dev referral-loop --help
+docker build -f Dockerfile.referral -t referral-loop:test .
+docker run --rm referral-loop:test python -m healthcare_rag.referral_loop.cli --help
+docker run --rm referral-loop:test pip list --format=freeze
+docker images referral-loop:test --format "{{.Size}}"
+python -m pytest tests/referral_loop/test_install_closure.py -v
 ```
-Expected: build succeeds; `--help` prints the `listen|filedrop|worklist` usage.
+Expected: `--help` prints `listen|filedrop|worklist|purge`; `pip list` shows only flask, cryptography and their transitive dependencies — no chromadb, no torch, no anthropic; install-closure tests pass.
 
-If Docker is unavailable, run `pip install -e ".[referral]" && referral-loop --help` and record that the container build was not verified.
+Record the image size in the commit message. If Docker is unavailable, say so explicitly and mark success criterion 6 as **unverified** — do not claim it passes on the strength of the import-closure test alone.
 
 - [ ] **Step 7: Commit**
 

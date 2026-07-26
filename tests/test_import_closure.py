@@ -16,6 +16,7 @@ import pytest
 
 FORBIDDEN = [
     "chromadb", "sentence_transformers", "torch", "transformers",
+    "lightrag", "raganything", "mcp", "ollama",
     "healthcare_rag.revenue_integrity", "healthcare_rag.denial_rca",
     "healthcare_rag.db", "healthcare_rag.audit_trail",
     "healthcare_rag.guardrails.tenant_isolation",
@@ -36,7 +37,9 @@ def _run_probe() -> set[str]:
     inside the probe would otherwise arrive as an opaque non-zero exit with the
     actual traceback swallowed.
     """
-    proc = subprocess.run([sys.executable, "-c", _PROBE], capture_output=True, text=True)
+    proc = subprocess.run(
+        [sys.executable, "-c", _PROBE], capture_output=True, text=True, timeout=120
+    )
     if proc.returncode != 0:
         pytest.fail(f"probe failed (exit {proc.returncode}):\n{proc.stderr}")
     return set(json.loads(proc.stdout))
