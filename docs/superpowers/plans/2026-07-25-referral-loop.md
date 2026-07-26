@@ -2783,21 +2783,45 @@ def test_sentinels_appear_zero_times_in_every_downstream_artifact(stack, caplog)
     api = http.get("/worklist/?format=json").data.decode()
     logs = "\n".join(record.getMessage() for record in caplog.records)
 
-    events = json.dumps(
-        [
-            {"loop_id": loop.loop_id, "detail": loop.__dict__}
-            for loop in handler.store.all_loops()
-        ],
-        default=str,
-    )
-
-    artifacts = {"worklist HTML": html, "worklist JSON": api, "logs": logs, "loop records": events}
+    # NOTE: the loop store is deliberately NOT an artifact here. It legitimately
+    # holds the MRN -- matching and ADT^A40 merges are identifier arithmetic and
+    # cannot work without it, and the spec says plainly that this product holds
+    # patient data by design. Asserting "no MRN in the store" would be asserting
+    # the product does not work. The claim is about what LEAVES the building.
+    artifacts = {"worklist HTML": html, "worklist JSON": api, "logs": logs}
 
     for sentinel_name, sentinel in SENTINELS.items():
         for artifact_name, content in artifacts.items():
             assert sentinel not in content, (
                 f"{sentinel_name} leaked into {artifact_name}"
             )
+
+
+def test_the_store_does_hold_the_mrn_and_that_is_correct(stack):
+    """The companion to the test above, and the reason it is scoped as it is.
+
+    If this ever fails, matching and merges are broken -- not fixed. It exists so
+    nobody 'hardens' the sentinel test by scrubbing the store and silently
+    breaking loop tracking.
+    """
+    handler, _, _ = stack
+    handler.handle(order())
+    loops = handler.store.all_loops()
+    assert loops, "an order must create a loop"
+    assert loops[0].mrn, "the store must retain the MRN or matching cannot work"
+
+
+def test_segments_outside_the_allowlist_never_reach_the_store(stack):
+    """PID is allowlisted, so PID sentinels legitimately land in the store.
+    NK1, GT1, notes and prefix-collision segments must not, anywhere."""
+    import json as _json
+
+    handler, _, _ = stack
+    handler.handle(oru_with_sentinels())
+    stored = _json.dumps([loop.__dict__ for loop in handler.store.all_loops()], default=str)
+
+    for name in ("NK1_NAME", "GT1_NAME", "NTE_TEXT", "PREFIX_COLLISION"):
+        assert SENTINELS[name] not in stored, f"{name} reached the store"
 
 
 def test_sentinels_do_not_reach_the_audit_trail(stack, tmp_path):
