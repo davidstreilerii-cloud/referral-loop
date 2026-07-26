@@ -18,6 +18,15 @@ PACK = {
     "modality_equivalence": {"CT": ["CT", "CAT"], "MG": ["MG", "MAM"]},
     "tie_breakers": ["nearest_order_date", "same_ordering_provider", "most_specific_modality"],
     "tier_confidence": {"1": 1.0, "2": 0.98, "3": 0.92, "4": 0.70},
+    "field_map": {
+        "placer_order_number": ["OBR-2", "ORC-2"],
+        "filler_order_number": ["OBR-3", "ORC-3", "OBR-18", "OBR-19"],
+        "service_code": ["OBR-4.1"],
+        "modality": ["OBR-24", "OBR-4.2"],
+        "ordering_provider": ["OBR-16.1"],
+        "mrn": ["PID-3.1"],
+    },
+    "min_auto_match_rate": 0.5,
 }
 
 
@@ -70,8 +79,21 @@ SHIPPED_PACK = Path(__file__).parent.parent.parent / "healthcare_rag" / "referra
 def test_shipped_pack_verifies_against_the_shipped_public_key():
     """A pack that cannot verify is a pack that cannot boot."""
     pack = load_pack(SHIPPED_PACK, bytes.fromhex(os.environ["REFERRAL_PACK_PUBKEY"]))
-    assert pack.version == "1.0.0"
+    assert pack.version == "1.1.0"
     assert pack.confidence_floor == 0.9
+
+
+@pytest.mark.skipif(
+    not os.environ.get("REFERRAL_PACK_PUBKEY"), reason="REFERRAL_PACK_PUBKEY not set"
+)
+def test_shipped_pack_is_1_1_0_and_exposes_field_map():
+    pack = load_pack(SHIPPED_PACK, bytes.fromhex(os.environ["REFERRAL_PACK_PUBKEY"]))
+    assert pack.version == "1.1.0"
+    assert pack.field_candidates("placer_order_number") == ("OBR-2", "ORC-2")
+    assert pack.field_candidates("filler_order_number") == (
+        "OBR-3", "ORC-3", "OBR-18", "OBR-19",
+    )
+    assert pack.min_auto_match_rate == 0.5
 
 
 def test_shipped_pack_and_signature_both_exist():
@@ -146,3 +168,52 @@ def test_non_integer_tier_confidence_key_refuses(tmp_path):
     pubkey = _write_pack(tmp_path, broken)
     with pytest.raises(PackVerificationError, match="signed but malformed"):
         load_pack(tmp_path, pubkey)
+
+
+def test_missing_field_map_refuses(tmp_path):
+    broken = {k: v for k, v in PACK.items() if k != "field_map"}
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="missing required field"):
+        load_pack(tmp_path, pubkey)
+
+
+def test_missing_min_auto_match_rate_refuses(tmp_path):
+    broken = {k: v for k, v in PACK.items() if k != "min_auto_match_rate"}
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="missing required field"):
+        load_pack(tmp_path, pubkey)
+
+
+@pytest.mark.parametrize("bad_entry", ["OBR", "OBR-0", "OBR-x", "TOOLONG-2", "OBR-2.0"])
+def test_malformed_field_map_entry_refused(tmp_path, bad_entry):
+    broken = {
+        **PACK,
+        "field_map": {**PACK["field_map"], "mrn": [bad_entry]},
+    }
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="field_map"):
+        load_pack(tmp_path, pubkey)
+
+
+def test_empty_field_map_candidate_list_refused(tmp_path):
+    broken = {
+        **PACK,
+        "field_map": {**PACK["field_map"], "mrn": []},
+    }
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="field_map"):
+        load_pack(tmp_path, pubkey)
+
+
+def test_unknown_field_map_concept_raises():
+    pack = _loaded_test_pack()
+    with pytest.raises(PackVerificationError, match="Unknown field-map concept"):
+        pack.field_candidates("not_a_real_concept")
+
+
+def test_field_candidates_priority_order_preserved():
+    pack = _loaded_test_pack()
+    assert pack.field_candidates("filler_order_number") == (
+        "OBR-3", "ORC-3", "OBR-18", "OBR-19",
+    )
+    assert pack.field_candidates("mrn") == ("PID-3.1",)

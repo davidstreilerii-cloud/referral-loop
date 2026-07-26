@@ -7,6 +7,7 @@ exists to prevent.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -15,6 +16,12 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .errors import PackVerificationError
+
+# SEG-N or SEG-N.C: a 3-letter HL7 segment id, a positive field number, and an
+# optional positive component number (components are ^-delimited within a
+# field). Field *placement* varies by site/RIS; field *concept* names (this
+# regex governs what a placement string may look like) do not.
+_FIELD_REF_RE = re.compile(r"^[A-Z]{3}-[1-9][0-9]*(\.[1-9][0-9]*)?$")
 
 
 @dataclass(frozen=True)
@@ -26,6 +33,8 @@ class RulePack:
     modality_equivalence: dict[str, list[str]]
     tie_breakers: tuple[str, ...]
     tier_confidence: dict[int, float]
+    field_map: dict[str, list[str]]
+    min_auto_match_rate: float
     _equivalence_index: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -53,6 +62,18 @@ class RulePack:
         interface quirk this table exists to absorb.
         """
         return self._equivalence_index.get(modality, frozenset({modality}))
+
+    def field_candidates(self, concept: str) -> tuple[str, ...]:
+        """Priority-ordered field references for a concept; the first populated one wins.
+
+        Raises PackVerificationError for an unknown concept rather than returning
+        an empty tuple -- a typo'd concept silently matching nothing is exactly the
+        failure mode that turns a tier into a false negative.
+        """
+        try:
+            return tuple(self.field_map[concept])
+        except KeyError as exc:
+            raise PackVerificationError(f"Unknown field-map concept: {concept!r}") from exc
 
 
 def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
@@ -94,10 +115,29 @@ def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
     # ...) must still refuse cleanly rather than crash the boot path with an
     # exception the caller isn't catching -- same reasoning as the checks above.
     required = ("version", "confidence_floor", "date_windows_hours", "staleness_hours",
-                "modality_equivalence", "tie_breakers", "tier_confidence")
+                "modality_equivalence", "tie_breakers", "tier_confidence",
+                "field_map", "min_auto_match_rate")
     missing = [k for k in required if k not in raw]
     if missing:
         raise PackVerificationError(f"Pack missing required field(s): {', '.join(missing)}")
+
+    # field_map governs where clinical concepts are read from on the wire.
+    # Pointing a concept at the wrong field (or accepting a typo'd reference)
+    # would silently degrade matches rather than fail loudly, so this is
+    # validated before construction, not discovered later at match time.
+    field_map = raw["field_map"]
+    if not isinstance(field_map, dict):
+        raise PackVerificationError("field_map must be a JSON object")
+    for concept, candidates in field_map.items():
+        if not isinstance(candidates, list) or not candidates:
+            raise PackVerificationError(
+                f"field_map['{concept}'] must be a non-empty list of field references"
+            )
+        for entry in candidates:
+            if not isinstance(entry, str) or not _FIELD_REF_RE.match(entry):
+                raise PackVerificationError(
+                    f"field_map['{concept}'] has a malformed field reference: {entry!r}"
+                )
 
     try:
         return RulePack(
@@ -108,6 +148,8 @@ def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
             modality_equivalence=raw["modality_equivalence"],
             tie_breakers=tuple(raw["tie_breakers"]),
             tier_confidence={int(k): float(v) for k, v in raw["tier_confidence"].items()},
+            field_map=field_map,
+            min_auto_match_rate=float(raw["min_auto_match_rate"]),
         )
     except (TypeError, ValueError, AttributeError) as exc:
         raise PackVerificationError(f"Pack is signed but malformed: {exc}") from exc
