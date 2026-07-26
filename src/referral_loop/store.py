@@ -237,6 +237,45 @@ BEGIN SELECT RAISE(ABORT, 'labels is append-only'); END;
 _ALIAS_ESTABLISHED = "established"
 _ALIAS_REVERSED = "reversed"
 
+# A hard floor under purge_retention, at the choke point rather than only in the
+# policy that calls it.
+#
+# retention.py decides which states are terminal, and that is the right place
+# for a clinical judgement. But `purge_retention` takes the set as an argument,
+# so a caller -- a future config path, a script, a test that gets the argument
+# order wrong -- can hand it OPEN and it would delete a clinically open loop.
+# This is the same posture append_event takes towards the reserved CLOSED event:
+# guard where the write happens, so paths no future caller has written yet are
+# covered too. A state here is refused whatever the policy says about it.
+#
+# It is a floor, not the set. retention.py may narrow it further and does not
+# have to justify itself here; it may not widen it. That the two agree is
+# asserted by test_the_shipped_policy_stays_inside_the_stores_floor rather than
+# trusted -- the same treatment the duplicated label patterns get above.
+_NEVER_DELETABLE = frozenset(
+    {
+        LoopState.OPEN,        # awaiting a result
+        LoopState.SCHEDULED,   # awaiting a result, with an appointment
+        LoopState.RESULTED,    # a result nobody has acknowledged
+        LoopState.ORPHAN,      # a result awaiting a human, which is not a resolution
+        LoopState.CLOSED,      # reserved for v2; v1 holds no opinion about deleting it
+    }
+)
+
+# The two guards a retention purge has to step over, by name. Only DELETE: a
+# purge never updates a row, so the UPDATE guards stay armed for its whole
+# transaction. Disarming more than the operation needs is how a delete path
+# quietly becomes an edit path over an append-only log.
+_DELETE_GUARDS = ("loop_events_no_delete", "raw_messages_no_delete")
+
+# How long a purge waits for the write lock before refusing. A live listener is
+# a second writer; five seconds is long enough to ride out one message and short
+# enough that an operator gets an answer.
+_PURGE_BUSY_TIMEOUT_MS = 5000
+
+# SQLite's parameter limit is 999 by default. Deletes are chunked well under it.
+_PURGE_CHUNK = 400
+
 # Event types that deliberately carry fields without changing state.
 _NON_TRANSITIONAL = frozenset({"merged_in"})
 
@@ -1196,3 +1235,394 @@ class LoopStore:
 
     def all_loops(self) -> list[Loop]:
         return self._loops_where("1 = 1", ())
+
+    # ------------------------------------------------------------- retention
+    #
+    # The only delete path in this file, and the only one there is going to be.
+    # Everything above appends. Spec section 6 makes retention a site policy,
+    # and enforcing a policy over PHI means something here has to be able to
+    # remove rows from two tables the schema declares append-only.
+    #
+    # Three properties hold it together, and each is asserted by a test rather
+    # than argued here:
+    #
+    #   1. **The guards come down for one transaction and no longer.** The
+    #      triggers are read out of sqlite_master, dropped, and recreated from
+    #      exactly the SQL that was found -- so re-arming cannot drift from
+    #      arming, because it is the same string. All of it, DDL included, runs
+    #      inside one explicit BEGIN IMMEDIATE: SQLite rolls DDL back with
+    #      everything else, so a crash mid-purge leaves the file armed. Python's
+    #      sqlite3 runs DDL in autocommit unless a transaction is already open,
+    #      which is why the BEGIN is explicit and isolation_level is None.
+    #
+    #   2. **A file already missing a guard is refused.** Those triggers travel
+    #      with the file and apply to every connection; a file without them has
+    #      been altered outside this module, and running the one sanctioned
+    #      delete path over it would destroy the evidence of that.
+    #
+    #   3. **The delete decision is re-derived from the event log, never read
+    #      off the projection.** `loops` is a materialized index and any
+    #      connection can write it -- the triggers cover the log, not the index
+    #      over it. Selecting candidates through idx_loops_state is a narrowing
+    #      step only; every candidate is then replayed, and a row claiming a
+    #      terminal state over a log that says OPEN deletes nothing. The
+    #      converse error -- a projection that wrongly says OPEN over a
+    #      terminal log -- retains a record too long, which is a policy miss
+    #      and not a safety one, and is the direction to be wrong in.
+    #
+    # BEGIN IMMEDIATE also takes the database's write lock for the whole
+    # transaction, which is what makes selection and deletion atomic against a
+    # listener running in another process. A correction arriving under safety
+    # rule 2 either lands before the purge takes the lock -- and the loop is no
+    # longer terminal when it is replayed -- or waits behind it.
+
+    _PURGE_BUSY_TIMEOUT_MS = _PURGE_BUSY_TIMEOUT_MS
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        """A naive timestamp is read as UTC, never compared against an aware one.
+
+        Comparing the two raises TypeError, and a TypeError inside a purge would
+        abort the whole run over one odd row -- most likely a row restored from
+        a system that wrote no offset.
+        """
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+    @classmethod
+    def _older_than(cls, stamp: object, cutoff: datetime) -> bool | None:
+        """True, False, or None when the timestamp cannot be read.
+
+        None is not False, and the caller must not treat it as one. A row whose
+        age cannot be established has no age; deleting it on the strength of a
+        parse failure is the single outcome here that cannot be undone.
+        """
+        if not isinstance(stamp, str):
+            return None
+        try:
+            return cls._as_utc(datetime.fromisoformat(stamp)) < cutoff
+        except ValueError:
+            return None
+
+    def _guards(self, conn: sqlite3.Connection) -> dict[str, str]:
+        """The DELETE guards' own DDL, or a refusal naming the missing one."""
+        found = {
+            r["name"]: r["sql"]
+            for r in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
+                f"({','.join('?' * len(_DELETE_GUARDS))})",
+                _DELETE_GUARDS,
+            ).fetchall()
+            if r["sql"]
+        }
+        missing = [name for name in _DELETE_GUARDS if name not in found]
+        if missing:
+            raise StoreUnavailableError(
+                f"Refusing to purge {self.db_path}: the append-only guard(s) "
+                f"{', '.join(missing)} are not present on this file. They travel with the "
+                "database and apply to every connection, so a file without them has been "
+                "altered outside this module -- and a purge is the one operation that would "
+                "destroy the evidence of that. Restore the file, or recreate the triggers "
+                "deliberately, before purging."
+            )
+        return found
+
+    def _purge_raw(self, conn, cutoff: datetime, report: dict, dry_run: bool) -> None:
+        """Aged archive rows, selected in Python rather than by SQL comparison.
+
+        `received_at < ?` in SQL is a *string* comparison. It happens to be
+        right for rows this module wrote, which all carry `+00:00`, and wrong
+        for a row restored from a writer that used a different offset or none --
+        which would then be deleted or kept by lexicographic accident. The cost
+        is holding the doomed control ids in memory for the length of one
+        transaction; for a single-site archive that is the cheaper mistake to
+        avoid making.
+        """
+        doomed: list[str] = []
+        for row in conn.execute(
+            "SELECT control_id, received_at FROM raw_messages"
+        ).fetchall():
+            older = self._older_than(row["received_at"], cutoff)
+            if older is None:
+                report["raw_retained_unreadable"] += 1
+            elif older:
+                doomed.append(row["control_id"])
+        report["raw_deleted"] = len(doomed)
+        if dry_run:
+            return
+        for start in range(0, len(doomed), _PURGE_CHUNK):
+            chunk = doomed[start:start + _PURGE_CHUNK]
+            conn.execute(
+                f"DELETE FROM raw_messages WHERE control_id IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+
+    def _doomed_loops(self, conn, cutoff, purgeable_states, report) -> dict[str, list]:
+        """Candidates that survive replay, age and the provenance guard."""
+        if not purgeable_states:
+            # `state IN ()` is a SQLite extension that other engines reject, and
+            # "no state is purgeable" has an answer that needs no query.
+            return {}
+        placeholders = ",".join("?" * len(purgeable_states))
+        candidates = [
+            r["loop_id"]
+            for r in conn.execute(
+                f"SELECT loop_id FROM loops WHERE state IN ({placeholders}) ORDER BY loop_id",
+                tuple(purgeable_states),
+            ).fetchall()
+        ]
+
+        doomed: dict[str, list] = {}
+        states: dict[str, LoopState] = {}
+        for loop_id in candidates:
+            rows = conn.execute(self._EVENTS_SQL, (loop_id,)).fetchall()
+            if not rows:
+                # A projection row with no log behind it. It has no age, so
+                # retention has nothing to say about it; counted so it is
+                # visible rather than silently skipped.
+                report["loops_without_events"] += 1
+                continue
+            try:
+                events = self._rows_to_events(rows)
+                loop = self._build_loop(loop_id, events)
+            except Exception:  # noqa: BLE001 - any unreadable log retains the loop
+                report["retained_unreplayable"] += 1
+                continue
+            if loop.state.value not in purgeable_states:
+                report["retained_projection_disagreed"] += 1
+                continue
+            ages = [self._older_than(r["occurred_at"], cutoff) for r in rows]
+            if any(age is None for age in ages):
+                report["retained_unreplayable"] += 1
+                continue
+            if not all(ages):
+                # Age comes from the NEWEST event, so this is "every event is
+                # past the window". A loop opened four hundred days ago and
+                # acknowledged yesterday is a record the site has been working
+                # inside its own window; measuring from creation would delete it
+                # the day it resolved. Taking the newest also means a
+                # future-dated event -- which the failure matrix accepts --
+                # keeps a record rather than deleting one.
+                report["retained_recent_activity"] += 1
+                continue
+            doomed[loop_id] = list(rows)
+            states[loop_id] = loop.state
+
+        self._hold_back_live_provenance(conn, doomed, states, report)
+        return doomed
+
+    @staticmethod
+    def _hold_back_live_provenance(conn, doomed, states, report) -> None:
+        """Keep an ATTACHED orphan whose target loop is staying.
+
+        Attaching an orphan writes `attached_from` onto the target's `resulted`
+        event, so the target's history names a record this purge would remove.
+        Where the target is going too, the pair leaves together and nothing
+        dangles. Where it is not -- a correction reopened it under safety rule 2,
+        so it is clinically live again -- deleting the orphan would leave an open
+        loop whose result came from a record that no longer exists.
+        """
+        for loop_id in list(doomed):
+            if states[loop_id] is not LoopState.ATTACHED:
+                continue
+            target = ""
+            for row in doomed[loop_id]:
+                if row["event_type"] == "attached":
+                    target = str(json.loads(row["detail"]).get("attached_to", ""))
+            if not target or target in doomed:
+                continue
+            if conn.execute(
+                "SELECT 1 FROM loop_events WHERE loop_id = ? LIMIT 1", (target,)
+            ).fetchone():
+                del doomed[loop_id]
+                report["retained_for_provenance"] += 1
+
+    @staticmethod
+    def _delete_loops(conn, doomed: dict[str, list]) -> None:
+        """A purged loop goes entirely -- events and projection row, one txn.
+
+        Partial is worse than either whole. Events without a projection row are
+        resurrected by rebuild_projection; a projection row without events is a
+        loop no query can replay, and _loops_where would raise on it forever.
+        """
+        ids = list(doomed)
+        for start in range(0, len(ids), _PURGE_CHUNK):
+            chunk = ids[start:start + _PURGE_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            conn.execute(f"DELETE FROM loop_events WHERE loop_id IN ({placeholders})", chunk)
+            conn.execute(f"DELETE FROM loops WHERE loop_id IN ({placeholders})", chunk)
+
+    def purge_retention(
+        self,
+        *,
+        raw_cutoff: datetime,
+        loop_cutoff: datetime,
+        purgeable_states: tuple[str, ...],
+        dry_run: bool = False,
+        reclaim: bool = False,
+    ) -> dict:
+        """Delete aged raw messages and aged terminal loops. Returns counts only.
+
+        `purgeable_states` is passed in rather than defined here: which states
+        are terminal is a clinical judgement and belongs with the policy, not
+        with the storage layer. But it is bounded by _NEVER_DELETABLE, which is
+        not negotiable from outside -- see the note on that constant. An empty
+        set deletes no loop at all, which is the correct answer to "somebody
+        removed every state from the list".
+
+        `dry_run` never lowers a guard and never takes the write lock. A command
+        whose entire purpose is to show an operator what a period reaches, before
+        they let it reach it, has no business disarming the append-only triggers
+        to find out -- and it must be runnable against a live listener, which a
+        write lock would prevent.
+        """
+        if not purgeable_states:
+            logger.warning("Purge called with no purgeable states; no loop will be deleted")
+        refused = sorted(
+            state.value for state in _NEVER_DELETABLE if state.value in purgeable_states
+        )
+        if refused:
+            raise ReferralLoopError(
+                f"Refusing to purge loops in {', '.join(refused)}: a loop in any of those "
+                "states is not finished. OPEN, SCHEDULED and RESULTED are awaiting a result "
+                "or a human; ORPHAN is a result awaiting a human, which is not a resolution; "
+                "CLOSED is reserved for v2 and v1 holds no opinion about deleting it. "
+                "Retention deletes resolved records, and this refusal does not depend on the "
+                "caller's policy being right."
+            )
+
+        report = {
+            "raw_deleted": 0,
+            "raw_retained_unreadable": 0,
+            "loops_deleted": 0,
+            "events_deleted": 0,
+            "loops_without_events": 0,
+            "retained_recent_activity": 0,
+            "retained_projection_disagreed": 0,
+            "retained_unreplayable": 0,
+            "retained_for_provenance": 0,
+            "reclaimed": False,
+        }
+
+        with self._lock:
+            conn = self._connect()
+            # Manual transaction control. Python's sqlite3 opens a transaction
+            # implicitly before DML only, so a DROP TRIGGER would otherwise run
+            # in autocommit and survive the rollback that is supposed to undo it.
+            conn.isolation_level = None
+            guards: dict[str, str] = {}
+            try:
+                conn.execute(f"PRAGMA busy_timeout = {self._PURGE_BUSY_TIMEOUT_MS}")
+                # Freed pages are overwritten rather than merely marked reusable.
+                # Without it the purged payloads stay legible in the file to
+                # anything that reads it as bytes, and "retention" would mean
+                # "unreachable by SQL" rather than "gone".
+                conn.execute("PRAGMA secure_delete = ON")
+                # IMMEDIATE for a real purge: it takes the database's write lock
+                # for the whole transaction, so selection and deletion cannot be
+                # split by a listener in another process applying a message.
+                # DEFERRED for a dry run, which writes nothing and must not
+                # block one.
+                conn.execute("BEGIN" if dry_run else "BEGIN IMMEDIATE")
+                # Checked on a dry run too, and before anything else: an
+                # operator asking what a purge would do needs to hear that this
+                # file's append-only guards are already off.
+                guards = self._guards(conn)
+                if not dry_run:
+                    for name in guards:
+                        conn.execute(f"DROP TRIGGER {name}")
+
+                self._purge_raw(conn, raw_cutoff, report, dry_run)
+                doomed = self._doomed_loops(conn, loop_cutoff, purgeable_states, report)
+                report["loops_deleted"] = len(doomed)
+                report["events_deleted"] = sum(len(rows) for rows in doomed.values())
+                if not dry_run:
+                    self._delete_loops(conn, doomed)
+                    for sql in guards.values():
+                        conn.execute(sql)
+                conn.execute("ROLLBACK" if dry_run else "COMMIT")
+            except sqlite3.Error as exc:
+                self._rollback(conn)
+                raise StoreUnavailableError(f"Retention purge failed: {exc}") from exc
+            except BaseException:
+                self._rollback(conn)
+                raise
+            finally:
+                conn.close()
+
+        self._reassert_guards()
+        if reclaim and not dry_run:
+            report["reclaimed"] = self._reclaim()
+        return report
+
+    @staticmethod
+    def _rollback(conn: sqlite3.Connection) -> None:
+        """Best effort, and it must not replace the exception that got us here.
+
+        A rollback that raises on the way out of a failure would mask the
+        failure -- an operator would be told the connection could not be rolled
+        back rather than what the purge actually hit.
+        """
+        try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        except sqlite3.Error as exc:
+            logger.error("Rolling a failed purge back also failed (%s); the transaction "
+                         "was not committed and SQLite discards it on close", type(exc).__name__)
+
+    def _reassert_guards(self) -> None:
+        """Check the guards are back, on a fresh connection, after the commit.
+
+        Belt and braces over the rollback semantics rather than a substitute for
+        them: if this module ever leaves a file unguarded, an operator has to
+        hear about it in the same breath as the delete that did it.
+        """
+        conn = self._connect()
+        try:
+            self._guards(conn)
+        finally:
+            conn.close()
+
+    def _reclaim(self) -> bool:
+        """VACUUM, so the purge actually returns the disk. Returns whether it ran.
+
+        Deleting rows only marks pages reusable; the file does not shrink, and
+        an archive purged for space would go on occupying it. VACUUM cannot run
+        inside a transaction, hence the separate connection in autocommit.
+
+        temp_store = MEMORY because VACUUM builds a temporary copy of the whole
+        database, and SQLite's default temp directory is not necessarily on the
+        volume the encryption gate attested. A copy of the PHI file landing in
+        /tmp would undo the gate on the way to enforcing retention. The cost is
+        memory proportional to the file, which for a single-site archive is the
+        cheaper of the two.
+
+        **A failure here is logged, not raised.** The deletion has already
+        committed, and it is the compliance-relevant half: the PHI is gone and
+        its pages are zeroed by secure_delete whether or not the file shrinks.
+        Raising would report a completed purge as a failed one -- and would put
+        an audit row reading `failure` over a delete that fully succeeded, which
+        is the worst of the available lies. Reclaiming is housekeeping; it is
+        reported as not done and the next purge will try again.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            conn.isolation_level = None
+            conn.execute(f"PRAGMA busy_timeout = {self._PURGE_BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.execute("VACUUM")
+            return True
+        except (sqlite3.Error, StoreUnavailableError) as exc:
+            # Including the failure to open at all: the volume can go away
+            # between the commit and the vacuum, and that is still a purge that
+            # happened rather than one that did not.
+            logger.warning(
+                "The purge committed but the space could not be reclaimed (%s). The rows are "
+                "deleted and their pages zeroed; the file keeps its size until a later purge "
+                "or a manual VACUUM.", type(exc).__name__,
+            )
+            return False
+        finally:
+            if conn is not None:
+                conn.close()

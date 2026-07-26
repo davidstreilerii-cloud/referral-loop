@@ -191,6 +191,13 @@ class AuditAction(str, Enum):
     PATIENT_MERGED = "referral.patient_merged"
     MERGE_REVERSED = "referral.merge_reversed"
     PACK_LOADED = "referral.pack_loaded"
+    # The one operation in this subsystem that destroys clinical records. It is
+    # audited for the reason the others are not enough on their own: after a
+    # retention purge runs, the rows that would evidence what it did are exactly
+    # what is gone, so the only durable account of it is this one -- in a
+    # database that is governed by a different, longer policy and that
+    # immutable_audit will not let anything delete from.
+    RETENTION_PURGED = "referral.retention_purged"
 
 
 class Outcome(str, Enum):
@@ -222,7 +229,15 @@ class RefusalCode(str, Enum):
 # The keys permitted in the JSON `detail` blob. Enforced at write time rather
 # than by review: a contributor adding a key gets an error instead of a leak.
 _DETAIL_KEYS = frozenset(
-    {"action", "actor_role", "pack_version", "loops_moved", "reason_recorded", "refusal"}
+    {
+        "action", "actor_role", "pack_version", "loops_moved", "reason_recorded", "refusal",
+        # Retention. Four integers and nothing else: two counts of what was
+        # removed and the two periods in force when it was, so the row is
+        # self-describing to an auditor who cannot see the environment the purge
+        # ran in. Counts and day-counts are definitionally non-identifying,
+        # which is what makes widening the allowlist for them safe.
+        "raw_deleted", "loops_deleted", "raw_retention_days", "resolved_retention_days",
+    }
 )
 
 _RESOURCE_TYPE = {
@@ -234,6 +249,7 @@ _RESOURCE_TYPE = {
     AuditAction.PATIENT_MERGED: "referral_patient_merge",
     AuditAction.MERGE_REVERSED: "referral_patient_merge",
     AuditAction.PACK_LOADED: "referral_rule_pack",
+    AuditAction.RETENTION_PURGED: "referral_retention",
 }
 
 # A merge touches a set of loops rather than one, and the identifiers that would
@@ -242,6 +258,10 @@ _RESOURCE_TYPE = {
 # the resource is the merge itself; `loops_moved` carries the size, and the
 # MSH-10 join lives in mrn_alias_events, which the same auditor already has.
 _MERGE_RESOURCE_ID = "patient-merge"
+
+# A purge is site-wide, not per-loop, and the loops it names are the ones it
+# deleted -- so there is no id to carry and nothing that would want one.
+_RETENTION_RESOURCE_ID = "retention-purge"
 
 # immutable_audit's own vocabulary (see GuardrailAuditEvent.event_type). Referral
 # actions are all writes to clinical-facing state; the referral action itself is
@@ -391,18 +411,29 @@ def _person(value: object, limit: int) -> str:
 class AuditScope:
     """The only writable surface a caller gets inside an audited block.
 
-    Three typed attributes and nothing else -- `__slots__` makes a fourth an
-    AttributeError rather than a field that quietly reaches `detail`. There is
-    no attribute here that takes prose, and that is the point: the wrapper is a
-    control because of what it cannot be handed, not because of what it filters.
+    A closed set of typed attributes and nothing else -- `__slots__` makes one
+    more an AttributeError rather than a field that quietly reaches `detail`.
+    There is no attribute here that takes prose, and that is the point: the
+    wrapper is a control because of what it cannot be handed, not because of
+    what it filters. Every slot beyond `pack_version` and `refusal` holds an
+    integer, so widening this set stays provably non-identifying.
     """
 
-    __slots__ = ("loops_moved", "pack_version", "refusal")
+    __slots__ = (
+        "loops_moved", "pack_version", "refusal",
+        "raw_deleted", "loops_deleted", "raw_retention_days", "resolved_retention_days",
+    )
 
     def __init__(self) -> None:
         self.loops_moved: int | None = None
         self.pack_version: str = ""
         self.refusal: RefusalCode | None = None
+        # Retention (spec section 6). Counts of what a purge removed and the
+        # periods in force when it did.
+        self.raw_deleted: int | None = None
+        self.loops_deleted: int | None = None
+        self.raw_retention_days: int | None = None
+        self.resolved_retention_days: int | None = None
 
 
 def _emit(
@@ -424,6 +455,8 @@ def _emit(
 
         if action in (AuditAction.PATIENT_MERGED, AuditAction.MERGE_REVERSED):
             resource_id = _MERGE_RESOURCE_ID
+        elif action is AuditAction.RETENTION_PURGED:
+            resource_id = _RETENTION_RESOURCE_ID
         elif action is AuditAction.PACK_LOADED:
             resource_id = _pack_version(scope.pack_version)
         else:
@@ -434,6 +467,13 @@ def _emit(
             detail["pack_version"] = _pack_version(scope.pack_version)
         if scope.loops_moved is not None:
             detail["loops_moved"] = int(scope.loops_moved)
+        for name in ("raw_deleted", "loops_deleted",
+                     "raw_retention_days", "resolved_retention_days"):
+            value = getattr(scope, name)
+            if value is not None:
+                # int(), so a value that is not a number raises here and drops
+                # the row rather than writing whatever it was.
+                detail[name] = int(value)
         if reason_required:
             # That a reason was given, never the reason. It is in loop_events.
             detail["reason_recorded"] = outcome is Outcome.SUCCESS

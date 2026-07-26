@@ -62,6 +62,8 @@ from .listener import FileDropSource, MessageHandler
 from .mllp_server import make_mllp_server
 from .pack import RulePack, load_pack
 from .registry import Registry
+from .retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV, RetentionPolicy
+from .retention import purge as run_purge
 from .staleness import require_thresholds_accepted
 from .store import LoopStore
 from .worklist import make_worklist_server
@@ -263,6 +265,70 @@ def _run_eval(stack: BootedStack, args, public_key_hex: str) -> int:
     return EVAL_ALLOWED if allowed else EVAL_BLOCKED
 
 
+def _run_purge(args) -> int:
+    """Enforce the site's retention policy. Two gates, and deliberately not three.
+
+    **The policy is read first, before anything touches disk.** An operator who
+    has not stated a retention period needs to hear that, not that their pack is
+    unsigned -- and `RetentionPolicy.from_env` reads only the environment, so
+    answering it first costs nothing and creates nothing.
+
+    **The encryption gate still runs before `LoopStore` is constructed**, for
+    the same reason it does in `boot`: this opens a file full of MRNs and result
+    text, and a purge on an unattested volume would be reading PHI off it to
+    decide what to delete.
+
+    The other two gates are skipped, and that is a judgement rather than an
+    oversight. The pack gate exists because a tampered pack causes false
+    matches; a purge loads no pack and matches nothing. The threshold gate
+    exists because staleness implies a clinical standard; a purge computes no
+    staleness. Requiring either would be gate theatre -- and worse, it would put
+    a site's ability to meet its own retention obligation behind a signing key
+    that has nothing to do with it.
+
+    `--dry-run` is not a convenience. This is the one command in the subsystem
+    that destroys clinical records, and an operator should be able to see what a
+    period actually reaches before it reaches it.
+
+    **A database that does not exist is refused, not created.** Every other mode
+    creates its file, because a fresh install has to start somewhere. A purge
+    has nothing to start: a typo in `--db` would otherwise build an empty
+    database, purge nothing from it, print "deleted 0" and exit 0 -- and the
+    site's retention obligation would read as met against a file that has never
+    held a message. That is `_run_filedrop`'s missing-directory case with a
+    compliance record attached to it.
+    """
+    policy = RetentionPolicy.from_env()
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"))
+
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        raise StoreUnavailableError(
+            f"No database at {db_path}, so there is nothing to purge. Point --db at the file "
+            "the listener writes to. It is not created here: purging a database this command "
+            "just made would report a retention policy as enforced against a file that has "
+            "never held a message."
+        )
+    store = LoopStore(db_path)
+    report = run_purge(store, policy, dry_run=args.dry_run, reclaim=not args.no_reclaim)
+
+    verb = "would delete" if args.dry_run else "deleted"
+    print(
+        f"{PROG}: retention {'dry run' if args.dry_run else 'purge'} complete "
+        f"(raw {policy.raw_days}d, resolved {policy.resolved_days}d): {verb} "
+        f"{report['raw_deleted']} archived message(s) and {report['loops_deleted']} "
+        f"resolved loop(s) carrying {report['events_deleted']} event(s)."
+    )
+    print(
+        f"{PROG}: kept {report['retained_recent_activity']} terminal loop(s) with activity "
+        f"inside the window, {report['retained_for_provenance']} attached to a loop that is "
+        f"staying, {report['retained_projection_disagreed']} whose event log says they are "
+        f"not terminal, and {report['retained_unreplayable']} that could not be replayed. "
+        "No open loop is ever deleted by age."
+    )
+    return 0
+
+
 def _run_worklist(stack: BootedStack, host: str, port: int) -> int:
     """Serve the coordinator worklist. Loopback by refusal, not by convention.
 
@@ -327,7 +393,8 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Required environment: {PUBKEY_ENV} (pack signing public key, hex), "
             "PHI_ENCRYPTION_VERIFIED=1 or OS-detected encryption at rest, "
             "REFERRAL_THRESHOLDS_ACCEPTED=1 once the site has reviewed "
-            "rules/pack.json staleness_hours."
+            f"rules/pack.json staleness_hours. purge mode additionally requires "
+            f"{RAW_DAYS_ENV} and {RESOLVED_DAYS_ENV}, which have no defaults."
         ),
     )
     parser.add_argument(
@@ -335,7 +402,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="listen: MLLP server. filedrop: drain a watched directory once. "
              "worklist: coordinator queue on localhost. eval: replay the labeled "
              "corpus through --pack-dir and apply the release gate against "
-             "--baseline-pack-dir. purge: reserved for v1+1, refuses.",
+             "--baseline-pack-dir. purge: enforce the site's retention policy, "
+             "which it refuses to run without.",
     )
     parser.add_argument("--db", default="data/referral_loops.db",
                         help="SQLite file on an encrypted volume (default: %(default)s)")
@@ -361,6 +429,12 @@ def _build_parser() -> argparse.ArgumentParser:
                              "coordinator labels. The site corpus is the valuable half -- it "
                              "is real interface quirks from real traffic -- so this is for "
                              "reproducing the shipped baseline, not for a release decision")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="purge mode: report what the configured periods reach and "
+                             "delete nothing. The selection is identical to a real run")
+    parser.add_argument("--no-reclaim", action="store_true",
+                        help="purge mode: skip the VACUUM. Deleted pages are already zeroed, "
+                             "but the file keeps its size until it is reclaimed")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="default: %(default)s")
@@ -382,16 +456,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Answered before the gates, deliberately. `purge` does nothing, so making
-    # an operator satisfy three gates to be told it does nothing would bury the
-    # message they need under one about a pack.
+    # Answered before the pack key is even looked for, deliberately. A purge
+    # loads no pack, and an operator whose retention period is unset needs to
+    # hear that rather than a message about a signing key. See _run_purge for
+    # which gates it does run and why the other two do not apply.
     if args.mode == "purge":
-        return _refuse(
-            "retention purge is not implemented. Spec section 11 holds it out of v1 "
-            "until the site states a retention period, because a delete path over PHI "
-            "and an append-only audit archive must not ship before the policy it "
-            "enforces exists."
-        )
+        try:
+            return _run_purge(args)
+        except (ReferralLoopError, RuntimeError) as exc:
+            return _refuse(str(exc))
 
     public_key_hex = os.environ.get(PUBKEY_ENV, "")
     if not public_key_hex.strip():

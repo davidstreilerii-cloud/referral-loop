@@ -25,6 +25,7 @@ import sys
 import threading
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -39,8 +40,9 @@ from healthcare_rag.referral_loop.errors import (
     StoreUnavailableError,
     ThresholdsNotAcceptedError,
 )
-from healthcare_rag.referral_loop.events import LoopState
+from healthcare_rag.referral_loop.events import LoopEvent, LoopState
 from healthcare_rag.referral_loop.mllp import deframe, frame
+from healthcare_rag.referral_loop.retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV
 from healthcare_rag.referral_loop.store import LoopStore
 from tests.referral_loop.test_listener import MRN, ORDERED_AT, order, result
 
@@ -334,22 +336,112 @@ def test_encryption_refusal_names_the_attestation_variable(tmp_path, good_env,
     assert "Traceback" not in err
 
 
-def test_purge_refuses_and_says_why_before_any_gate_runs(tmp_path, monkeypatch, capsys):
-    """Spec section 11: retention purge is not in v1.
+def test_purge_refuses_an_unstated_retention_policy_before_any_gate_runs(
+    tmp_path, monkeypatch, capsys
+):
+    """Spec section 6: retention is configured, not assumed.
 
-    Deliberately answered before the gates. An operator who runs `purge` needs
-    to hear that it does not exist, not that their pack is unsigned -- and a
-    `purge` that exited 0 while deleting nothing would be the worst possible
-    outcome, since retention compliance would then be asserted by a no-op.
+    Deliberately answered before the gates and before the pack key is looked
+    for. An operator who runs `purge` with no period set needs to hear which
+    variables to set, not that their pack is unsigned -- and a `purge` that
+    exited 0 while deleting nothing would be the worst possible outcome, since
+    retention compliance would then be asserted by a no-op.
     """
     for name in ("PHI_MODE", "PHI_ENCRYPTION_VERIFIED", "REFERRAL_THRESHOLDS_ACCEPTED",
-                 PUBKEY_ENV):
+                 PUBKEY_ENV, RAW_DAYS_ENV, RESOLVED_DAYS_ENV):
         monkeypatch.delenv(name, raising=False)
-    code = main(["purge"])
+    code = main(["purge", "--db", str(tmp_path / "loops.db")])
     err = capsys.readouterr().err
     assert code == 2
-    assert "not implemented" in err
-    assert "retention" in err.lower()
+    assert RAW_DAYS_ENV in err and RESOLVED_DAYS_ENV in err
+    assert "Traceback" not in err
+    assert not (tmp_path / "loops.db").exists(), "a refused purge created a PHI file"
+
+
+def test_purge_still_refuses_when_only_one_period_is_stated(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(RAW_DAYS_ENV, "30")
+    monkeypatch.delenv(RESOLVED_DAYS_ENV, raising=False)
+    assert main(["purge", "--db", str(tmp_path / "loops.db")]) == 2
+    assert RESOLVED_DAYS_ENV in capsys.readouterr().err
+
+
+def test_purge_refuses_an_unattested_volume_even_with_a_stated_policy(
+    tmp_path, monkeypatch, capsys
+):
+    """The one gate a purge does run. It opens a file of MRNs and result text to
+    decide what to delete, so encryption at rest has to hold first."""
+    monkeypatch.setenv(RAW_DAYS_ENV, "30")
+    monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
+    monkeypatch.setenv("PHI_MODE", "full")
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+
+    code = main(["purge", "--db", str(tmp_path / "loops.db")])
+
+    assert code == 2
+    assert "PHI_ENCRYPTION_VERIFIED" in capsys.readouterr().err
+    assert not (tmp_path / "loops.db").exists()
+
+
+def test_purge_needs_no_pack_key_and_no_accepted_thresholds(tmp_path, monkeypatch, capsys):
+    """A purge loads no pack and computes no staleness. Putting a site's ability
+    to meet its own retention obligation behind a signing key it does not use
+    would be gate theatre."""
+    store = LoopStore(tmp_path / "loops.db")
+    store.append_event(LoopEvent("L-00000000aaaa", "created",
+                                 datetime.now(timezone.utc) - timedelta(days=800), "C1",
+                                 {"mrn": "MRN1"}))
+    store.append_event(LoopEvent("L-00000000aaaa", "acknowledged",
+                                 datetime.now(timezone.utc) - timedelta(days=800), "C2", {}))
+
+    for name in (PUBKEY_ENV, "REFERRAL_THRESHOLDS_ACCEPTED"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(RAW_DAYS_ENV, "30")
+    monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+
+    code = main(["purge", "--db", str(tmp_path / "loops.db")])
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "1 resolved loop(s)" in out
+    assert store.all_loops() == []
+
+
+def test_purge_refuses_a_database_that_does_not_exist(tmp_path, monkeypatch, capsys):
+    """Every other mode creates its file. A purge has nothing to start, and a
+    typo in --db would otherwise build an empty database, purge nothing, print
+    "deleted 0" and exit 0 -- with the site's retention obligation reading as
+    enforced against a file that has never held a message."""
+    monkeypatch.setenv(RAW_DAYS_ENV, "30")
+    monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+
+    missing = tmp_path / "typo" / "loops.db"
+    code = main(["purge", "--db", str(missing)])
+
+    assert code == 2
+    assert "nothing to purge" in capsys.readouterr().err
+    assert not missing.exists()
+    assert not missing.parent.exists(), "a refused purge created the data directory"
+
+
+def test_a_dry_run_purge_reports_without_deleting(tmp_path, monkeypatch, capsys):
+    store = LoopStore(tmp_path / "loops.db")
+    old = datetime.now(timezone.utc) - timedelta(days=800)
+    store.append_event(LoopEvent("L-00000000bbbb", "created", old, "C1", {"mrn": "MRN1"}))
+    store.append_event(LoopEvent("L-00000000bbbb", "cancelled", old, "C2", {}))
+
+    monkeypatch.setenv(RAW_DAYS_ENV, "30")
+    monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+
+    code = main(["purge", "--db", str(tmp_path / "loops.db"), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "would delete" in out and "1 resolved loop(s)" in out
+    assert len(store.all_loops()) == 1
 
 
 def test_help_works_with_no_pack_no_environment_and_no_database(tmp_path):

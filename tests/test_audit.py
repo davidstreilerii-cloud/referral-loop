@@ -349,12 +349,19 @@ def test_a_minted_loop_id_is_kept_because_it_is_the_join_an_auditor_needs(regist
 
 def test_the_scope_a_caller_holds_accepts_no_field_of_its_own():
     """`AuditScope` is the only writable surface inside an audited block. If a
-    caller could set a fourth attribute, `detail` would be a free-text channel
-    again -- which is the shape this whole module exists to close."""
+    caller could set an attribute of their own, `detail` would be a free-text
+    channel again -- which is the shape this whole module exists to close.
+
+    The set is pinned rather than merely checked for prose, so widening it is a
+    deliberate edit here. Task 16 added the four retention slots; every one of
+    them holds an integer, which is what makes the widening provably safe."""
     scope = AuditScope()
     with pytest.raises(AttributeError):
         scope.mrn = MRN_SENTINEL
-    assert set(AuditScope.__slots__) == {"loops_moved", "pack_version", "refusal"}
+    assert set(AuditScope.__slots__) == {
+        "loops_moved", "pack_version", "refusal",
+        "raw_deleted", "loops_deleted", "raw_retention_days", "resolved_retention_days",
+    }
 
 
 def test_a_detail_key_outside_the_allowlist_is_dropped_rather_than_written(caplog, monkeypatch):
