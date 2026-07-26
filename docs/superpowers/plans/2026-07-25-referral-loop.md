@@ -998,6 +998,20 @@ git commit -m "feat(referral): MLLP framing and ACK construction"
 
 ### Task 5: Store — raw archive, append-only events, replay
 
+> **AS-BUILT — the code block below is superseded in five ways. Read this first; implementing the snippet verbatim reintroduces four defects.** Authoritative source is `healthcare_rag/referral_loop/store.py`.
+>
+> 1. **Append-only is enforced by SQL triggers, not the authorizer.** A `sqlite3` authorizer binds per-connection, so it guards only connections `LoopStore` opens — any other process could delete the event log freely. `BEFORE DELETE`/`BEFORE UPDATE` triggers on `loop_events` and `raw_messages` travel with the file. The authorizer is retained as defence in depth. Verified blocked from an outside connection: `DELETE`, `UPDATE`, `UPDATE ... FROM`, `ALTER TABLE`, `DROP TRIGGER`.
+> 2. **`replay` must NOT filter falsy detail values.** `event.detail` contains exactly the keys an event intends to change, so `attrs.update(event.detail)` already leaves other fields alone. The filter made it impossible for an event to *clear* a field, which made safety rule 2 — a corrected result clearing the prior acknowledgement — unimplementable through the event log.
+> 3. **`record_raw` must not treat every `IntegrityError` as a duplicate.** It returned `False` for a message that was never stored, so the listener would answer `AA` and the message would be gone. It now confirms the row exists before claiming duplicate, and raises `StoreUnavailableError` otherwise. A falsy `control_id` is refused outright — SQLite permits repeated NULLs in a TEXT primary key, which silently defeats MSH-10 idempotency.
+> 4. **Unknown `event_type` is rejected in `append_event`, before the insert** — not only in `replay`. Validating in `replay` alone raises *after* the row is committed, and because the log is append-only that event can never be removed: one typo makes a loop permanently unreplayable. The `replay` guard remains for a restored or foreign-written log.
+> 5. **Durability is pinned, not defaulted.** `_connect()` sets `PRAGMA synchronous=FULL`, `recursive_triggers=ON` (so `REPLACE INTO` fires the delete trigger) and `foreign_keys=ON`, with a test asserting they read back. Measured by hard-killing the process after `record_raw` returned: the row survives. Without pinning, one stray `PRAGMA synchronous=OFF` in a later task would silently remove persist-before-ACK with no test failing.
+>
+> Also added: `rebuild_projection()` (a restore from the event log otherwise leaves an empty worklist — a loop vanishing silently), and timezone-aware UTC `received_at` to match `occurred_at`.
+>
+> **Residual, documented in the module docstring rather than papered over:** a foreign connection that does not set `recursive_triggers`, and `DROP TABLE`, both remain possible. These are bounded by filesystem permissions, not by this module, and belong in the audit narrative.
+>
+> **Carried to Task 6:** `replay` orders by arrival (`event_id`), deliberately — each event was validated by the registry when applied, so arrival order is the authoritative accepted sequence. **The registry must therefore reject a clinically-older message arriving late before appending it**; nothing below the registry guards this, and a `scheduled` arriving after a `resulted` would otherwise regress the state. Separately, `_materialize`'s lock is per-instance, so two processes on one file can race the `loops` projection.
+
 **Files:**
 - Create: `healthcare_rag/referral_loop/store.py`
 - Test: `tests/referral_loop/test_store.py`
