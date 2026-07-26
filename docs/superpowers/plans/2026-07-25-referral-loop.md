@@ -354,7 +354,15 @@ class RulePack:
         return self.staleness_hours.get(modality, self.staleness_hours["_default"])
 
     def equivalent_modalities(self, modality: str) -> frozenset[str]:
-        return frozenset(self.modality_equivalence.get(modality, [modality]))
+        """Symmetric: querying from an alias returns the same class as the canonical.
+
+        The pack keys equivalences canonically ("CT": ["CT", "CAT"]), but sending
+        systems emit either spelling. A naive .get(modality) returns {"CAT"} for
+        the alias, so a CAT result would never match a CT order -- failing safe
+        (an orphan, not a false close) but silently costing recall on exactly the
+        interface quirk this table exists to absorb.
+        """
+        return self._equivalence_index.get(modality, frozenset({modality}))
 
 
 def load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
@@ -811,14 +819,16 @@ def parse_hl7_text(text: str) -> ParsedMessage:
     message_type = ""
 
     for raw in raw_segments:
+        # Exact segment-id match, not a prefix match. `raw[:3] in ALLOWED_SEGMENTS`
+        # alone would ingest "OBXTRA|..." as an OBX, letting a non-allowlisted
+        # segment's content reach Python objects -- the one thing the allowlist
+        # exists to prevent. HL7 v2 ids are always exactly 3 characters, so a
+        # conformant sender never trips this; that is precisely the reasoning this
+        # module rejects for denylists, so it is enforced rather than assumed.
         seg_id = raw[:3]
-        if seg_id not in ALLOWED_SEGMENTS:
+        if seg_id not in ALLOWED_SEGMENTS or not (len(raw) == 3 or raw[3] == "|"):
             continue
-        try:
-            fields = _split_fields(raw)
-        except Exception:
-            flags.append(seg_id)
-            continue
+        fields = _split_fields(raw)
 
         if seg_id == "MSH":
             # MSH-1 is the field separator itself, so MSH fields shift by one.
@@ -2655,6 +2665,10 @@ SENTINELS = {
     "NK1_NAME": "ZZSENTINELKIN",
     "GT1_NAME": "ZZSENTINELGUARANTOR",
     "NTE_TEXT": "ZZSENTINELNOTE",
+    # A segment id that prefix-collides with an allowlisted one. An allowlist
+    # that matches on prefix would ingest this as an OBX; this sentinel makes
+    # that bypass visible in the end-to-end proof rather than only in a unit test.
+    "PREFIX_COLLISION": "ZZSENTINELPREFIX",
 }
 
 
@@ -2668,6 +2682,7 @@ def oru_with_sentinels(control_id: str = "SENT001") -> str:
         f"OBR|1|PLACER1|FILLER1|71260^CT CHEST^C4|||20260725100000\r"
         f"OBX|1|TX|71260^CT CHEST^C4||{SENTINELS['NTE_TEXT']}||||||F\r"
         f"NTE|1||{SENTINELS['NTE_TEXT']}\r"
+        f"OBXTRA|1|TX|CODE||{SENTINELS['PREFIX_COLLISION']}||||||F\r"
     )
 
 
