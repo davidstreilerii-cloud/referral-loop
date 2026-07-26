@@ -1,13 +1,14 @@
 """Spec test 9: pack tamper. Mutate one byte; assert refusal to load."""
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from healthcare_rag.referral_loop.errors import PackVerificationError
-from healthcare_rag.referral_loop.pack import load_pack
+from healthcare_rag.referral_loop.pack import RulePack, load_pack
 
 PACK = {
     "version": "1.0.0",
@@ -31,6 +32,13 @@ def _write_pack(tmp_path, pack_dict, corrupt=False):
     (tmp_path / "pack.json").write_bytes(pack_bytes)
     (tmp_path / "pack.sig").write_bytes(sig)
     return key.public_key().public_bytes_raw()
+
+
+def _loaded_test_pack() -> RulePack:
+    with tempfile.TemporaryDirectory() as d:
+        tmp_path = Path(d)
+        pubkey = _write_pack(tmp_path, PACK)
+        return load_pack(tmp_path, pubkey)
 
 
 def test_valid_pack_loads(tmp_path):
@@ -103,4 +111,38 @@ def test_missing_default_window_refuses(tmp_path, field):
     broken = {**PACK, field: {"CT": 24}}
     pubkey = _write_pack(tmp_path, broken)
     with pytest.raises(PackVerificationError, match=f"{field} missing"):
+        load_pack(tmp_path, pubkey)
+
+
+def test_equivalent_modalities_is_symmetric():
+    pack = _loaded_test_pack()
+    assert pack.equivalent_modalities("CT") == pack.equivalent_modalities("CAT")
+    assert "CT" in pack.equivalent_modalities("CAT")
+    assert "CAT" in pack.equivalent_modalities("CT")
+
+
+def test_unknown_modality_is_its_own_class():
+    pack = _loaded_test_pack()
+    assert pack.equivalent_modalities("NM") == frozenset({"NM"})
+
+
+def test_date_window_and_staleness_fall_back_to_default():
+    pack = _loaded_test_pack()
+    assert pack.date_window_hours("CT") == 24
+    assert pack.date_window_hours("UNKNOWN") == 168
+    assert pack.staleness_threshold_hours("CT") == 4
+    assert pack.staleness_threshold_hours("UNKNOWN") == 336
+
+
+def test_missing_version_refuses(tmp_path):
+    broken = {k: v for k, v in PACK.items() if k != "version"}
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="missing required field"):
+        load_pack(tmp_path, pubkey)
+
+
+def test_non_integer_tier_confidence_key_refuses(tmp_path):
+    broken = {**PACK, "tier_confidence": {"not-an-int": 1.0}}
+    pubkey = _write_pack(tmp_path, broken)
+    with pytest.raises(PackVerificationError, match="signed but malformed"):
         load_pack(tmp_path, pubkey)

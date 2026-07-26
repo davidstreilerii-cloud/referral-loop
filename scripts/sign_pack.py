@@ -37,7 +37,10 @@ def _load_private() -> Ed25519PrivateKey:
 
 def sign() -> None:
     key = _load_private()
-    pack_bytes = (PACK_DIR / "pack.json").read_bytes()
+    pack_path = PACK_DIR / "pack.json"
+    if not pack_path.exists():
+        sys.exit(f"No pack at {pack_path}. Nothing to sign.")
+    pack_bytes = pack_path.read_bytes()
     (PACK_DIR / "pack.sig").write_bytes(key.sign(pack_bytes))
     print(f"Signed {len(pack_bytes)} bytes -> {PACK_DIR / 'pack.sig'}")
 
