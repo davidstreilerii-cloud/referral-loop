@@ -71,6 +71,26 @@ class CircularMergeError(ReferralLoopError):
     """
 
 
+class MrnRetiredError(ReferralLoopError):
+    """An MRN that stopped being current between ingest resolution and the write.
+
+    Identity is resolved once, at ingest, before the registry or the matcher
+    sees anything (spec section 4) -- and that resolution is not atomic with
+    committing a merge. A listener can resolve an MRN, an ADT^A40 can commit,
+    and the loop is then written onto an identifier retired microseconds
+    earlier: invisible to every query on the surviving patient, and missed by
+    that merge's straggler scan, which has already run.
+
+    Typed, and distinct from the ReferralLoopError the rest of open_loop raises,
+    because the two need opposite answers on the wire. This one is **retryable**
+    -- the next resolution gets it right -- so the listener answers AE and the
+    engine redelivers. A generic failure is not retryable and is answered AA
+    with the raw archived and flagged; answering AE to that would wedge the
+    interface behind a message that will never become acceptable. Distinguishing
+    them by parsing an error message would be the fragile version of this.
+    """
+
+
 class StaleMessageError(ReferralLoopError):
     """A message clinically older than one already applied to the loop.
 

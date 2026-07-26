@@ -58,6 +58,13 @@ logger = logging.getLogger(__name__)
 _RESULTABLE_STATES = frozenset({LoopState.OPEN, LoopState.SCHEDULED, LoopState.RESULTED})
 _EXACT_TIER_STATES = _RESULTABLE_STATES | frozenset({LoopState.ACKNOWLEDGED})
 
+# Every state match_result can return a loop from. Exported so ingest asks the
+# store for exactly this set rather than deciding for itself which loops to
+# offer: a listener that supplied a narrower set would silently disable a tier,
+# and omitting ACKNOWLEDGED specifically would make safety rule 2 dead code
+# without any test in this module noticing.
+MATCHABLE_STATES = _EXACT_TIER_STATES
+
 _TIER_PLACER = 1
 _TIER_FILLER = 2
 _TIER_SERVICE = 3

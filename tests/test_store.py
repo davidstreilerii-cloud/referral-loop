@@ -368,3 +368,91 @@ def test_projection_is_rebuildable_from_the_event_log(tmp_path):
 
     assert store.rebuild_projection() == 2
     assert {loop.loop_id for loop in store.open_loops()} == {"L1", "L2"}
+
+
+# ------------------------------------------------- applied_messages (Task 10)
+
+
+def test_loops_in_states_returns_only_the_requested_states(tmp_path):
+    """Found by mutation: making this ignore its filter passed the whole suite,
+    because the matcher re-checks state and the extra candidates changed no
+    outcome. That makes the filter unobservable through the listener but not
+    unimportant -- it is a public store method whose contract the next caller
+    will rely on, and an untested contract is one that drifts.
+    """
+    store = LoopStore(tmp_path / "loops.db")
+    store.append_event(LoopEvent("L-open", "created", NOW, "C1", {"mrn": "M1"}))
+    store.append_event(LoopEvent("L-done", "created", NOW, "C2", {"mrn": "M1"}))
+    store.append_event(LoopEvent("L-done", "cancelled", NOW, "C3", {}))
+
+    ids = {loop.loop_id for loop in store.loops_in_states([LoopState.OPEN])}
+    assert ids == {"L-open"}, "a CANCELLED loop is not OPEN"
+
+    both = store.loops_in_states([LoopState.OPEN, LoopState.CANCELLED])
+    assert {loop.loop_id for loop in both} == {"L-open", "L-done"}
+    assert store.loops_in_states([]) == []
+
+
+def test_a_content_key_can_only_be_claimed_once(tmp_path):
+    """The unique index, tested at the store rather than through the listener.
+
+    Found by mutation: dropping UNIQUE passed the whole suite, because the
+    listener serializes every message behind one lock and the check-then-insert
+    never actually races in-process. That makes the constraint look redundant
+    and it is not -- the lock covers one process, and the index is the only
+    thing standing between two processes on one database file and a second
+    `resulted` transition for the same result.
+    """
+    store = LoopStore(tmp_path / "loops.db")
+    assert store.record_applied("CTRL_A", "sha-of-the-result") is True
+    assert store.record_applied("CTRL_B", "sha-of-the-result") is False, (
+        "a second control id must not be able to claim content already applied"
+    )
+    assert store.content_key_owner("sha-of-the-result") == "CTRL_A"
+    assert store.applied_count() == 1
+
+
+def test_a_control_id_can_only_be_applied_once(tmp_path):
+    store = LoopStore(tmp_path / "loops.db")
+    assert store.record_applied("CTRL_A", "key-1") is True
+    assert store.record_applied("CTRL_A", "key-2") is False
+    assert store.control_id_applied("CTRL_A") is True
+    assert store.control_id_applied("CTRL_NEVER_SEEN") is False
+
+
+def test_messages_with_no_content_key_do_not_collide(tmp_path):
+    """content_key is NULL for unknown types and for content duplicates. A
+    non-partial UNIQUE index on an engine treating NULLs as equal would let the
+    first such message block every later one."""
+    store = LoopStore(tmp_path / "loops.db")
+    assert store.record_applied("CTRL_A", None) is True
+    assert store.record_applied("CTRL_B", None) is True
+    assert store.applied_count() == 2
+
+
+def test_applied_messages_is_append_only(tmp_path):
+    """Same guarantee as the archive: a deleted row is a message applied twice,
+    and an updated one is a content key reassigned to a message that never
+    carried it."""
+    db = tmp_path / "loops.db"
+    store = LoopStore(db)
+    store.record_applied("CTRL_A", "key-1")
+    with closing(sqlite3.connect(db)) as conn:
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("DELETE FROM applied_messages")
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("UPDATE applied_messages SET content_key = 'other'")
+
+
+def test_record_applied_refuses_an_empty_control_id(tmp_path):
+    store = LoopStore(tmp_path / "loops.db")
+    with pytest.raises(StoreUnavailableError):
+        store.record_applied("", "key-1")
+
+
+def test_raw_payloads_returns_messages_in_receipt_order(tmp_path):
+    store = LoopStore(tmp_path / "loops.db")
+    for control_id, payload in (("C1", "first"), ("C2", "second"), ("C3", "third")):
+        store.record_raw(control_id, payload)
+        time.sleep(0.002)
+    assert store.raw_payloads() == ["first", "second", "third"]

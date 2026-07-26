@@ -77,7 +77,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-from .errors import ReferralLoopError, StaleMessageError
+from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
 from .events import Loop, LoopEvent, LoopState
 from .store import LoopStore
 
@@ -215,7 +215,12 @@ class Registry:
             # Raising turns that silent invisibility into a loud, retryable
             # error the listener answers by re-resolving and resending.
             if self.store.resolve_mrn(mrn) != mrn:
-                raise ReferralLoopError(
+                # MrnRetiredError, not a bare ReferralLoopError: this refusal is
+                # retryable and every other failure in this method is not, and
+                # the listener has to answer AE here and AA elsewhere. Still a
+                # ReferralLoopError, so existing callers catching that keep
+                # working.
+                raise MrnRetiredError(
                     f"MRN {mrn} was retired between ingest and this write; re-resolve and "
                     "retry. Storing the loop here would hide it from the surviving patient."
                 )

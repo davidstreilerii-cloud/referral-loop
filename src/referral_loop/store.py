@@ -71,6 +71,40 @@ CREATE TABLE IF NOT EXISTS loop_events (
     detail      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_loop ON loop_events(loop_id);
+
+-- Which messages have been *applied*, and what content they carried. Both
+-- idempotency paths of spec section 6 live in this one table, and it is
+-- deliberately not raw_messages.
+--
+--   * raw_messages answers "has this arrived", which is what the archive is
+--     for. applied_messages answers "has this been acted on", which is a
+--     strictly later fact. Keying dedup on arrival loses a message whenever a
+--     store failure lands between the two: the raw is durable, the engine gets
+--     AE, it redelivers under the same MSH-10, and an arrival-keyed check
+--     no-ops a message that never produced a transition. A referral loop that
+--     silently never opened is exactly the failure this product exists to
+--     prevent, arriving through the backpressure mechanism.
+--   * content_key is the second path. Many interface engines stamp a fresh
+--     control id on retry, so the same result returns with a new MSH-10, sails
+--     past the control-id check, and produces a second `resulted` transition or
+--     a second orphan. The unique index makes that a database fact rather than
+--     a check the listener has to remember, which is also what makes it hold
+--     across two connections racing.
+--
+-- The index is partial because content_key is NULL for messages that carry no
+-- identifying content of their own (unknown types, and messages refused before
+-- a key could be built). A plain UNIQUE index would collapse all of those into
+-- one row on any database engine treating NULLs as equal, and relying on
+-- SQLite not doing so is a portability trap for a table whose whole job is not
+-- losing messages.
+CREATE TABLE IF NOT EXISTS applied_messages (
+    control_id   TEXT PRIMARY KEY,
+    content_key  TEXT,
+    message_type TEXT NOT NULL DEFAULT '',
+    applied_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applied_content_key
+    ON applied_messages(content_key) WHERE content_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS loops (
     loop_id           TEXT PRIMARY KEY,
     mrn               TEXT NOT NULL,
@@ -142,6 +176,13 @@ CREATE TRIGGER IF NOT EXISTS mrn_alias_no_delete BEFORE DELETE ON mrn_alias_even
 BEGIN SELECT RAISE(ABORT, 'mrn_alias_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS mrn_alias_no_update BEFORE UPDATE ON mrn_alias_events
 BEGIN SELECT RAISE(ABORT, 'mrn_alias_events is append-only'); END;
+-- Append-only for the same reason as the archive: a deleted row is a message
+-- that gets applied a second time, and an updated one is a content key
+-- reassigned to a message that never carried it.
+CREATE TRIGGER IF NOT EXISTS applied_no_delete BEFORE DELETE ON applied_messages
+BEGIN SELECT RAISE(ABORT, 'applied_messages is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS applied_no_update BEFORE UPDATE ON applied_messages
+BEGIN SELECT RAISE(ABORT, 'applied_messages is append-only'); END;
 """
 
 _ALIAS_ESTABLISHED = "established"
@@ -192,6 +233,7 @@ def _authorizer(action_code: int, arg1, arg2, *_args):
         "loop_events",
         "raw_messages",
         "mrn_alias_events",
+        "applied_messages",
     ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
@@ -297,6 +339,90 @@ class LoopStore:
 
     def raw_count(self) -> int:
         return self._read("SELECT COUNT(*) FROM raw_messages")[0][0]
+
+    def raw_payloads(self) -> list[str]:
+        """Every archived message, in receipt order.
+
+        Spec section 7 evaluates a rule-pack revision by replaying the archive
+        and measuring the delta, so the archive has to be readable as a stream
+        of messages rather than only countable. Ordered by received_at then
+        control_id so a replay is deterministic across runs even when two
+        messages share a timestamp.
+        """
+        return [
+            r["payload"]
+            for r in self._read(
+                "SELECT payload FROM raw_messages ORDER BY received_at, control_id"
+            )
+        ]
+
+    # ---------------------------------------------------------- applied messages
+
+    def control_id_applied(self, control_id: str) -> bool:
+        """Has this MSH-10 already been acted on (not merely archived)?"""
+        if not control_id:
+            return False
+        return bool(
+            self._read("SELECT 1 FROM applied_messages WHERE control_id = ?", (control_id,))
+        )
+
+    def content_key_owner(self, content_key: str) -> str | None:
+        """The control id that already applied this content, if any."""
+        if not content_key:
+            return None
+        rows = self._read(
+            "SELECT control_id FROM applied_messages WHERE content_key = ?", (content_key,)
+        )
+        return rows[0]["control_id"] if rows else None
+
+    def record_applied(
+        self, control_id: str, content_key: str | None, message_type: str = ""
+    ) -> bool:
+        """Mark a message applied. False if this control id or content was already.
+
+        Written *after* the transition it describes, deliberately. Claiming the
+        key first would give at-most-once delivery: a crash between the claim
+        and the write leaves a message permanently marked applied that produced
+        no transition, and the result is silently gone. Writing afterwards gives
+        at-least-once -- a crash in the same window costs a duplicate transition
+        on redelivery, which is visible in the event log and correctable. A
+        swallowed result is neither.
+        """
+        if not control_id:
+            raise StoreUnavailableError(
+                "Refusing to mark a message applied with no control id (MSH-10): "
+                "idempotency cannot be guaranteed without it"
+            )
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO applied_messages (control_id, content_key, message_type, "
+                    "applied_at) VALUES (?, ?, ?, ?)",
+                    (control_id, content_key or None, message_type,
+                     datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                # Either this control id or this content key is already on file.
+                # Both mean "somebody else got here first", which is the whole
+                # point of the constraint -- including when the somebody else is
+                # a second process this lock does not cover.
+                conn.rollback()
+                logger.info(
+                    "Message %s was already marked applied (content key present: %s)",
+                    control_id, content_key is not None,
+                )
+                return False
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise StoreUnavailableError(f"Applied-message write failed: {exc}") from exc
+            finally:
+                conn.close()
+
+    def applied_count(self) -> int:
+        return self._read("SELECT COUNT(*) FROM applied_messages")[0][0]
 
     def append_event(self, event: LoopEvent) -> None:
         """Append an event and refresh its projection in ONE transaction.
@@ -832,6 +958,23 @@ class LoopStore:
         _materialize writes the projection's mrn from that same replay.
         """
         return self._loops_where("mrn = ?", (mrn,))
+
+    def loops_in_states(self, states) -> list[Loop]:
+        """Loops in any of the given states, read through idx_loops_state.
+
+        The matcher owns which states may receive a result; this only answers
+        the query. Ingest needs that set rather than open_loops(), because an
+        ACKNOWLEDGED loop must remain a candidate at the exact-identifier tiers
+        or safety rule 2 never fires on live traffic -- a correction would land
+        in the orphan queue while the loop it corrects went on reporting
+        "handled". all_loops() would answer it too, by replaying every event in
+        the file and discarding all but the still-open work.
+        """
+        values = tuple(getattr(s, "value", s) for s in states)
+        if not values:
+            return []
+        placeholders = ", ".join("?" * len(values))
+        return self._loops_where(f"state IN ({placeholders})", values)
 
     def all_loops(self) -> list[Loop]:
         return self._loops_where("1 = 1", ())
