@@ -55,7 +55,36 @@ Consequences: the matcher must resolve fields **through the pack**, not via Task
 
 ---
 
-## OPEN SPEC QUESTION — MRN aliasing after a merge (raised by Task 7, decide before Task 10)
+## NEW REQUIREMENT — content-key idempotency (spec §6, test 15). Affects Tasks 5, 10, 12.
+
+**The design manufactures the duplicates it must reject, and this is the mechanism.** §6 requires `AE` whenever a message cannot be stored, precisely so the interface engine queues and retries. A number of engines stamp a **fresh control ID on retry**. The same result then arrives with a new `MSH-10`, sails past the duplicate check, and produces a second `resulted` transition or a second orphan. Backpressure — the thing protecting against loss — becomes a source of double-counting.
+
+`MSH-10` dedup alone is therefore insufficient. Every message also carries a **content key**: a hash over the identifying tuple — filler order number / accession, placer order number, MRN, and the `OBX` set (identifier, value, `OBX-11`). A message whose content key is already present is a no-op, logged.
+
+**Counted separately from `MSH-10` duplicates, because they mean different things.** An `MSH-10` duplicate is ordinary engine chatter. A content duplicate under a *new* control ID indicates a retry configuration — an operational fact worth surfacing rather than absorbing silently.
+
+**A genuine amendment is not swallowed.** `OBX-11 = C` with a different `OBX` value produces a different content key, so it correctly reopens under safety rule 2 instead of being discarded as a duplicate. This is the property that makes content-key dedup safe to add at all, and it needs a test of its own — dedup that eats corrections would be far worse than the double-counting it fixes.
+
+Work: `store.py` gains a content-key column and a second dedup path with its own counter; the listener computes the key after parsing; Task 12 gains test 15. The content key must be computed from **resolved** values (post-alias), or the same result under a retired and a surviving MRN would hash differently.
+
+---
+
+## RESOLVED 2026-07-26 — persistent MRN alias table
+
+**Decision: build it.** Four sub-decisions taken with it:
+
+- **No expiry.** An alias records a fact the hospital asserted — these are one patient — and that does not decay. The mistyped-`A40` risk is handled by correctability instead: a later `A40` supersedes an earlier one, latest-wins, both stay in the log. An expiring alias is strictly worse, because it silently resumes stranding loops at an arbitrary future moment with no event to explain why.
+- **Aliases chain.** A→B then B→C resolves A→C, or the second hop strands everything the first moved.
+- **Cycles terminate.** A→B→A is a real registration outcome: detect, stop, log, return where you stopped, and cap chain depth so a pathological chain cannot hang the interface.
+- **Resolution at write time, covering matching as well as creation.** `open_loop` resolves before storing, so loops always carry the current identifier and every existing query keeps working. A result arriving on a retired MRN has the same problem as an order, so the matcher resolves too.
+
+Stored in an append-only `mrn_alias_events` table under the same `BEFORE DELETE`/`BEFORE UPDATE` triggers as `loop_events` — an alias silently edited is a patient's loops silently redirected. `open_loop` records the pre-resolution value as `submitted_mrn`, so an auditor asking why a loop sits on a patient the message did not name has an answer in the log.
+
+The original problem statement follows, for the record.
+
+---
+
+## The gap this closed (raised by Task 7)
 
 `ADT^A40` moves the loops that exist **when it is applied**. Interface engines keep emitting the prior MRN for some time afterwards — the registration merge and the downstream feeds do not cut over atomically. Nothing currently redirects those later messages, so a loop opened by an `ORM` carrying the retired MRN lands on an identifier no coordinator will search.
 
