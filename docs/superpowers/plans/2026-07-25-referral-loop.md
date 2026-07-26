@@ -55,6 +55,20 @@ Consequences: the matcher must resolve fields **through the pack**, not via Task
 
 ---
 
+## ACCEPTED RESIDUAL — `CR FS CR` in a message body defeats the stream reader (Task 10)
+
+`mllp.frame` refuses to emit a body containing `FS`, and `deframe` refuses one on the way in. Neither helps a **stream** reader, which must decide where a frame ends from the bytes on the wire.
+
+A body embedding `CR FS CR` splits into two. The truncated first half then *ends with `CR`*, so the termination check passes it, and with the remainder not yet delivered nothing else can fire. Measured: `acks=['AA','AR'], loops:1` — the half was applied and acknowledged.
+
+This is **not fixable in a stream reader**. At the instant a frame completes, a truncated half followed by a remainder is byte-for-byte indistinguishable from a whole message followed by another one.
+
+Mitigations in place: a multi-MSH guard, and retroactive flagging of the half **by control id** once the stream proves desynchronised. Neither is a fix — the `AA` has already gone back to the engine. False-alarm flags are possible, since a good message followed by an unrelated malformed one looks the same.
+
+**This is the only known path by which a truncated clinical message is answered `AA`.** It requires a sender emitting `FS` inside a body, which is malformed HL7 — but "the sender is malformed" is exactly the argument this codebase rejects elsewhere for denylists. Worth a spec decision on whether v1 ships with it, and worth naming in the security review rather than discovered there.
+
+---
+
 ## NEW REQUIREMENT — content-key idempotency (spec §6, test 15). Affects Tasks 5, 10, 12.
 
 **The design manufactures the duplicates it must reject, and this is the mechanism.** §6 requires `AE` whenever a message cannot be stored, precisely so the interface engine queues and retries. A number of engines stamp a **fresh control ID on retry**. The same result then arrives with a new `MSH-10`, sails past the duplicate check, and produces a second `resulted` transition or a second orphan. Backpressure — the thing protecting against loss — becomes a source of double-counting.
