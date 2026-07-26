@@ -38,6 +38,20 @@ class LoopNotFoundError(ReferralLoopError):
     """
 
 
+class ReservedStateError(ReferralLoopError):
+    """An attempt to enter a state reserved for a later version.
+
+    v1 stops at ACKNOWLEDGED -- a coordinator confirming that this result belongs
+    to this loop, a clerical claim they can support. CLOSED asserts that a
+    clinically responsible actor dispositioned the finding, which nothing in v1
+    observes, so it is reserved and asserted unreachable (spec section 4, test 5).
+
+    Typed rather than asserted: an assertion vanishes under python -O, and this
+    has to hold in production. Distinct from StoreUnavailableError because it must
+    never be retried -- the message is not going to become acceptable later.
+    """
+
+
 class StaleMessageError(ReferralLoopError):
     """A message clinically older than one already applied to the loop.
 

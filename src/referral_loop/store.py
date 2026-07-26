@@ -28,13 +28,16 @@ file is tamper-proof:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .errors import LoopNotFoundError, StoreUnavailableError
+from .errors import LoopNotFoundError, ReservedStateError, StoreUnavailableError
 from .events import Loop, LoopEvent, LoopState
+
+logger = logging.getLogger(__name__)
 
 # States that mean "still waiting on a result". Derived from LoopState rather
 # than written out as SQL string literals, so renaming a state cannot leave a
@@ -99,11 +102,26 @@ _EVENT_STATE = {
     "created": LoopState.OPEN,
     "scheduled": LoopState.SCHEDULED,
     "resulted": LoopState.RESULTED,
-    "closed": LoopState.CLOSED,
+    "acknowledged": LoopState.ACKNOWLEDGED,
     "cancelled": LoopState.CANCELLED,
     "orphaned": LoopState.ORPHAN,
     "reopened": LoopState.RESULTED,
+    "reversed": LoopState.RESULTED,   # a coordinator undoing their own ack
+    "dismissed": LoopState.DISMISSED,
 }
+
+# No event type maps to LoopState.CLOSED, and that is the whole of the v1
+# guarantee: state comes only from replaying this mapping, so a state absent
+# from its values cannot be reached by any message, coordinator action or
+# replay path. Asserted by test_no_event_type_maps_to_closed and swept for by
+# spec test 5, not by a bare `assert` here -- an assert vanishes under python -O,
+# and a mutation of this table has to fail a test rather than an import.
+
+# Event types that would enter a state reserved for v2. Refused by name so the
+# failure is legible: "closed" is what code written before the ACKNOWLEDGED /
+# CLOSED split emits, and a generic unknown-event-type error would send its
+# author looking for a typo rather than reading spec section 4.
+_RESERVED_V2_EVENTS = {"closed"}
 
 
 def _authorizer(action_code: int, arg1, arg2, *_args):
@@ -232,6 +250,21 @@ class LoopStore:
         exact failure this product exists to prevent. Same connection, one
         commit: they land together or not at all.
         """
+        if event.event_type in _RESERVED_V2_EVENTS:
+            # Failure matrix: attempted transition to CLOSED is refused and
+            # logged. This is the choke point every event passes through, from
+            # the registry or from anywhere else, so guarding here covers paths
+            # no future caller has written yet.
+            logger.error(
+                "Refused reserved event_type %r for loop %s: CLOSED is v1-unreachable",
+                event.event_type, event.loop_id,
+            )
+            raise ReservedStateError(
+                f"Event type {event.event_type!r} would enter a state reserved for v2. "
+                "v1 stops at ACKNOWLEDGED, which claims a coordinator matched the result "
+                "to the loop; CLOSED claims a clinically responsible actor dispositioned "
+                "the finding, and nothing in v1 observes that. Use 'acknowledged'."
+            )
         if event.event_type not in _EVENT_STATE and event.event_type not in _NON_TRANSITIONAL:
             # Validate before the insert, not after. replay() also rejects
             # unknown types, but by then the event is committed and the log is
@@ -320,6 +353,14 @@ class LoopStore:
             attrs.update(event.detail)
             if event.event_type in _NON_TRANSITIONAL:
                 continue
+            if event.event_type in _RESERVED_V2_EVENTS:
+                # A restored or foreign-written log. Refusing to replay is the
+                # point: silently mapping it to ACKNOWLEDGED would let a v2 claim
+                # in the log be read back as v1's weaker one.
+                raise ReservedStateError(
+                    f"Loop {loop_id} holds a reserved event_type {event.event_type!r}; "
+                    "CLOSED is not reachable in v1 and this log cannot be replayed"
+                )
             if event.event_type not in _EVENT_STATE:
                 raise StoreUnavailableError(
                     f"Unknown event_type {event.event_type!r} in loop {loop_id}; "

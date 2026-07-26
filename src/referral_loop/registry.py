@@ -1,21 +1,34 @@
 """The loop state machine.
 
-A loop is an expectation that a result returns. Two transitions here are
-clinical safety decisions rather than engineering choices, and both are
+A loop is an expectation that a result returns. Three transitions here are
+clinical safety decisions rather than engineering choices, and all three are
 enforced structurally rather than by convention:
 
-  1. A preliminary read (OBX-11 = P) may reach RESULTED but never CLOSED.
-  2. A corrected read (OBX-11 = C) returns a CLOSED loop to RESULTED.
+  1. A preliminary read (OBX-11 = P) may reach RESULTED but never ACKNOWLEDGED.
+  2. A corrected read (OBX-11 = C) returns an ACKNOWLEDGED loop to RESULTED.
+  4. A coordinator may reverse their own acknowledgement.
+
+ACKNOWLEDGED is v1's terminal state; CLOSED is reserved for v2 and unreachable.
+The two are different claims (spec section 4). A coordinator can support "this
+result belongs to this order"; only a clinically responsible actor can support
+"this finding has been dispositioned", and nothing in v1 observes that. So
+acknowledge() yields ACKNOWLEDGED and no path here reaches CLOSED -- the store
+refuses the event type outright, and test 5 sweeps the state space to prove it.
 
 Rule 1 is written as an allowlist, not as "not P". Only an explicitly final or
-corrected read opens the door to CLOSED, so an absent, unrecognised or
-future-dialect OBX-11 fails closed instead of closing the loop by default.
+corrected read may be acknowledged, so an absent, unrecognised or future-dialect
+OBX-11 fails safe instead of resolving the loop by default.
 
-Rule 2 is generalised: *any* result arriving on a CLOSED loop reopens it and
-clears the acknowledgement. A resent final that only moved CLOSED -> RESULTED
-while leaving ack_at set would sit in neither open_loops() nor
+Rule 2 is generalised: *any* result arriving on an ACKNOWLEDGED loop reopens it
+and clears the acknowledgement. A resent final that only moved ACKNOWLEDGED ->
+RESULTED while leaving ack_at set would sit in neither open_loops() nor
 resulted_unacknowledged() -- a loop on no worklist at all, which is the failure
 this product exists to prevent.
+
+Rule 4 exists because rule 2 only recovers the machine's error. A coordinator
+who acknowledged the wrong loop had no way back: that loop stayed resolved while
+the real one stayed open. reverse_acknowledgement appends, never mutates, so the
+mistake and its correction both remain in the history.
 
 Ordering. store.replay() orders events by arrival (event_id), because every
 event was validated here at the moment it was applied, so arrival order is the
@@ -37,19 +50,26 @@ PRELIMINARY = "P"
 FINAL = "F"
 CORRECTED = "C"
 
-# States a loop may be closed from.
-_CLOSEABLE_FROM = frozenset({LoopState.RESULTED})
+# States a loop may be acknowledged from.
+_ACKNOWLEDGEABLE_FROM = frozenset({LoopState.RESULTED})
 
-# OBX-11 values that may open the door to CLOSED. An allowlist: rule 1 must not
-# be expressible as "anything that is not a preliminary", because that closes on
-# every value we failed to anticipate.
-_CLOSEABLE_STATUSES = frozenset({FINAL, CORRECTED})
+# OBX-11 values a coordinator may acknowledge. An allowlist: rule 1 must not be
+# expressible as "anything that is not a preliminary", because that resolves the
+# loop on every value we failed to anticipate.
+_ACKNOWLEDGEABLE_STATUSES = frozenset({FINAL, CORRECTED})
 
 # Only these event types carry a result. A merged_in event (Task 7) copies
 # fields off another loop, and an orphaned event carries caller-supplied detail;
 # if either could set the result status, a merge or an orphan would flip a
-# preliminary to final with no result ever arriving.
+# preliminary to final with no result ever arriving. "reversed" is excluded
+# deliberately: undoing an acknowledgement changes who vouched for the match, not
+# what the radiologist read.
 _RESULT_EVENTS = frozenset({"resulted", "reopened"})
+
+# Terminal or otherwise result-proof states. A result recorded against any of
+# these would leave the loop on no worklist, or retire it by a route no
+# coordinator chose.
+_NO_RESULT_FROM = frozenset({LoopState.ORPHAN, LoopState.DISMISSED})
 
 # Scheduling and cancellation describe where an order sits in the workflow, so
 # they are only meaningful while the loop is still waiting on a result.
@@ -86,8 +106,8 @@ class Registry:
         # Every rule here is check-then-append, and the check is worthless if
         # another thread appends between the two. Concretely: a correction and
         # an acknowledgement racing each other both pass their checks, the
-        # acknowledgement lands second, and the loop is CLOSED on a superseded
-        # read -- safety rule 2 defeated with no error raised anywhere.
+        # acknowledgement lands second, and the loop is resolved on a
+        # superseded read -- rule 2 defeated with no error raised anywhere.
         # socketserver hands each connection to the handler, and an interface
         # engine routinely holds several. Scope: one process. Two processes on
         # one database file are not serialized by this, and the store's own note
@@ -209,14 +229,15 @@ class Registry:
                     f"Result arrived for CANCELLED loop {loop_id}; route to orphan queue and flag"
                 )
 
-            if loop.state is LoopState.ORPHAN:
-                # Otherwise ORPHAN -> RESULTED -> CLOSED retires a result nobody
-                # ordered through the ordinary worklist, and it leaves the orphan
-                # queue the gap flywheel counts without any coordinator ever
-                # attaching it. An orphan is retired by attach_orphan (Task 15).
+            if loop.state in _NO_RESULT_FROM:
+                # ORPHAN -> RESULTED -> ACKNOWLEDGED would retire a result nobody
+                # ordered through the ordinary worklist, leaving the orphan queue
+                # the gap flywheel counts without any coordinator attaching it.
+                # An orphan is retired by attach_orphan (Task 15) or dismissed
+                # explicitly. DISMISSED is terminal and stays terminal.
                 raise ReferralLoopError(
-                    f"Loop {loop_id} is an orphan; results are not recorded against orphans. "
-                    "Attach it to a real loop instead."
+                    f"Loop {loop_id} is in state {loop.state}; results are not recorded "
+                    "against orphaned or dismissed records. Attach it to a real loop instead."
                 )
 
             if obx11 not in (PRELIMINARY, FINAL, CORRECTED):
@@ -225,10 +246,10 @@ class Registry:
             self._refuse_if_stale(loop_id, message_at, f"result {obx11!r}")
 
             # Rule 2, generalised. A correction always reopens review; so does
-            # any result landing on a loop somebody has already closed, because
-            # the acknowledgement was made against a read this message
+            # any result landing on a loop somebody has already acknowledged,
+            # because that acknowledgement was made against a read this message
             # supersedes.
-            if obx11 == CORRECTED or loop.state is LoopState.CLOSED:
+            if obx11 == CORRECTED or loop.state is LoopState.ACKNOWLEDGED:
                 detail = self._stamp({"obx11": obx11, **_CLEARED_ACK}, message_at)
                 self.store.append_event(LoopEvent(loop_id, "reopened", _now(), control_id, detail))
                 return
@@ -240,13 +261,16 @@ class Registry:
             )
 
     def acknowledge(self, loop_id: str, actor: str, role: str, control_id: str) -> None:
-        """Close the loop. Refuses on a preliminary read -- spec section 4 rule 1.
+        """Acknowledge the match: this result belongs to this loop. Rule 1.
 
-        `role` is recorded because if the acknowledging party is not clinically
-        responsible then CLOSED means 'someone looked at it', and the worklist
-        must not claim more than that. See open question 2. The status actually
-        acknowledged is recorded alongside, so the audit answers "what did they
-        look at" as well as "who looked".
+        Yields ACKNOWLEDGED, v1's terminal state -- never CLOSED. The claim is
+        clerical: a coordinator confirming identifiers, which is what the §7
+        matching metrics measure. It does not assert that anyone clinically
+        competent read the finding, and the worklist must not say otherwise.
+
+        `role` is recorded so that question stays answerable rather than assumed,
+        and `ack_result_status` records what was actually looked at, so the audit
+        answers "what did they see" as well as "who looked".
 
         No message_at: this is a human action, not a message, and it must not
         advance the clinical watermark. If it did, an acknowledgement made today
@@ -255,31 +279,120 @@ class Registry:
         """
         if not actor or not role:
             raise ReferralLoopError(
-                "An acknowledgement needs a named actor and role; CLOSED attributed to "
-                "nobody cannot answer who closed the loop or whether they were responsible"
+                "An acknowledgement needs a named actor and role; a resolution attributed "
+                "to nobody cannot answer who vouched for the match or on what authority"
             )
 
         with self._lock:
             loop = self.get(loop_id)
-            if loop.state not in _CLOSEABLE_FROM:
-                raise ReferralLoopError(f"Cannot close a loop in state {loop.state}")
+            if loop.state not in _ACKNOWLEDGEABLE_FROM:
+                raise ReferralLoopError(f"Cannot acknowledge a loop in state {loop.state}")
 
             status = self._latest_result_status(loop_id)
-            if status not in _CLOSEABLE_STATUSES:
+            if status not in _ACKNOWLEDGEABLE_STATUSES:
                 raise ReferralLoopError(
                     f"Loop {loop_id} has no final or corrected result (latest OBX-11 {status!r}); "
-                    "CLOSED is unreachable"
+                    "ACKNOWLEDGED is unreachable"
                 )
 
             at = _now()
             self.store.append_event(
                 LoopEvent(
-                    loop_id, "closed", at, control_id,
+                    loop_id, "acknowledged", at, control_id,
                     {
                         "ack_by": actor,
                         "ack_role": role,
                         "ack_at": at.isoformat(),
                         "ack_result_status": status,
+                    },
+                )
+            )
+
+    def reverse_acknowledgement(
+        self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> None:
+        """Rule 4: a coordinator undoes their own acknowledgement.
+
+        Rule 2 recovers the machine's error -- a result that later corrects.
+        Nothing recovered the human's: a coordinator who acknowledged the wrong
+        loop had no way back, so that loop stayed resolved while the real one
+        stayed open and unwatched. This returns it to RESULTED and to the
+        worklist.
+
+        Appends, never mutates: the mistake and its correction both stay in the
+        history, which is the whole reason the log is append-only. The reversing
+        actor is recorded under its own keys so the acknowledgement it undoes
+        remains legible in the event log rather than being overwritten.
+
+        `reason` is required. Task 15: every reversal is a labeled false positive
+        for the flywheel -- a human telling you the matcher was wrong on real site
+        data, which is the most valuable label the system produces -- and an
+        unexplained label teaches nothing.
+        """
+        if not actor or not role or not reason:
+            raise ReferralLoopError(
+                "A reversal needs a named actor, role and reason: it is both an audit "
+                "record of undoing someone's resolution and a labeled false positive"
+            )
+
+        with self._lock:
+            loop = self.get(loop_id)
+            if loop.state is not LoopState.ACKNOWLEDGED:
+                raise ReferralLoopError(
+                    f"Cannot reverse an acknowledgement on a loop in state {loop.state}"
+                )
+
+            at = _now()
+            self.store.append_event(
+                LoopEvent(
+                    loop_id, "reversed", at, control_id,
+                    {
+                        # Clearing these is what returns the loop to
+                        # resulted_unacknowledged() and therefore to a human.
+                        **_CLEARED_ACK,
+                        "reversed_by": actor,
+                        "reversed_role": role,
+                        "reversed_reason": reason,
+                        "reversed_at": at.isoformat(),
+                    },
+                )
+            )
+
+    def dismiss_orphan(
+        self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> None:
+        """Terminal state for an orphan that belongs to no loop here.
+
+        Some results are misrouted from another facility, or arrive from a feed
+        misconfiguration. Without a terminal state the orphan queue only grows,
+        and a queue that only grows is one coordinators stop opening -- silently
+        disabling the surface both the safety story and the flywheel depend on.
+
+        Never automatic: nothing in this module calls it, and no message reaches
+        it. A human decides an orphan is unattachable, and says why.
+        """
+        if not actor or not role or not reason:
+            raise ReferralLoopError(
+                "A dismissal needs a named actor, role and reason; it retires a result "
+                "permanently and 'someone dismissed it' is not an answer to why"
+            )
+
+        with self._lock:
+            loop = self.get(loop_id)
+            if loop.state is not LoopState.ORPHAN:
+                raise ReferralLoopError(
+                    f"Only an orphan can be dismissed; loop {loop_id} is in state {loop.state}"
+                )
+
+            at = _now()
+            self.store.append_event(
+                LoopEvent(
+                    loop_id, "dismissed", at, control_id,
+                    {
+                        "dismissed_by": actor,
+                        "dismissed_role": role,
+                        "dismissed_reason": reason,
+                        "dismissed_at": at.isoformat(),
                     },
                 )
             )
@@ -341,7 +454,7 @@ class Registry:
         already keeps arrival order equal to clinical order for anything this
         registry appends, so this ordering only matters for a log written by
         something else -- a restore, a foreign writer, a future code path. That
-        is exactly when getting it wrong would let CLOSED be reached on a
+        is exactly when getting it wrong would let a loop be acknowledged on a
         superseded read, so it is defended here rather than assumed away.
         """
         best_key = None

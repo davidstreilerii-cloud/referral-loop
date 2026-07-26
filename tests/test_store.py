@@ -64,9 +64,9 @@ def test_events_are_append_only(tmp_path):
         "DELETE FROM loop_events",
         "DELETE FROM loop_events WHERE loop_id = 'L1'",
         "UPDATE loop_events SET detail = '{\"ack_by\": \"forged\"}'",
-        "UPDATE loop_events SET event_type = 'closed' WHERE loop_id = 'L1'",
+        "UPDATE loop_events SET event_type = 'acknowledged' WHERE loop_id = 'L1'",
         "UPDATE loop_events SET loop_id = 'L2' FROM loops WHERE loops.loop_id = 'L1'",
-        "REPLACE INTO loop_events VALUES (1, 'L1', 'closed', 'x', 'C1', '{}')",
+        "REPLACE INTO loop_events VALUES (1, 'L1', 'acknowledged', 'x', 'C1', '{}')",
     ],
 )
 def test_loop_events_rejects_every_mutation_from_a_foreign_connection(tmp_path, sql):
@@ -216,7 +216,7 @@ def test_a_reopened_loop_is_visible_to_someone(tmp_path):
     store = LoopStore(tmp_path / "loops.db")
     store.append_event(LoopEvent("L1", "created", NOW, "C1", {"mrn": "MRN1"}))
     store.append_event(LoopEvent("L1", "resulted", NOW, "C2", {"obx11": "F"}))
-    store.append_event(LoopEvent("L1", "closed", NOW, "C3",
+    store.append_event(LoopEvent("L1", "acknowledged", NOW, "C3",
                                  {"ack_by": "coord1", "ack_at": NOW.isoformat()}))
     assert store.resulted_unacknowledged() == []
 
@@ -237,7 +237,7 @@ def test_an_event_can_clear_a_field(tmp_path):
     acknowledgement, and the event log is the only way state changes."""
     store = LoopStore(tmp_path / "loops.db")
     store.append_event(LoopEvent("L1", "created", NOW, "C1", {"mrn": "MRN1"}))
-    store.append_event(LoopEvent("L1", "closed", NOW, "C2",
+    store.append_event(LoopEvent("L1", "acknowledged", NOW, "C2",
                                  {"ack_by": "coord1", "ack_role": "coordinator",
                                   "ack_at": NOW.isoformat()}))
     assert store.replay("L1").ack_by == "coord1"
