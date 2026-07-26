@@ -17,6 +17,38 @@ one metric it did not move.
 Nothing closes in v1 — `CLOSED` is v2 — so a metric named for closure described
 something the system does not do. Same definition, same veto.*
 
+## Baseline measurement for 1.1.0 — 2026-07-26
+
+No pack change. The eval harness the gate depends on now exists, so 1.1.0's
+numbers against the shipped synthetic corpus are recorded here — every later
+revision is measured against these, and a revision with no delta to show against
+them does not ship.
+
+Reproduce with `referral-loop eval --pack-dir healthcare_rag/referral_loop/rules
+--synthetic-only`:
+
+```
+  cases                13   matchable 6
+  false-match rate 0.0000   (0)
+  precision        1.0000   (5/5)
+  recall           0.8333   (5/6)
+  auto-match rate  0.8333   (pack floor 0.5000)
+  orphan rate      0.6154   (8)
+  dismissal rate   0.0000   (no site labels)
+```
+
+Criterion 4 is met: false-match rate zero **and** auto-match rate above the
+pack's minimum. The one matchable case 1.1.0 does not resolve is the tier-4
+modality-equivalence pair, declined because tier 4's confidence (0.70) sits below
+the floor (0.90). That is deliberate headroom, not a defect — a corpus every pack
+already satisfies leaves condition 3 unsatisfiable and the gate becomes a
+formality.
+
+The dismissal rate is site-derived and reads 0.0000 here only because the shipped
+corpus carries no coordinator labels. Within one gate run it is identical on both
+sides of a comparison and cannot on its own justify a release; it moves between
+releases, not during one.
+
 ## 1.1.0 — 2026-07-26
 
 Added `field_map` and `min_auto_match_rate`.

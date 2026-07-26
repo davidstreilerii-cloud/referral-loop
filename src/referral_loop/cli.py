@@ -56,6 +56,7 @@ from typing import NamedTuple
 
 from healthcare_rag.encryption_check import verify_encryption_at_rest
 
+from . import eval as eval_harness
 from .errors import PackVerificationError, ReferralLoopError, StoreUnavailableError
 from .listener import FileDropSource, MessageHandler
 from .mllp_server import make_mllp_server
@@ -77,7 +78,12 @@ PUBKEY_ENV = "REFERRAL_PACK_PUBKEY"
 # an operator as a traceback.
 _ED25519_PUBLIC_KEY_BYTES = 32
 
-MODES = ("listen", "filedrop", "worklist", "purge")
+MODES = ("listen", "filedrop", "worklist", "eval", "purge")
+
+# `eval` exit codes. Distinct from _refuse's 2, because "this pack must not ship"
+# and "this process could not start" send an operator to different places.
+EVAL_ALLOWED = 0
+EVAL_BLOCKED = 1
 
 
 class BootedStack(NamedTuple):
@@ -206,6 +212,57 @@ def _run_filedrop(stack: BootedStack, drop_dir: Path | str) -> int:
     return 0
 
 
+def _run_eval(stack: BootedStack, args, public_key_hex: str) -> int:
+    """Replay the labeled corpus through the booted pack and apply the gate.
+
+    This is the operator's half of spec section 7: a pack revision is justified
+    by replay evidence or it does not ship. Without a command an operator can
+    actually run, "rules as signed data" is a claim nobody at the site can check.
+
+    Two answers, and they are deliberately different exit codes. **2** is a
+    refusal -- the candidate does not clear criterion 4's absolute floor, which is
+    true of it alone and needs no baseline. **1** is the release gate blocking a
+    comparison against a named baseline. **0** means it may ship.
+
+    The candidate is evaluated on its own *first*. A pack that attaches nothing
+    would otherwise reach the comparison and could pass it whenever the baseline
+    also attached nothing, and the two of them would ship each other.
+
+    Nothing this prints can carry an identifier: every line comes from
+    `format_report`, which reads only floats and ints off `EvalResult`, or from a
+    gate reason built from the same. The corpus itself holds PHI when it was
+    reconstructed from the site archive, and never leaves this process.
+    """
+    cases = eval_harness.synthetic_corpus()
+    if not args.synthetic_only:
+        cases = cases + eval_harness.corpus_from_site(stack.store)
+    labels = stack.store.labels()
+
+    print(f"{PROG}: corpus of {len(cases)} labeled case(s); "
+          f"{sum(1 for c in cases if c.source == 'site')} reconstructed from site labels")
+
+    candidate = eval_harness.replay(cases, stack.pack, labels=labels)
+    print(eval_harness.format_report(candidate, title="candidate"))
+
+    meets, why = eval_harness.check_release_criteria(candidate, stack.pack)
+    print(f"{PROG}: {why}")
+    if not meets:
+        return 2
+
+    if not args.baseline_pack_dir:
+        print(f"{PROG}: no --baseline-pack-dir given, so the release gate was not applied. "
+              "A pack ships on a measured delta against the pack it replaces.")
+        return EVAL_ALLOWED
+
+    baseline_pack = load_pack(Path(args.baseline_pack_dir), _public_key(public_key_hex))
+    baseline = eval_harness.replay(cases, baseline_pack, labels=labels)
+    print(eval_harness.format_report(baseline, title="baseline"))
+
+    allowed, reason = eval_harness.gate_pack_release(baseline, candidate, pack=stack.pack)
+    print(f"{PROG}: {reason}")
+    return EVAL_ALLOWED if allowed else EVAL_BLOCKED
+
+
 def _run_worklist(stack: BootedStack, host: str, port: int) -> int:
     """Serve the coordinator worklist. Loopback by refusal, not by convention.
 
@@ -275,9 +332,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "mode", choices=list(MODES),
-        help="listen: MLLP server. filedrop: drain a watched directory once (also the "
-             "replay path for pack evaluation). worklist: coordinator queue on "
-             "localhost. purge: reserved for v1+1, refuses.",
+        help="listen: MLLP server. filedrop: drain a watched directory once. "
+             "worklist: coordinator queue on localhost. eval: replay the labeled "
+             "corpus through --pack-dir and apply the release gate against "
+             "--baseline-pack-dir. purge: reserved for v1+1, refuses.",
     )
     parser.add_argument("--db", default="data/referral_loops.db",
                         help="SQLite file on an encrypted volume (default: %(default)s)")
@@ -294,6 +352,15 @@ def _build_parser() -> argparse.ArgumentParser:
                              "page has no authentication (default: %(default)s)")
     parser.add_argument("--worklist-port", type=int, default=5055,
                         help="worklist mode: port (default: %(default)s)")
+    parser.add_argument("--baseline-pack-dir", default="",
+                        help="eval mode: the pack --pack-dir is measured against. Omitted, "
+                             "the candidate is only checked against the absolute floor "
+                             "(spec section 10.4 criterion 4) and no gate is applied")
+    parser.add_argument("--synthetic-only", action="store_true",
+                        help="eval mode: skip the cases reconstructed from this site's own "
+                             "coordinator labels. The site corpus is the valuable half -- it "
+                             "is real interface quirks from real traffic -- so this is for "
+                             "reproducing the shipped baseline, not for a release decision")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="default: %(default)s")
@@ -349,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_listen(stack, args.host, args.port)
         if args.mode == "filedrop":
             return _run_filedrop(stack, args.drop_dir)
+        if args.mode == "eval":
+            return _run_eval(stack, args, public_key_hex)
         return _run_worklist(stack, args.worklist_host, args.worklist_port)
     except ReferralLoopError as exc:
         return _refuse(str(exc))
