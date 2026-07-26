@@ -51,7 +51,11 @@ healthcare_rag/referral_loop/
 Dockerfile.referral  installs healthcare_rag[referral]
 ```
 
-**Imported from the existing codebase, and nothing else:** `guardrails/immutable_audit.py`, `guardrails/phi_redactor.py`, `guardrails/step_up_auth.py`, `audit_trail.py`, `encryption_check.py`, `db.py`, and Flask scaffolding from `api.py`.
+**Imported from the existing codebase, and nothing else:** `guardrails/immutable_audit.py`, `guardrails/phi_redactor.py`, `guardrails/step_up_auth.py`, `encryption_check.py`, and Flask scaffolding from `api.py`.
+
+`db.py` and `audit_trail.py` are **not** imported, reversing an earlier assumption. `db.py` is hardwired to `rag_growth.db` and carries the RAG growth schema; importing it would drag an unrelated database into a build whose whole claim is a separate deployable. `audit_trail.log_access` delegates to `db.log_phi_access`, so importing it inherits that coupling, and its `AuditEvent` is shaped for an HTTP API (`endpoint`, `tokens_used`, `cost_usd`) with a free-text `query_summary` field — the same free-text channel shape that leaked through an unbounded free-text field in an earlier system. Referral audit therefore routes through `guardrails/immutable_audit.py`, which already owns its own append-only database and blocks `UPDATE`/`DELETE` at the SQLite authorizer — the property §6 requires of `loop_events` anyway.
+
+Both `GuardrailAuditEvent.detail` and `.resource_id` are free-text and must carry only allowlisted, non-identifying values (loop id, tier, pack version). Test 7 asserts this.
 
 `guardrails/tenant_isolation.py` is deliberately **not** imported. v1 is a single-site install; importing an unexercised isolation control would suggest a guarantee the build does not test. It comes in with multi-tenancy or not at all.
 
@@ -84,6 +88,10 @@ A loop is an expectation of a result returning. Created by `REF^I12` or `ORM^O01
 | `STALE` | age > per-modality threshold | The thing the product exists to surface |
 | `CANCELLED` | `SIU^S15` / order cancel | Expectation withdrawn |
 | `ORPHAN` | ORU with no match | Result nobody ordered — needs a human |
+
+**`STALE` is derived, not stored.** Writing it into the `state` column would destroy the underlying state — a stale loop is still `OPEN` or `SCHEDULED`, and it must return to plain `OPEN` the moment a result arrives without a second transition to undo. Staleness is computed from `(state ∈ {OPEN, SCHEDULED}, age, per-modality threshold)` at read time and is the worklist's primary sort. It is listed as a state above because that is how a coordinator experiences it, not because it is one.
+
+**`ORPHAN` is a stored state on a loop-shaped record whose origin is a result rather than an order.** An unmatched `ORU` has no loop by definition, so the matcher creates one in `ORPHAN` to hold it. This keeps the coordinator queue reading a single table, and attaching an orphan is then a merge into the real loop rather than a separate workflow. Every attachment is a labeled example (§7).
 
 ### Three rules that are clinical safety decisions
 
@@ -233,7 +241,7 @@ The first four are safety, not correctness.
 | Care-gap risk scoring | v2. Introduces the de-identification path, LLM dependency, and CDS regulatory question at once |
 | Writing back to the EHR | Needs interface-engine write access; a bad message pollutes the legal record |
 | Epic In Basket integration | Epic-mediated, hardest possible ingress, unnecessary given the feed |
-| Multi-tenancy | Single-site install. `tenant_isolation` is imported but not exercised in v1 |
+| Multi-tenancy | Single-site install. `tenant_isolation` is deliberately **not** imported (§3) |
 | FHIR ingress | HL7 v2 first. FHIR is the better long-term model but adds vendor approval |
 
 ---
