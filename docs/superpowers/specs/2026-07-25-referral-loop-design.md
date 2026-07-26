@@ -77,17 +77,31 @@ Operating mode is `PHI_MODE=full`. This triggers existing fail-closed behavior: 
 
 ## 4. The loop state machine
 
-A loop is an expectation of a result returning. Created by `REF^I12` or `ORM^O01`/`OMG^O19`; satisfied when a matching **final** result arrives and a coordinator acknowledges it.
+A loop is an expectation of a result returning. Created by `REF^I12` or `ORM^O01`/`OMG^O19`; **matched** when a final result arrives and a coordinator confirms it belongs to this loop. Whether the finding was then acted on clinically is a separate question, and a separate state — see below.
 
 | State | Entered by | Meaning |
 |---|---|---|
 | `OPEN` | REF/ORM received | Expectation created |
 | `SCHEDULED` | `SIU^S12` | Appointment exists |
 | `RESULTED` | matching final ORU | Result arrived, not yet reviewed |
-| `CLOSED` | coordinator acknowledges | Loop complete |
+| `ACKNOWLEDGED` | coordinator confirms the match | This result belongs to this loop. Clerical, terminal for v1 |
+| `CLOSED` | clinically responsible actor dispositions the finding | **v2 — not implemented in v1** |
 | `STALE` | age > per-modality threshold | The thing the product exists to surface |
 | `CANCELLED` | `SIU^S15` / order cancel | Expectation withdrawn |
 | `ORPHAN` | ORU with no match | Result nobody ordered — needs a human |
+| `DISMISSED` | coordinator judges an orphan unattachable | Terminal for orphans that belong to no loop here |
+
+### `ACKNOWLEDGED` and `CLOSED` are two different claims
+
+The original design had one terminal state, `CLOSED`, entered by coordinator acknowledgement. That conflates two claims of very different strength, and the weaker one was wearing the stronger one's name.
+
+A referral coordinator can reliably confirm that *this result belongs to this order*. That is identifier work, and it is what the matching metrics in §7 measure. Whether a clinician competent to act on an abnormal finding has actually read it is a different assertion, and nothing in v1 observes it.
+
+Collapsing them is the product's own failure mode, one layer up: a tool could report every loop closed while no clinician had seen a single result — precisely the "nobody followed up" scenario §1 exists to prevent, now with a dashboard asserting it did not happen.
+
+So v1 implements `ACKNOWLEDGED` and stops there. The worklist says *result matched and acknowledged*, which is exactly true and defensible to a risk officer. `CLOSED` is reserved, unimplemented, and added in v2 once a pilot site names who may clinically disposition a finding (§12 q2). Because the store is append-only, that arrives as a new event type against existing loops — no migration, and no state whose meaning quietly shifts under a name already in use.
+
+**Precision and false-match rate in §7 therefore measure acknowledgement, not clinical closure.** No metric in v1 claims a clinician saw anything.
 
 **`STALE` is derived, not stored.** Three reasons, the last decisive:
 
@@ -99,11 +113,12 @@ Staleness is therefore computed from `(state ∈ {OPEN, SCHEDULED}, age, per-mod
 
 **`ORPHAN` is a stored state on a loop-shaped record whose origin is a result rather than an order.** An unmatched `ORU` has no loop by definition, so the matcher creates one in `ORPHAN` to hold it. This keeps the coordinator queue reading a single table, and attaching an orphan is then a merge into the real loop rather than a separate workflow. Every attachment is a labeled example (§7).
 
-### Three rules that are clinical safety decisions
+### Four rules that are clinical safety decisions
 
-1. **Never close on a preliminary read.** `OBX-11 = P` advances to `RESULTED` but must not permit `CLOSED`. A radiology prelim that later corrects to a finding is precisely the malpractice scenario; auto-closing on it would make the tool the cause.
-2. **Corrected results reopen review.** `OBX-11 = C` on a `CLOSED` loop returns it to `RESULTED` and re-queues.
+1. **Never acknowledge on a preliminary read.** `OBX-11 = P` advances to `RESULTED` but must not permit `ACKNOWLEDGED`. A radiology prelim that later corrects to a finding is precisely the malpractice scenario; auto-resolving on it would make the tool the cause.
+2. **Corrected results reopen review.** `OBX-11 = C` on an `ACKNOWLEDGED` loop returns it to `RESULTED` and re-queues.
 3. **Patient merges must carry loops.** `ADT^A40` reassigns an MRN. If loops do not follow the surviving identifier they vanish from the worklist while remaining clinically open — the tool then reports all-clear on an open loop. This breaks most homegrown trackers; it is a first-class case.
+4. **A coordinator can undo their own acknowledgement.** Rule 2 recovers the machine's error — a result that later corrects. Nothing recovered the human's: a coordinator who acknowledges the wrong loop had no way back, and the loop stayed resolved while the real one stayed open. `ACKNOWLEDGED` therefore returns to `RESULTED` on an explicit reversal, recorded as a `reversed` event carrying the actor. The append-only store makes this a new event, never a mutation, so the mistake and its correction both remain in the history. Every reversal is also a labeled false positive for §7's flywheel — the most valuable label the system produces, because a human is telling you the matcher was wrong on real site data.
 
 ### Staleness is per-modality
 
@@ -115,9 +130,9 @@ A stat CT unresulted at 4 hours and a screening mammogram unresulted at 30 days 
 
 | Tier | Predicate | Confidence |
 |---|---|---|
-| 1 | `OBR-2` placer order number exact | Highest |
-| 2 | `OBR-3` filler order number / accession exact | High |
-| 3 | MRN + `OBR-4` service code + date window | Medium |
+| 1 | placer order number exact | Highest |
+| 2 | filler order number / accession exact | High |
+| 3 | MRN + service code + date window | Medium |
 | 4 | MRN + modality equivalence + date window | Low — needs tie-break |
 | 5 | none | `ORPHAN` |
 
@@ -125,7 +140,32 @@ Tie-breakers at tiers 3–4, in order: nearest order date, same ordering provide
 
 The **date window** at tiers 3–4 is pack-configured per modality, not a single global value — a same-day window is right for a stat study and wrong for a screening study ordered weeks ahead.
 
+### Which HL7 field feeds each tier is pack data, not code
+
+The tier table above names concepts, not field numbers. **The mapping from concept to segment-field lives in the rule pack**, alongside the tiers, windows, and thresholds:
+
+```json
+"field_map": {
+  "placer_order_number": ["OBR-2", "ORC-2"],
+  "filler_order_number": ["OBR-3", "ORC-3", "OBR-18", "OBR-19"],
+  "service_code":        ["OBR-4.1"],
+  "modality":            ["OBR-24", "OBR-4.2"],
+  "ordering_provider":   ["OBR-16.1"],
+  "mrn":                 ["PID-3.1"]
+}
+```
+
+Each concept lists candidate locations in priority order; the first populated one wins.
+
+This corrects an inconsistency in the original design, which made tiers, tie-breakers, windows, thresholds, and the confidence floor all pack-configured — and then hardcoded the one thing that actually varies between hospitals. Tier *logic* is stable everywhere: an exact accession match is strong evidence at every site. Field *placement* is not. Accession lands in `OBR-3` at some sites, `OBR-18`/`OBR-19` or `ORC-3` at others, depending on the RIS and how the interface engine was built a decade ago.
+
+With the mapping in code, onboarding a site whose accession sits in the wrong field needs a code change, a release, and a security review — which defeats "rules as data, code as commodity" (§2) exactly where it matters most. With it in the pack, that site is a signed pack revision evaluated by replaying its own archive.
+
+The field map is covered by the pack signature, so a mapping change is as tamper-evident as a threshold change — and it needs to be, since pointing `placer_order_number` at the wrong field would silently degrade every tier-1 match into a false positive.
+
 **Orphans are workflow, not failure.** Outside imaging arrives with no order constantly. An orphan queue where a coordinator attaches the result is real value, and every attachment is a labeled example.
+
+**But some orphans belong to no loop here at all** — misrouted from another facility, a patient this site never ordered for, a feed misconfiguration. Without a terminal state these accumulate forever, and a queue that only grows is one coordinators stop opening. That silently disables the surface both the safety story and the flywheel depend on. A coordinator may therefore mark an orphan `DISMISSED`, with a required reason recorded on the event. `DISMISSED` is terminal, is never entered automatically, and its rate is monitored: a rising dismissal rate is a feed problem to investigate upstream, not a coordinator working faster.
 
 ---
 
@@ -150,11 +190,17 @@ Interface engine --MLLP--> listener.py
 
 **Raw archive is separate from parsed state,** retained on its own schedule and replayable. Rule pack updates are evaluated by replaying the archive and measuring the delta. Without the archive a pack revision cannot be evaluated, so the archive is what makes matching quality measurable rather than asserted.
 
-**Idempotency via `MSH-10`.** Duplicate control ID is a no-op, logged, never a second transition.
+**Idempotency via `MSH-10`, plus a content key.** Duplicate control ID is a no-op, logged, never a second transition.
+
+`MSH-10` alone is not sufficient, and the gap is one this design creates for itself. §6 requires `AE` whenever a message cannot be stored, precisely so the engine queues and retries — and a number of interface engines stamp a **fresh control ID on retry**. The same result then arrives with a new `MSH-10`, passes the duplicate check, and produces a second `resulted` transition or a second orphan. The backpressure mechanism manufactures the duplicates.
+
+Each message therefore also carries a **content key**: a hash over the identifying tuple — filler order number / accession, placer order number, MRN, and the `OBX` set (identifier, value, `OBX-11`). A message whose content key is already present is a no-op, logged, and counted separately from `MSH-10` duplicates. Counted separately because the two mean different things: `MSH-10` duplicates are ordinary engine chatter, while content duplicates under new control IDs indicate a retry configuration worth knowing about.
+
+A genuine amendment carries `OBX-11 = C` and a different `OBX` value, so it produces a different content key and correctly reopens under rule 2 rather than being swallowed as a duplicate.
 
 **Storage:** one encrypted SQLite file, three tables — `raw_messages`, `loops`, `loop_events` (append-only). Any loop's state is reconstructible by replaying its events.
 
-**Retention is configured, not assumed.** Raw messages and closed loops both need a purge policy the hospital sets.
+**Retention is configured, not assumed.** Raw messages and resolved loops both need a purge policy the hospital sets. The tooling that enforces it is out of scope for v1 (§11).
 
 ---
 
@@ -162,24 +208,29 @@ Interface engine --MLLP--> listener.py
 
 ```
 rules/
-  pack.json          matching tiers, tie-breakers, modality equivalences,
-                     per-modality staleness thresholds, confidence floor
+  pack.json          field map (§5), matching tiers, tie-breakers,
+                     modality equivalences, per-modality staleness
+                     thresholds and date windows, confidence floor
   pack.sig           Ed25519 signature
   CHANGELOG.md       what changed, and the eval delta that justified it
 ```
 
-The engine verifies the signature before loading and refuses an unsigned or altered pack. This is IP protection and a safety control — a tampered pack could cause false closes.
+The engine verifies the signature before loading and refuses an unsigned or altered pack. This is IP protection and a safety control — a tampered pack could cause false matches, or point a tier at the wrong field (§5).
 
-### The metric is false-close rate, not accuracy
+### The metric is false-match rate, not accuracy
 
 | Metric | Definition | Role |
 |---|---|---|
-| Precision | of auto-closed loops, share correctly matched | Primary |
-| **False-close rate** | results attached to the wrong open loop | **Safety** |
+| Precision | of auto-matched loops, share correctly matched | Primary |
+| **False-match rate** | results attached to the wrong open loop | **Safety** |
 | Recall | of results with a correct open loop, share matched | Secondary |
+| Auto-match rate | of results with a correct open loop, share resolved without a human | Guard on the safety metric — see §10.4 |
 | Orphan rate | results with no match | Workload, not failure |
+| Dismissal rate | orphans marked `DISMISSED` | Feed health, watched for drift (§5) |
 
-A false close is strictly worse than an orphan. An orphan gets human attention. A false close attributes a result to the wrong order, marks that loop satisfied, and leaves the real loop open *while reporting it closed* — the tool conceals the thing it exists to surface.
+*Renamed from **false-close rate**, which appears in earlier commits and in code written against them. Nothing closes in v1 — `CLOSED` is v2 (§4) — so a metric named for closure described something the system does not do. Same definition, same role, accurate name.*
+
+A false match is strictly worse than an orphan. An orphan gets human attention. A false match attributes a result to the wrong order, marks that loop resolved, and leaves the real loop open *while reporting it handled* — the tool conceals the thing it exists to surface.
 
 The pack therefore carries a **confidence floor**; below it the matcher refuses to auto-match and routes to review. This is the product's equivalent of `INSUFFICIENT_REGULATORY_EVIDENCE` — decline rather than guess.
 
@@ -187,7 +238,15 @@ The pack therefore carries a **confidence floor**; below it the matcher refuses 
 
 Every orphan a coordinator attaches is a labeled example. Every auto-match they undo is a labeled false positive, and more valuable than a synthetic case because it is a real interface quirk from a real site.
 
-**Pack release gate:** a new pack ships only if, replayed against the archived corpus, false-close rate does not increase **and** precision improves. Regression on the safety metric blocks release regardless of recall.
+**Pack release gate.** Replayed against the archived corpus, a new pack ships only if:
+
+1. **False-match rate does not regress** — absolute veto, regardless of every other number.
+2. **Precision does not regress.**
+3. **At least one target metric improves** — precision, recall, auto-match rate, orphan rate, or dismissal rate.
+
+The original gate required precision to *improve*, which blocked releases it should have allowed. A pack that leaves precision untouched but halves the orphan rate is a pure coordinator-workload win with no safety cost — and under the old rule it could never ship, because the one metric it did not move was the one being gated on. Requiring *no regression* on the two safety-bearing metrics and *improvement somewhere* keeps the veto exactly as strict while letting the pack improve along any axis that matters.
+
+Regression on false-match rate blocks release regardless of recall. That asymmetry is deliberate and is the whole point: missing a match costs a coordinator a lookup, and a wrong match costs a patient a missed finding.
 
 **Eval corpus, three sources:** synthetic pairs generated from the HL7 v2 spec (ships with the repo, no PHI); de-identified data from any future pilot; site-local labels that remain on the hospital's machine and are contributed back only on opt-in. The architecture must improve locally even when nothing is contributed back.
 
@@ -201,6 +260,10 @@ Every orphan a coordinator attaches is a labeled example. Every auto-match they 
 | Unparseable segment | Skip segment, keep message, flag |
 | Unknown message type | Ignore, count, never error |
 | Duplicate `MSH-10` | No-op, logged |
+| Duplicate content key, new `MSH-10` | No-op, logged and counted **separately** from an `MSH-10` duplicate — it signals a retry configuration, not ordinary chatter (§6) |
+| Field map names a segment-field absent from the message | Fall through to the next candidate for that concept; if all are absent the tier does not fire. Never an error, never a partial match |
+| Field map names a segment outside the §3 allowlist | **Refuse to boot.** A pack must not be able to widen the parser's read surface |
+| Attempted transition to `CLOSED` | Refuse and log. Reserved for v2 (§4) |
 | DB unwritable or full | **`AE` so the engine queues.** Never ACK what cannot be stored |
 | Pack signature invalid | Refuse to boot |
 | Encryption-at-rest check fails | Refuse to boot |
@@ -212,18 +275,22 @@ Every orphan a coordinator attaches is a labeled example. Every auto-match they 
 
 ## 9. Tests
 
-The first four are safety, not correctness.
+The first six are safety, not correctness.
 
-1. **Preliminary never closes.** `CLOSED` unreachable from `OBX-11 = P`.
-2. **Corrected result reopens.** `OBX-11 = C` on `CLOSED` returns to `RESULTED`.
+1. **Preliminary never resolves.** `ACKNOWLEDGED` unreachable from `OBX-11 = P`.
+2. **Corrected result reopens.** `OBX-11 = C` on `ACKNOWLEDGED` returns to `RESULTED`.
 3. **Merge carries loops.** `ADT^A40` moves every open loop to the surviving MRN; none orphaned.
-4. **False-close gate.** Replay labeled corpus; false-close rate zero at the confidence floor. Blocks pack release.
-5. **No egress.** Block non-loopback `socket.connect`; full suite passes.
-6. **No model calls.** Monkeypatch `anthropic` and `claude_cli` to raise; full suite passes.
-7. **No PHI in artifacts.** Sentinels planted across `PID`, `NK1`, `GT1`, and note segments appear zero times in worklist HTML, logs, exports, and audit entries. Assert on what leaves the building, not on the parser.
-8. **Persist before ACK.** Kill between durable write and parse; replay reconstructs state.
-9. **Pack tamper.** Mutate one byte; assert refusal to load.
-10. **State reconstruction.** Any loop's state derivable by replaying `loop_events`.
+4. **False-match gate.** Replay labeled corpus; false-match rate zero at the confidence floor **while auto-match rate meets its configured minimum**. Blocks pack release. Both halves are required — see §10.4.
+5. **`CLOSED` is unreachable in v1.** No message, coordinator action, or replay path reaches it. Asserts the state reserved in §4 cannot be entered by accident before v2 defines who may enter it.
+6. **Acknowledgement is reversible.** A `reversed` event returns `ACKNOWLEDGED` to `RESULTED`, the actor is recorded, and no prior event is mutated.
+7. **No egress.** Block non-loopback `socket.connect`; full suite passes.
+8. **No model calls.** Monkeypatch `anthropic` and `claude_cli` to raise; full suite passes.
+9. **No PHI in artifacts.** Sentinels planted across `PID`, `NK1`, `GT1`, and note segments appear zero times in worklist HTML, logs, exports, and audit entries. Assert on what leaves the building, not on the parser.
+10. **Persist before ACK.** Kill between durable write and parse; replay reconstructs state.
+11. **Retry under a new control ID is not a second transition.** Redeliver an identical result with a fresh `MSH-10`; assert one transition, and that the content-key duplicate is counted separately from an `MSH-10` duplicate.
+12. **Pack tamper.** Mutate one byte; assert refusal to load. Includes a byte inside `field_map` — a mapping change must be as tamper-evident as a threshold change.
+13. **Field map drives matching.** Relocate the accession from `OBR-3` to `OBR-18` in both fixture and pack; assert tier 2 still matches with no code change. This is the claim that "rules as data" actually holds where sites differ.
+14. **State reconstruction.** Any loop's state derivable by replaying `loop_events`.
 
 **Fixtures are synthetic,** generated from the HL7 v2 specification. No real message enters version control regardless of claimed de-identification.
 
@@ -232,11 +299,17 @@ The first four are safety, not correctness.
 ## 10. Success criteria
 
 1. A synthetic HL7 stream runs end-to-end to a populated worklist with zero model calls and zero non-loopback connections.
-2. All four safety tests pass.
+2. All six safety tests pass.
 3. The PHI-sentinel proof passes on every downstream artifact.
-4. False-close rate is zero against the labeled corpus at the configured floor.
+4. **False-match rate is zero against the labeled corpus at the configured floor, *and* auto-match rate is at or above its configured minimum.**
 5. A loop's state is reconstructible from `loop_events` alone.
 6. The referral install requires neither ChromaDB nor the corpus, asserted by import-closure test.
+
+**Why criterion 4 has two halves.** Stated as "false-match rate is zero" alone, it is passed perfectly by a matcher that auto-matches nothing: every result orphans, no result is attached to the wrong loop, the safety number reads 0.000 and the gate goes green. The degenerate implementation scores best. Worse, it fails invisibly — the metric everyone watches looks ideal precisely when the product has stopped working, and the only symptom is a coordinator queue quietly filling with work the tool was bought to remove.
+
+Pairing it with a minimum auto-match rate closes that. The pair says *decline when uncertain, but you must still resolve most of what you see* — which is the actual product claim. The minimum is pack-configured and starts deliberately low; raising it is a decision backed by replay evidence, never an aspiration set at the start.
+
+This is the same reasoning as the confidence floor in §7, applied to the criterion that audits it. A floor without a coverage requirement optimises toward silence.
 
 ---
 
@@ -249,6 +322,8 @@ The first four are safety, not correctness.
 | Epic In Basket integration | Epic-mediated, hardest possible ingress, unnecessary given the feed |
 | Multi-tenancy | Single-site install. `tenant_isolation` is deliberately **not** imported (§3) |
 | FHIR ingress | HL7 v2 first. FHIR is the better long-term model but adds vendor approval |
+| Clinical closure (`CLOSED`) | The state is reserved in §4 and asserted unreachable by test 5. It ships when a pilot site names who may clinically disposition a finding (§12 q2) |
+| Retention purge tooling | §6 requires a retention *policy*, which is a site decision. Shipping a delete path over PHI and an append-only audit archive before that policy exists is the wrong order. `referral-loop purge --older-than` lands once a site states a period |
 
 ---
 
@@ -256,6 +331,8 @@ The first four are safety, not correctness.
 
 1. **MLLP listener vs file drop for the pilot.** MLLP is the real integration and the design assumes it. A file-drop mode reading messages from a watched directory would let a site pilot before IT schedules an interface build. Decide when a pilot site is identified — the parser and registry are identical either way, so this is a listener-only concern.
 
-2. **Who acknowledges a loop.** `CLOSED` requires coordinator acknowledgement, but if the coordinator is not the clinically responsible party then acknowledgement is a workflow record, not a clinical one. This affects what the worklist claims. Resolve with the first pilot site's actual workflow rather than by assumption.
+2. ~~**Who acknowledges a loop.**~~ **Resolved by construction — see §4.** The question was whether a coordinator's acknowledgement is a clinical record or a workflow one. Rather than guess, v1 stops at `ACKNOWLEDGED` — a claim a coordinator can actually support — and reserves `CLOSED` for a clinically responsible actor, unimplemented and asserted unreachable (test 5). No metric in v1 claims a clinician saw anything.
+
+   What still needs a pilot site is the narrower question: **who may enter `CLOSED`, and does that person work from this worklist or from the EHR they already live in?** That is a v2 scoping question, and it no longer blocks v1 or shapes what v1's worklist claims.
 
 3. **Whether staleness thresholds are defensible defaults or site-configured.** Shipping a default implies a clinical standard. Per-modality defaults should probably ship as a starting point the site must explicitly accept, so the threshold is their clinical decision rather than ours.
