@@ -55,6 +55,25 @@ Consequences: the matcher must resolve fields **through the pack**, not via Task
 
 ---
 
+## OPEN SPEC QUESTION — MRN aliasing after a merge (raised by Task 7, decide before Task 10)
+
+`ADT^A40` moves the loops that exist **when it is applied**. Interface engines keep emitting the prior MRN for some time afterwards — the registration merge and the downstream feeds do not cut over atomically. Nothing currently redirects those later messages, so a loop opened by an `ORM` carrying the retired MRN lands on an identifier no coordinator will search.
+
+That is the same failure §4 rule 3 exists to prevent, arriving through a different door: a clinically open loop invisible on the worklist while the tool reports all-clear. Task 7 closed the door for loops that already existed; this is the one still open.
+
+It is deliberately **not** fixed inside `merge_patient`. A fix needs a persisted alias table consulted on every `open_loop`, which is a schema change plus decisions this plan cannot make alone:
+
+- Does an alias expire, and on what evidence? A permanent alias means a mistyped `A40` silently redirects a real patient's loops forever.
+- Do aliases chain? A→B then B→C must resolve A→C, or the second hop strands the first.
+- What happens on a circular merge, where last-writer-wins is currently the only available answer?
+- Does the alias apply to matching (§5) as well as loop creation? A result carrying the retired MRN has the same problem.
+
+`test_a_loop_opened_mid_merge_cannot_be_stranded_on_the_prior_mrn` asserts the current behaviour explicitly, so the gap is visible in the suite rather than discovered at a pilot site.
+
+**Task 10 must not wire the listener without a decision here**, because that is the point at which real engine traffic starts creating loops from arbitrary MRNs.
+
+---
+
 ## RESOLVED: success criterion 6 was asserted against the wrong thing
 
 **Found during Task 1 review. Decision taken 2026-07-26: slim the image (option 2 below). Task 13 implements it.**
