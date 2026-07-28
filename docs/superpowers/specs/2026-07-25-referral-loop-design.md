@@ -152,11 +152,25 @@ A stat CT unresulted at 4 hours and a screening mammogram unresulted at 30 days 
 
 | Tier | Predicate | Confidence |
 |---|---|---|
-| 1 | placer order number exact | Highest |
-| 2 | filler order number / accession exact | High |
+| 1 | placer order number exact, **and MRN agrees where both are known** | Highest |
+| 2 | filler order number / accession exact, **and MRN agrees where both are known** | High |
 | 3 | MRN + service code + date window | Medium |
 | 4 | MRN + modality equivalence + date window | Low — needs tie-break |
 | 5 | none | `ORPHAN` |
+
+### Why the exact tiers still check the MRN
+
+An order number is not a site-wide identifier. Placer numbers are unique per *placing application*, and two feeds that both number from 1000000 collide on the digits alone — so an exact tier-1 match on the digits can attach a result to **a different patient's loop, at full confidence**. That is the worst outcome this system can produce, and it arrives through the tier the design trusts most.
+
+Measured before the guard existed:
+
+```
+bare number, different MRN : loop_id='L_other_patient', tier=1, confidence=1.0
+```
+
+The assigning authority in the field (`1000001^EPIC` vs `1000001^ATHENA`) already distinguishes them, and the default field map reads the whole field rather than a component, so this was not exploitable as shipped. But that protection is **pack data**: a revision narrowing `placer_order_number` to `OBR-2.1` strips the namespace and silently reopens the vector — through a signed pack edit, which does not pass code review the way a code change would.
+
+So the exact tiers also require the MRN to agree. "Where both are known" is load-bearing: a result carrying no `PID-3` must still match on an exact accession, or a real class of ORU is demoted to an orphan for having less data. This cannot false-negative on merges, because resolution happens at ingest (§4) — both identifiers are already the surviving one by the time matching sees them.
 
 Tie-breakers at tiers 3–4, in order: nearest order date, same ordering provider, most specific modality. All pack-configured, none hardcoded.
 
