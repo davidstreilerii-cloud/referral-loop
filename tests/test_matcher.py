@@ -415,6 +415,198 @@ def test_ordering_provider_tiebreak_is_skipped_when_the_result_names_nobody():
     assert match_result(_key(service_code="71260"), loops, PACK).loop_id == "L_named"
 
 
+# ============================ exact tiers require MRN agreement (spec sec. 5)
+#
+# An order number is not a site-wide identifier. Placer numbers are unique per
+# *placing application*, so two feeds numbering from the same seed collide on
+# the digits alone -- and tier 1 is the tier the design trusts most, so the
+# collision lands another patient's loop at full confidence. That is the worst
+# outcome this system can produce.
+#
+# "Where both are known" is load-bearing in the other direction: a result with
+# no PID-3 must still match an exact accession, or a real class of ORU is
+# demoted to an orphan for carrying *less* data -- trading a rare false match
+# for a common false negative. The tests below pin both halves, because either
+# one alone has a cheap wrong implementation that passes the other.
+
+
+def test_tier1_declines_when_the_mrn_disagrees():
+    """The measured collision from spec section 5, at the tier that hurts most.
+
+    Before the guard: `loop_id='L_other_patient', tier=1, confidence=1.0`.
+    """
+    loops = [_loop("L_other_patient", mrn="MRN_OTHER", placer_order_number="1000001")]
+    result = match_result(_key(mrn="MRN1", placer="1000001"), loops, PACK)
+    assert result.loop_id is None
+    assert result.reason != "no candidate loop", (
+        "a cross-patient order-number collision must be legible in the orphan "
+        "queue, not indistinguishable from a result nothing was ordered for"
+    )
+    assert "MRN disagreed" in result.reason
+
+
+def test_tier2_declines_when_the_mrn_disagrees():
+    loops = [_loop("L_other_patient", mrn="MRN_OTHER", filler_order_number="ACC1")]
+    result = match_result(_key(mrn="MRN1", filler="ACC1"), loops, PACK)
+    assert result.loop_id is None
+    assert "MRN disagreed" in result.reason
+
+
+def test_tier1_still_matches_when_the_mrn_agrees():
+    """The common case. The guard must cost it nothing -- not the loop, not the
+    tier, and not the confidence, since a demoted confidence would silently
+    push tier-1 matches under the pack floor."""
+    loops = [_loop("L1", mrn="MRN1", placer_order_number="P1")]
+    result = match_result(_key(mrn="MRN1", placer="P1"), loops, PACK)
+    assert result.loop_id == "L1"
+    assert result.tier == 1
+    assert result.confidence == 1.0
+    assert result.reason == "placer order number exact"
+
+
+def test_tier2_still_matches_when_the_mrn_agrees():
+    loops = [_loop("L1", mrn="MRN1", filler_order_number="ACC1")]
+    result = match_result(_key(mrn="MRN1", filler="ACC1"), loops, PACK)
+    assert result.loop_id == "L1"
+    assert result.tier == 2
+
+
+def test_result_carrying_no_mrn_still_matches_an_exact_accession():
+    """The reason "where both are known" is in the predicate at all.
+
+    An ORU with no readable PID-3 is a real class of message. Demoting it to an
+    orphan for carrying *less* data trades a rare false match for a common false
+    negative -- a fix worse than the bug.
+    """
+    loops = [_loop("L1", mrn="MRN1", filler_order_number="ACC1")]
+    result = match_result(_key(mrn="", filler="ACC1"), loops, PACK)
+    assert result.loop_id == "L1"
+    assert result.tier == 2
+
+
+def test_result_carrying_no_mrn_still_matches_an_exact_placer():
+    loops = [_loop("L1", mrn="MRN1", placer_order_number="P1")]
+    result = match_result(_key(mrn="", placer="P1"), loops, PACK)
+    assert result.loop_id == "L1"
+    assert result.tier == 1
+
+
+def test_loop_carrying_no_mrn_still_matches_an_exact_accession():
+    """The same clause from the other side."""
+    loops = [_loop("L1", mrn="", filler_order_number="ACC1")]
+    result = match_result(_key(mrn="MRN1", filler="ACC1"), loops, PACK)
+    assert result.loop_id == "L1"
+    assert result.tier == 2
+
+
+@pytest.mark.parametrize("absent", ["", None])
+def test_an_absent_mrn_is_unknown_on_either_side_however_it_is_spelled(absent):
+    """`""` and `None` both mean "not known", and must not diverge.
+
+    A guard written as `loop.mrn == key.mrn` makes two absences *agree*, which
+    reads the same here but is the `"" == ""` equivalence class this file
+    already pins elsewhere -- so the absent case is asserted as "no constraint",
+    reached only because the accession still had to match exactly.
+    """
+    assert match_result(
+        replace(_key(filler="ACC1"), mrn=absent),
+        [_loop("L1", mrn="MRN1", filler_order_number="ACC1")], PACK,
+    ).loop_id == "L1"
+    assert match_result(
+        _key(mrn="MRN1", filler="ACC1"),
+        [replace(_loop("L1", filler_order_number="ACC1"), mrn=absent)], PACK,
+    ).loop_id == "L1"
+    # And an absent MRN still buys nothing on its own: the identifier must match.
+    assert match_result(
+        replace(_key(filler="ACC1"), mrn=absent),
+        [replace(_loop("L1", filler_order_number="OTHER"), mrn=absent)], PACK,
+    ).loop_id is None
+
+
+def test_a_colliding_order_number_no_longer_poisons_the_patients_real_match():
+    """The guard removes the other patient's loop from the tier, not the result
+    from matching. A legitimate lower-tier match for the right patient must
+    still be found underneath the collision."""
+    loops = [
+        _loop("L_other", mrn="MRN_OTHER", placer_order_number="1000001"),
+        _loop("L_mine", mrn="MRN1", service_code="71260"),
+    ]
+    result = match_result(_key(mrn="MRN1", placer="1000001", service_code="71260"), loops, PACK)
+    assert result.loop_id == "L_mine"
+    assert result.tier == 3
+
+
+def test_a_cross_system_collision_is_not_an_ambiguity():
+    """Two loops share the digits; only one is this patient's. Before the guard
+    this declined as ambiguous -- a false orphan caused by another patient's
+    numbering scheme."""
+    loops = [
+        _loop("L_other", mrn="MRN_OTHER", placer_order_number="1000001"),
+        _loop("L_mine", mrn="MRN1", placer_order_number="1000001"),
+    ]
+    result = match_result(_key(mrn="MRN1", placer="1000001"), loops, PACK)
+    assert result.loop_id == "L_mine"
+    assert result.tier == 1
+
+
+def test_the_mrn_guard_does_not_loosen_the_heuristic_tiers():
+    """Tiers 3-4 key on the MRN as *evidence*; the exact tiers use it as a
+    *guard*. Letting "where both are known" leak downward would let a loop with
+    no MRN match any patient on a service code -- a new false-match vector
+    introduced by the fix for one."""
+    loops = [_loop("L1", mrn="", service_code="71260")]
+    assert match_result(_key(mrn="MRN1", service_code="71260"), loops, PACK).tier == 5
+    loops = [_loop("L1", mrn="", modality="CT", service_code="99999")]
+    assert match_result(_key(mrn="MRN1", service_code="71260", modality="CT"), loops, PACK).tier == 5
+
+
+def test_assigning_authority_still_separates_two_systems_when_the_mrn_agrees():
+    """The two protections are complementary, not alternatives.
+
+    `test_assigning_authority_survives_...` now has two reasons to pass, since
+    its loop also carries a different MRN. This one removes the MRN difference
+    so the namespace is again the only thing separating the two placing systems
+    -- otherwise a pack narrowing `placer_order_number` to `OBR-2.1` would go
+    unnoticed for any two orders belonging to the same patient.
+    """
+    message = _parsed(mrn="MRN1", placer="1000001^EPIC")
+    same_patient_other_system = [
+        _loop("L_athena", mrn="MRN1", placer_order_number="1000001^ATHENA")
+    ]
+    key = result_key_from_message(message, PACK)
+    assert key.mrn == "MRN1"
+    assert match_result(key, same_patient_other_system, PACK).loop_id is None
+
+
+def test_one_loop_rejected_at_both_exact_tiers_is_counted_once():
+    """A loop carrying both order numbers is rejected at tier 1 and again at
+    tier 2. Counting it twice would overstate how wide the numbering overlap is
+    -- the same distinct-loop rule the ambiguity gate already applies."""
+    loops = [_loop("L_other", mrn="MRN_OTHER", placer_order_number="P1", filler_order_number="F1")]
+    result = match_result(_key(mrn="MRN1", placer="P1", filler="F1"), loops, PACK)
+    assert result.loop_id is None
+    assert "1 exact order-number match(es)" in result.reason
+
+
+def test_two_colliding_patients_are_both_counted():
+    """The count is still a count -- deduplication must not flatten it to a flag."""
+    loops = [
+        _loop("L_a", mrn="MRN_A", placer_order_number="P1"),
+        _loop("L_b", mrn="MRN_B", placer_order_number="P1"),
+    ]
+    result = match_result(_key(mrn="MRN1", placer="P1"), loops, PACK)
+    assert result.loop_id is None
+    assert "2 exact order-number match(es)" in result.reason
+
+
+def test_the_mrn_disagreement_reason_carries_no_identifiers():
+    """Reasons land in audit detail (spec section 3). The new one is no exception."""
+    loops = [_loop("L_other", mrn="SECRET_MRN", placer_order_number="SECRET_PLACER")]
+    reason = match_result(_key(mrn="SECRET_MINE", placer="SECRET_PLACER"), loops, PACK).reason
+    for sentinel in ("SECRET_MRN", "SECRET_MINE", "SECRET_PLACER", "L_other"):
+        assert sentinel not in reason
+
+
 # ================================================= empty fields never match
 
 

@@ -278,6 +278,41 @@ def result_key_from_message(
 # -------------------------------------------------------------------- matching
 
 
+def _mrn_agrees(loop: Loop, key: ResultKey) -> bool:
+    """Do the loop and the result agree on the patient, *where both name one*?
+
+    The exact tiers key on an order number, and an order number is not a
+    site-wide identifier: placer numbers are unique per placing application, so
+    two feeds numbering from the same seed collide on the digits alone and tier
+    1 attaches another patient's loop at full confidence (spec section 5). The
+    assigning authority in the field distinguishes them, but that protection is
+    *pack data* -- a revision narrowing the candidate to `OBR-2.1` strips the
+    namespace through a signed pack edit, which does not pass code review the
+    way a code change would. So the tier checks the patient in code as well.
+
+    **"Where both are known" is load-bearing, not softening.** An absent MRN is
+    not a value to compare, it is the absence of a constraint: a result with no
+    readable `PID-3` must still match an exact accession, or a real class of ORU
+    is demoted to an orphan for carrying *less* data -- trading a rare false
+    match for a common false negative, which is the fix being worse than the
+    bug. Both sides get the same treatment, because a loop can lack one too.
+
+    This is deliberately *not* `loop.mrn == key.mrn`. That form makes two
+    absences agree, which lands on the same answer here but is the `"" == ""`
+    equivalence class this module refuses everywhere else -- and it would block
+    the one-sided absence, which is exactly the case that must not break.
+
+    No alias resolution happens here. Both identifiers are already the surviving
+    one: resolution runs once, at ingest, before the registry or the matcher
+    sees anything (spec section 4), so re-resolving would be the second call
+    site the spec ruled out -- and this comparison therefore cannot
+    false-negative on a merge.
+    """
+    if not loop.mrn or not key.mrn:
+        return True
+    return loop.mrn == key.mrn
+
+
 def _in_window(loop: Loop, key: ResultKey, pack: RulePack) -> bool:
     """Per-modality date window (spec section 5). Both halves must be known.
 
@@ -392,24 +427,59 @@ def match_result(key: ResultKey, loops: list[Loop], pack: RulePack) -> MatchResu
     overturn what an order number already said, and no weaker tier can win by
     accident.
 
+    A *hit* means the whole tier predicate, not just its identifier. Tiers 1-2
+    require the MRN to agree where both sides carry one, so a result whose only
+    exact-number match belongs to another patient has not found a hit at all --
+    it falls through rather than declining, and the lower tiers still get their
+    turn. See _mrn_agrees for why the check is there and why it is conditional.
+
     Empty is never a match. Every tier requires its key field to be populated,
     so an absent placer cannot match another absent placer -- the `"" == ""` bug
     that turns a whole feed's worth of empty fields into one giant equivalence
     class of false matches.
     """
     exact_candidates = [loop for loop in loops if loop.state in _EXACT_TIER_STATES]
+    # Loops dropped from an exact tier because they belonged to another patient.
+    # Counted, not returned: a count is safe in a reason that lands in audit
+    # detail, and it is the difference between an orphan a coordinator can
+    # triage as a feed fault and one that looks like a result nobody ordered.
+    #
+    # *Distinct* loops, for the same reason the ambiguity gate in _resolve counts
+    # distinct loop ids: a loop carrying both order numbers is rejected once at
+    # tier 1 and again at tier 2, and reporting two collisions where one loop
+    # collided would inflate the number an operator uses to judge how wide the
+    # numbering overlap is.
+    mrn_rejected: set[str] = set()
 
-    # Tier 1 -- placer order number exact.
+    def exact(hits: list[Loop]) -> list[Loop]:
+        """Apply the MRN half of the tier-1/2 predicate, recording what it drops."""
+        agreeing = []
+        for loop in hits:
+            if _mrn_agrees(loop, key):
+                agreeing.append(loop)
+            else:
+                mrn_rejected.add(loop.loop_id)
+        return agreeing
+
+    # Tier 1 -- placer order number exact, and MRN agrees where both are known.
+    #
+    # The MRN is part of the *predicate*, so a cross-patient collision means the
+    # tier never fires -- it does not fire and then decline. That distinction is
+    # deliberate: another patient's numbering scheme must not be able to consume
+    # this result's turn at the lower tiers, which is what a decline here would
+    # do. Falling through cannot manufacture a match, because every tier below
+    # is either MRN-keyed (3-4) or carries this same guard (2).
     if key.placer:
-        hits = [loop for loop in exact_candidates if loop.placer_order_number == key.placer]
+        hits = exact([loop for loop in exact_candidates if loop.placer_order_number == key.placer])
         if hits:
             return _resolve(
                 hits, key, pack, _TIER_PLACER, "placer order number exact", tiebreak=False
             )
 
-    # Tier 2 -- filler order number / accession exact.
+    # Tier 2 -- filler order number / accession exact, and MRN agrees where both
+    # are known.
     if key.filler:
-        hits = [loop for loop in exact_candidates if loop.filler_order_number == key.filler]
+        hits = exact([loop for loop in exact_candidates if loop.filler_order_number == key.filler])
         if hits:
             return _resolve(
                 hits, key, pack, _TIER_FILLER, "filler order number exact", tiebreak=False
@@ -446,4 +516,20 @@ def match_result(key: ResultKey, loops: list[Loop], pack: RulePack) -> MatchResu
             )
 
     # Tier 5 -- no match. Orphans are workflow, not failure (spec section 5).
+    if mrn_rejected:
+        # Two feeds numbering from the same seed is a site-wide fault that gets
+        # worse silently, so it is said out loud rather than left to look like a
+        # result nobody ordered. Counts only -- no identifiers reach a log line
+        # or an audit row (spec section 3).
+        logger.warning(
+            "%d loop(s) matched an exact order number but belonged to another "
+            "patient and were rejected; result routed to the orphan queue. Two "
+            "placing systems numbering from the same seed, or a field map "
+            "pointing at the wrong field.", len(mrn_rejected),
+        )
+        return MatchResult(
+            None, _TIER_ORPHAN, 0.0,
+            f"no candidate loop; {len(mrn_rejected)} exact order-number "
+            "match(es) rejected because the MRN disagreed",
+        )
     return MatchResult(None, _TIER_ORPHAN, 0.0, "no candidate loop")
