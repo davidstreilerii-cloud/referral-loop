@@ -276,6 +276,49 @@ _PURGE_BUSY_TIMEOUT_MS = 5000
 # SQLite's parameter limit is 999 by default. Deletes are chunked well under it.
 _PURGE_CHUNK = 400
 
+# ------------------------------------------------------------- storage stats
+#
+# `applied_messages` and `mrn_alias_events`/`mrn_aliases` are deliberately
+# excluded from retention (see the module docstring above and retention.py),
+# which means they have no bound at all on a box this project does not
+# administer. `stats()` exists to make that growth visible before it becomes a
+# disk-full incident, not to add one -- see `cli.py`'s `stats` mode for the
+# operator-facing side of this.
+#
+# One row per table this report covers, and every column it sums over. The
+# audit database is not here: it is a different file, opened by a different
+# module, under a different retention policy, and this module never opens it.
+#
+# Each table's own INTEGER PRIMARY KEY column (event_id, alias_event_id,
+# label_id) is left out of its column list. That column IS the table's rowid
+# under SQLite's rowid-alias rule and is not stored a second time as a body
+# value, so summing LENGTH() over it would report storage that is not really
+# there. A TEXT PRIMARY KEY (control_id, loop_id, retired_mrn) is not a rowid
+# alias and every one of those stays in its table's list.
+STATS_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("raw_messages", ("control_id", "payload", "received_at")),
+    ("applied_messages", ("control_id", "content_key", "message_type", "applied_at")),
+    ("loops", ("loop_id", "mrn", "state", "placer_order_number", "filler_order_number",
+               "service_code", "modality", "ordering_provider", "ordered_at",
+               "ack_by", "ack_role", "ack_at")),
+    ("loop_events", ("loop_id", "event_type", "occurred_at", "control_id", "detail")),
+    ("mrn_alias_events", ("event_type", "retired_mrn", "surviving_mrn", "established_at",
+                          "established_by", "detail")),
+    ("mrn_aliases", ("retired_mrn", "surviving_mrn", "established_at", "established_by")),
+    ("labels", ("label_type", "outcome", "loop_id", "modality", "service_code", "tier",
+                "actor_role", "pack_version", "created_date")),
+)
+
+# The tables retention.py's module docstring names as permanently excluded.
+# stats() flags these in its report so an operator does not have to
+# cross-reference retention.py to know which rows never age out.
+UNBOUNDED_TABLES = frozenset({"applied_messages", "mrn_alias_events", "mrn_aliases"})
+
+# Same rationale as _PURGE_BUSY_TIMEOUT_MS: a live listener is a second writer,
+# and a stats read that cannot get a consistent snapshot quickly should refuse
+# rather than block an operator indefinitely.
+_STATS_BUSY_TIMEOUT_MS = 5000
+
 # Event types that deliberately carry fields without changing state.
 _NON_TRANSITIONAL = frozenset({"merged_in"})
 
@@ -1626,3 +1669,66 @@ class LoopStore:
         finally:
             if conn is not None:
                 conn.close()
+
+    # --------------------------------------------------------- storage stats
+
+    def stats(self) -> dict:
+        """Row count and an approximate payload-byte figure per STATS_TABLES
+        entry, plus the exact whole-file size -- all read from ONE snapshot.
+
+        **Why one snapshot.** A listener is a second writer. Reading each
+        table with its own separate SELECT would let a message land between
+        two of them -- `applied_messages` counted before it arrived,
+        `loop_events` counted after -- and the report would describe a
+        combination of table states that was never true of the file at any
+        single instant. An explicit deferred transaction fixes the snapshot at
+        its first read and holds it there (SQLite's documented transaction
+        isolation) until the transaction ends; a concurrent writer is not
+        blocked from writing during that window, only from *committing*, and
+        is free the moment this method's transaction closes. This is a
+        read-only sibling of the same guarantee `purge_retention` leans on,
+        just without the write lock a delete needs and this does not.
+
+        **Why COUNT(*) and SUM(LENGTH(...)) rather than reading rows.** Both
+        are computed inside SQLite as streaming aggregates over the btree;
+        this process never holds more than the running total and the final
+        scalar. The cost here does not grow with how much RAM is available the
+        way `len(cursor.fetchall())` on the largest table in the file would.
+
+        **What the byte figure is not.** It is a LOWER BOUND, not the on-disk
+        footprint. LENGTH() measures stored column bytes; it does not count
+        the SQLite record header, btree page overhead, or any of this
+        schema's indexes (idx_applied_content_key, idx_alias_events_retired,
+        idx_aliases_surviving, idx_loops_mrn, idx_loops_state, idx_events_loop,
+        idx_labels_outcome). `dbstat` would give an exact per-table figure and
+        is a compile-time SQLite option -- not present in every build,
+        including this one -- so the one number reported here as exact is the
+        whole file's size (`page_count * page_size`), read inside the same
+        snapshot as the row counts so it describes the same instant they do.
+        """
+        conn = self._connect()
+        try:
+            conn.isolation_level = None
+            conn.execute(f"PRAGMA busy_timeout = {_STATS_BUSY_TIMEOUT_MS}")
+            conn.execute("BEGIN")
+            try:
+                page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+                page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                tables: dict[str, dict] = {}
+                for name, columns in STATS_TABLES:
+                    length_sum = "+".join(f"IFNULL(LENGTH({c}),0)" for c in columns)
+                    row_count, payload_bytes = conn.execute(
+                        f"SELECT COUNT(*), COALESCE(SUM({length_sum}), 0) FROM {name}"
+                    ).fetchone()
+                    tables[name] = {
+                        "rows": row_count,
+                        "payload_bytes": payload_bytes,
+                        "unbounded": name in UNBOUNDED_TABLES,
+                    }
+            finally:
+                self._rollback(conn)
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"Stats read failed: {exc}") from exc
+        finally:
+            conn.close()
+        return {"file_bytes": page_count * page_size, "tables": tables}

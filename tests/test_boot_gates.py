@@ -426,6 +426,84 @@ def test_purge_refuses_a_database_that_does_not_exist(tmp_path, monkeypatch, cap
     assert not missing.parent.exists(), "a refused purge created the data directory"
 
 
+def test_stats_needs_no_pack_key_and_no_accepted_thresholds(tmp_path, monkeypatch, capsys):
+    """A stats report matches nothing and computes no staleness. Putting an
+    operator's ability to see their own disk usage behind a signing key it
+    does not use would be the same gate theatre purge already refuses."""
+    store = LoopStore(tmp_path / "loops.db")
+    store.record_applied("CTRL1", "content-key-1", "ORU^R01")
+
+    for name in (PUBKEY_ENV, "REFERRAL_THRESHOLDS_ACCEPTED"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+
+    code = main(["stats", "--db", str(tmp_path / "loops.db")])
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "applied_messages" in out
+    assert "1 row(s)" in out
+
+
+def test_stats_refuses_an_unattested_volume(tmp_path, monkeypatch, capsys):
+    """It opens a file of MRNs and result text to sum column lengths, so
+    encryption at rest has to hold first -- the same posture purge takes."""
+    LoopStore(tmp_path / "loops.db")
+    monkeypatch.setenv("PHI_MODE", "full")
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+
+    code = main(["stats", "--db", str(tmp_path / "loops.db")])
+
+    assert code == 2
+    assert "PHI_ENCRYPTION_VERIFIED" in capsys.readouterr().err
+
+
+def test_stats_refuses_a_database_that_does_not_exist(tmp_path, monkeypatch, capsys):
+    """A typo'd --db would otherwise build an empty database and report "0
+    rows in every table" -- readable as "nothing has grown" when the truth is
+    "you are not looking at the file the listener writes to"."""
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+    missing = tmp_path / "typo" / "loops.db"
+
+    code = main(["stats", "--db", str(missing)])
+
+    assert code == 2
+    assert "nothing to report on" in capsys.readouterr().err
+    assert not missing.exists()
+    assert not missing.parent.exists(), "a refused stats report created the data directory"
+
+
+def test_stats_reports_row_counts_and_flags_the_tables_retention_never_touches(
+    tmp_path, monkeypatch, capsys
+):
+    store = LoopStore(tmp_path / "loops.db")
+    store.record_raw("RAW1", "MSH|payload")
+    store.record_applied("CTRL1", "content-key-1", "ORU^R01")
+    store.record_alias("MRN_OLD", "MRN_NEW", datetime.now(timezone.utc), "engine")
+
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+    code = main(["stats", "--db", str(tmp_path / "loops.db")])
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "raw_messages" in out and "NOT retention-bounded" not in out.split("raw_messages")[1].split("\n")[0]
+    assert "applied_messages" in out
+    applied_line = [line for line in out.splitlines() if "applied_messages" in line][0]
+    assert "NOT retention-bounded" in applied_line
+    alias_line = [line for line in out.splitlines() if "mrn_alias_events" in line][0]
+    assert "NOT retention-bounded" in alias_line
+
+
+def test_stats_never_creates_a_worklist_or_mllp_socket(tmp_path, monkeypatch, capsys):
+    """A read-only report has no business binding a port. Guards against a
+    refactor that routes `stats` through the same boot path `listen` uses."""
+    LoopStore(tmp_path / "loops.db")
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+    code = main(["stats", "--db", str(tmp_path / "loops.db")])
+    assert code == 0
+
+
 def test_a_dry_run_purge_reports_without_deleting(tmp_path, monkeypatch, capsys):
     store = LoopStore(tmp_path / "loops.db")
     old = datetime.now(timezone.utc) - timedelta(days=800)
@@ -460,7 +538,7 @@ def test_help_works_with_no_pack_no_environment_and_no_database(tmp_path):
         capture_output=True, text=True, timeout=180, cwd=tmp_path, env=env,
     )
     assert proc.returncode == 0, proc.stderr
-    for mode in ("listen", "filedrop", "worklist", "purge"):
+    for mode in ("listen", "filedrop", "worklist", "purge", "stats"):
         assert mode in proc.stdout
     assert PUBKEY_ENV in proc.stdout, "--help must name the environment it requires"
     assert list(tmp_path.iterdir()) == [], "--help created files"

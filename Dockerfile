@@ -69,6 +69,23 @@ ENV PYTHONPATH=/app \
 #   -e REFERRAL_THRESHOLDS_ACCEPTED=1
 #   -e PHI_ENCRYPTION_VERIFIED=1   (or an OS-detected encrypted volume)
 #   -v /encrypted/volume:/app/data
+#
+# Capacity planning for that volume. `--older-than` retention (spec section 6)
+# ages out the raw HL7 archive and resolved loops once the site configures a
+# period, but two tables are excluded from it by design (retention.py's module
+# docstring): applied_messages (the idempotency ledger -- deleting a row
+# re-arms double application of a redelivered message) and mrn_alias_events /
+# mrn_aliases (a merge is a permanent fact; expiring one silently re-strands
+# a loop). Both grow without bound for the life of the install. Measured on a
+# real database: ~166 bytes/row for applied_messages, ~342 bytes/row for the
+# alias tables combined, both including their indexes. At sustained volumes of
+# 1,000 / 10,000 / 50,000 HL7 messages per day, applied_messages alone (it
+# gets one row per applied message, 1:1 with traffic) reaches roughly
+# 58MB / 577MB / 2.8GB after one year and 289MB / 2.8GB / 14GB after five --
+# the alias tables stay well under that even at a generous assumed merge rate.
+# Full method and BUILD_LOG.md carry the numbers this is summarized from.
+# `referral-loop stats --db /app/data/referral_loops.db` reports the real
+# figures for this install rather than the projection above.
 
 EXPOSE 2575 5055
 

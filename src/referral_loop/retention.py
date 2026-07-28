@@ -62,6 +62,13 @@ What retention does not touch
     message the engine redelivers under an old control id, and it is the
     smallest table in the file.
 
+Both exclusions above are correct and neither has a bound of any kind, which
+is a different problem from having the wrong bound: nobody was measuring what
+it costs. ``LoopStore.stats()`` / ``referral-loop stats`` reports row counts
+and approximate on-disk size for both, and BUILD_LOG.md carries measured
+bytes-per-row and growth projections at several message volumes -- read that
+before assuming either table needs the bound this module refuses to add.
+
 The audit trail
     Never touched, and this module never opens that database to delete from it.
     ``guardrails/immutable_audit.py`` blocks deletion at its own authorizer, and

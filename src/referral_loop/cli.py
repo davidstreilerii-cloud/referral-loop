@@ -65,7 +65,7 @@ from .registry import Registry
 from .retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV, RetentionPolicy
 from .retention import purge as run_purge
 from .staleness import require_thresholds_accepted
-from .store import LoopStore
+from .store import STATS_TABLES, LoopStore
 from .worklist import make_worklist_server
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ PUBKEY_ENV = "REFERRAL_PACK_PUBKEY"
 # an operator as a traceback.
 _ED25519_PUBLIC_KEY_BYTES = 32
 
-MODES = ("listen", "filedrop", "worklist", "eval", "purge")
+MODES = ("listen", "filedrop", "worklist", "eval", "purge", "stats")
 
 # `eval` exit codes. Distinct from _refuse's 2, because "this pack must not ship"
 # and "this process could not start" send an operator to different places.
@@ -329,6 +329,65 @@ def _run_purge(args) -> int:
     return 0
 
 
+def _run_stats(args) -> int:
+    """Report row counts and approximate payload bytes per table, and the
+    database's exact file size. Read-only: never deletes or ages out a row.
+
+    Exists because `applied_messages` and `mrn_alias_events`/`mrn_aliases` are
+    deliberately excluded from retention (see retention.py's module docstring)
+    and therefore have no bound at all -- on a box this project does not
+    administer. Nobody can act on a growth cost that has never been measured,
+    and a site should see it coming before a full disk does the telling.
+    Measured projections and the verdict on whether it matters at all live in
+    BUILD_LOG.md; this is the tool that lets a site check its own numbers
+    against them rather than trust ours.
+
+    **Same two gates as purge, and for the same reason.** The encryption gate
+    runs because this opens a file holding PHI-shaped columns to sum their
+    byte lengths -- no value is ever printed, but the file is still read for
+    it. The pack gate does not apply: a stats report matches nothing. The
+    threshold gate does not apply: it computes no staleness. Requiring either
+    would put an operator's ability to see their own disk usage behind a
+    signing key that has nothing to do with it -- the same gate-theatre
+    argument `_run_purge` makes for itself.
+
+    **A database that does not exist is refused, not created.** Every mode but
+    purge and this one creates its file, because a fresh install has to start
+    somewhere. A typo'd `--db` here would otherwise build an empty database
+    and report "0 rows in every table" -- readable as "nothing has grown yet"
+    when the truth is "you are not looking at the file the listener writes
+    to". That is `_run_purge`'s missing-database case, and the report this
+    command produces is exactly the kind of number that gets pasted into a
+    ticket without anyone checking the path first.
+    """
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"))
+
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        raise StoreUnavailableError(
+            f"No database at {db_path}, so there is nothing to report on. Point --db at "
+            "the file the listener writes to."
+        )
+    store = LoopStore(db_path)
+    report = store.stats()
+
+    print(f"{PROG}: storage report for {db_path} (whole file: {report['file_bytes']:,} bytes)")
+    for name, _columns in STATS_TABLES:
+        info = report["tables"][name]
+        flag = "  [NOT retention-bounded]" if info["unbounded"] else ""
+        print(
+            f"{PROG}:   {name:<18} {info['rows']:>12,} row(s)  "
+            f"~{info['payload_bytes']:>14,} payload byte(s){flag}"
+        )
+    print(
+        f"{PROG}: payload bytes are LENGTH() of stored columns -- a lower bound that "
+        "excludes the SQLite record header, page overhead and every index on the table. "
+        "The whole-file size above is exact. See retention.py for what stays unbounded and "
+        "why, and BUILD_LOG.md for measured growth projections at several message volumes."
+    )
+    return 0
+
+
 def _run_worklist(stack: BootedStack, host: str, port: int) -> int:
     """Serve the coordinator worklist. Loopback by refusal, not by convention.
 
@@ -403,7 +462,9 @@ def _build_parser() -> argparse.ArgumentParser:
              "worklist: coordinator queue on localhost. eval: replay the labeled "
              "corpus through --pack-dir and apply the release gate against "
              "--baseline-pack-dir. purge: enforce the site's retention policy, "
-             "which it refuses to run without.",
+             "which it refuses to run without. stats: report row counts and "
+             "approximate on-disk size per table, including the tables retention "
+             "deliberately never touches.",
     )
     parser.add_argument("--db", default="data/referral_loops.db",
                         help="SQLite file on an encrypted volume (default: %(default)s)")
@@ -456,13 +517,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Answered before the pack key is even looked for, deliberately. A purge
-    # loads no pack, and an operator whose retention period is unset needs to
-    # hear that rather than a message about a signing key. See _run_purge for
-    # which gates it does run and why the other two do not apply.
-    if args.mode == "purge":
+    # Answered before the pack key is even looked for, deliberately. Neither
+    # purge nor stats loads a pack, and an operator whose retention period is
+    # unset -- or who just wants to see how big their database has gotten --
+    # needs to hear that rather than a message about a signing key. See
+    # _run_purge and _run_stats for which gates each runs and why the other
+    # two do not apply to either of them.
+    if args.mode in ("purge", "stats"):
         try:
-            return _run_purge(args)
+            return _run_purge(args) if args.mode == "purge" else _run_stats(args)
         except (ReferralLoopError, RuntimeError) as exc:
             return _refuse(str(exc))
 
