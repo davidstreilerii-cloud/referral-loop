@@ -968,6 +968,24 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
     Re-run in a subprocess because the guards have to be installed before
     collection, and because a guard armed in-process would be armed for the
     tests that come after it in this file only.
+
+    **`-m "not docker"` is not a coverage gap, and adding those tests back would
+    not close one.** Do not "fix" it. Both guards are `monkeypatch`-installed
+    inside *this* pytest process: `socket.socket.connect` is rebound on this
+    interpreter's socket module, and `anthropic`/`claude_cli` are poisoned in
+    this interpreter's `sys.modules`. A `docker build` or `docker run` is a
+    child process with its own interpreter -- and, for the container, its own
+    kernel namespace -- so neither guard is in force inside it and neither can
+    observe what it does. Running `test_install_closure.py` here therefore adds
+    exactly zero evidence for spec 12 or 13. What it did add was time and
+    flakiness: `docker run` stalled past ten minutes more than once, and this
+    inner run was twenty-two of the suite's thirty-eight minutes when a hang
+    finally took the merge gate red. A safety proof is the last place to accept
+    an unreliable step that proves nothing.
+
+    Those tests still run in a normal invocation, where success criterion 6 is
+    verified against the built image -- that is the only real proof of it, and
+    nothing here weakens it.
     """
     if os.environ.get(spec_guards.ARMED_ENV):
         pytest.skip("already inside the guarded run; not recursing")
@@ -975,6 +993,7 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/referral_loop", "-q",
          "-p", "tests.referral_loop.spec_guards",
+         "-m", "not docker",
          "--deselect",
          "tests/referral_loop/test_spec_proofs.py::"
          "test_spec_12_and_13_the_whole_suite_runs_under_both_guards"],

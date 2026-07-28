@@ -104,10 +104,22 @@ def _docker_reason() -> str | None:
     return None
 
 
-requires_docker = pytest.mark.skipif(
+_skip_without_docker = pytest.mark.skipif(
     _docker_reason() is not None,
     reason=f"success criterion 6 UNVERIFIED -- {_docker_reason()}",
 )
+
+
+def requires_docker(test):
+    """Skip without a daemon, and carry the `docker` marker either way.
+
+    The marker is what lets the spec 12/13 meta-test deselect these from its
+    inner run with `-m "not docker"`. It is applied unconditionally -- including
+    on a machine with no daemon, where the test would only skip -- because a
+    selector that changed meaning with the environment is worse than either
+    behaviour on its own.
+    """
+    return pytest.mark.docker(_skip_without_docker(test))
 
 
 @pytest.fixture(scope="session")

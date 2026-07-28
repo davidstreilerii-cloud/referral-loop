@@ -527,10 +527,34 @@ def test_a_merge_is_surfaced_without_either_identifier(http, registry):
 
 # ---------------------------------------------------------------- injection
 
+# The probe these tests plant to prove Jinja did not evaluate hostile input, and
+# the string that appears if and only if it did.
+#
+# It used to be `{{ 7*7 }}` / `"49"`, asserted absent from the whole document,
+# and that assertion collided with the document by construction: `open_loop`
+# mints ids as `L-<12 random hex chars>`, so roughly one rendered loop in
+# twenty-five carries a literal "49" in its id, and the ages and ratios on the
+# page are decimal too. The suite went red on `assert '49' not in body` with
+# nothing wrong with the product.
+#
+# The whole document is the right scope -- an evaluated expression can surface
+# anywhere the value is interpolated, not only in the cell it was planted in --
+# so the fix is to the marker rather than the scope. Two properties make a
+# collision impossible rather than merely unlikely:
+#
+#   * the concatenation. `"JINJA" ~ "EVALUATED"` yields JINJAEVALUATED only when
+#     Jinja evaluates it; the un-evaluated source text does not contain that
+#     substring, because the `" ~ "` sits in the middle of it.
+#   * the alphabet. J, N, U and V are outside hex, so no random loop id can
+#     contain the marker, and neither can an age, a ratio or a count.
+JINJA_PROBE = '{{ "JINJA" ~ "EVALUATED" }}'
+JINJA_PROBE_EVALUATED = "JINJAEVALUATED"
+
+
 @pytest.mark.parametrize("hostile", [
     "<script>alert(1)</script>",
     "L-\"><img src=x onerror=alert(1)>",
-    "{{ 7*7 }}",
+    JINJA_PROBE,
     "{% raise %}",
     "L-'--",
 ])
@@ -545,17 +569,19 @@ def test_a_hostile_loop_id_is_escaped_not_executed(http, registry, hostile):
     assert "<script" not in body.lower()
     assert "<img" not in body.lower()
     # Jinja never evaluated it.
-    assert "49" not in body
+    assert JINJA_PROBE_EVALUATED not in body
     # ...and the row is still rendered, escaped exactly, rather than dropped:
     # a row silently missing from a worklist is this product's failure mode.
     assert str(escape(hostile)) in body
 
 
 def test_jinja_syntax_in_a_modality_is_not_evaluated(http, registry):
-    registry.open_loop(mrn=MRN_SENTINEL, modality="{{ 7*7 }}", control_id="C1")
+    from markupsafe import escape
+
+    registry.open_loop(mrn=MRN_SENTINEL, modality=JINJA_PROBE, control_id="C1")
     body = http.get("/worklist/").data.decode()
-    assert "49" not in body
-    assert "{{ 7*7 }}" in body or "{{ 7*7 }}".replace('"', "&#34;") in body
+    assert JINJA_PROBE_EVALUATED not in body
+    assert JINJA_PROBE in body or str(escape(JINJA_PROBE)) in body
 
 
 @pytest.mark.parametrize("action, setup", [("dismiss", "orphan"), ("reverse_acknowledgement", "ack")])
