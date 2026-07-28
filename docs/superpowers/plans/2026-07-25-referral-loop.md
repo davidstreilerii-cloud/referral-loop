@@ -55,17 +55,51 @@ Consequences: the matcher must resolve fields **through the pack**, not via Task
 
 ---
 
-## ACCEPTED RESIDUAL — `CR FS CR` in a message body defeats the stream reader (Task 10)
+## NARROWED 2026-07-27 — `CR FS CR` in a message body (Task 10)
 
-`mllp.frame` refuses to emit a body containing `FS`, and `deframe` refuses one on the way in. Neither helps a **stream** reader, which must decide where a frame ends from the bytes on the wire.
+**Status: narrowed, not closed.** What follows replaces the "not fixable in a stream reader" finding below it, which was wrong about *why* — and wrong in a way that stopped the investigation one step early.
 
-A body embedding `CR FS CR` splits into two. The truncated first half then *ends with `CR`*, so the termination check passes it, and with the remainder not yet delivered nothing else can fire. Measured: `acks=['AA','AR'], loops:1` — the half was applied and acknowledged.
+### The original defect
 
-This is **not fixable in a stream reader**. At the instant a frame completes, a truncated half followed by a remainder is byte-for-byte indistinguishable from a whole message followed by another one.
+`mllp.frame` refuses to emit a body containing `FS`, and `deframe` refuses one on the way in. Neither helps a **stream** reader, which must decide where a frame ends from the bytes on the wire. A body embedding `CR FS CR` splits into two. The truncated first half then *ends with `CR`*, so the termination check passes it. Measured: `acks=['AA','AR'], loops:1` — the half applied and acknowledged, the `ORC` discarded.
 
-Mitigations in place: a multi-MSH guard, and retroactive flagging of the half **by control id** once the stream proves desynchronised. Neither is a fix — the `AA` has already gone back to the engine. False-alarm flags are possible, since a good message followed by an unrelated malformed one looks the same.
+### What the original analysis got wrong
 
-**This is the only known path by which a truncated clinical message is answered `AA`.** It requires a sender emitting `FS` inside a body, which is malformed HL7 — but "the sender is malformed" is exactly the argument this codebase rejects elsewhere for denylists. Worth a spec decision on whether v1 ships with it, and worth naming in the security review rather than discovered there.
+"At the instant a frame completes, a truncated half followed by a remainder is byte-for-byte indistinguishable from a whole message followed by another one." True, and irrelevant — because the reader does not have to decide at that instant. It can look at **what follows**, and the bytes following a truncated half begin `ORC|...`, not `VT`. The check that tests exactly that (check 4) was already in the code; it was firing only when those bytes happened to be buffered already, and nothing had been done to make them be.
+
+The remaining reason not to wait was the deadlock: MLLP senders block on the ACK, so a reader that waits for a next frame that will never be written hangs the connection.
+
+### What was done
+
+**A bounded lookahead before the ACK.** When a frame completes with an empty buffer behind it, the reader waits at most `DESYNC_GRACE_SECONDS` (default 0.05, `select`, per-server override `desync_grace`) for the bytes that would prove the stream is still synchronised. Check 4 then runs against them, *before* the frame is applied or acknowledged, so a proven desync is answered `AR` and the half is never applied.
+
+The deadlock is avoided by the wait being bounded and every failure path — timeout, EOF, socket error — returning "no bytes", i.e. leading straight back to acknowledging the frame in hand. It is never "wait for the next frame".
+
+This works because of an asymmetry the original analysis missed: a truncated half and its remainder are two pieces of a **single sender `write`**, so the remainder is already in flight and needs no round trip; a genuine next message has usually not been written yet, because the sender is blocked on the ACK. Waiting therefore finds evidence in the case that matters and finds nothing in the case that does not.
+
+### What remains, measured
+
+The window is the whole of it. Delay sweep against the fix, remainder written without an intervening ACK read:
+
+| remainder delayed by | outcome |
+|---|---|
+| 0 / 1 / 5 / 20 / 45 ms | `acks=['AR']`, `loops=0` — refused, never applied |
+| 70 ms, 200 ms | `acks=['AA','AR']`, `loops=1`, `suspect=1` — the old behaviour |
+
+So two cases still produce an `AA` on a truncated half:
+
+1. **A remainder delayed past the grace window** — a sender or intermediary that splits its own write and then stalls for longer than 50 ms. Caught late, not silently: the retroactive flag by control id still fires (`suspect_truncation_count`), and the archive holds the bytes.
+2. **A remainder that never arrives at all** — the sender emits the half and dies. No evidence exists on the connection, and nothing in a stream reader can manufacture it. This one is genuinely unclosable here.
+
+Cost: bounded added latency on the last frame of each delivery (measured 0.047–0.063 s per message for a strictly sequential sender; three pipelined frames pay it once, 0.078 s total, because only a frame with an empty buffer behind it waits). `desync_grace=0` opts out and restores the pre-fix behaviour exactly — which is how the test suite proves the guard is what closes the hole.
+
+### Still true from before
+
+The multi-MSH guard and the retroactive flag both remain. False-alarm flags are still possible: a good message followed by an unrelated malformed one looks the same, and that trade is deliberate.
+
+### Adjacent finding, not fixed here
+
+The truncated half in the probe was `MSH` + `PID` only — no `ORC`, no `OBR` — and the listener opened a loop from it: empty placer, empty filler, empty service code, `ordered_at` defaulted to ingest time. A structural minimum per message type would be a second, timing-independent narrowing (it would catch every split before the last required segment), but rejecting a reduced-but-real order with `AR` is itself a loss path, so it needs the spec decision this one no longer does.
 
 ---
 

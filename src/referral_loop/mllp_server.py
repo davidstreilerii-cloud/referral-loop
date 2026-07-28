@@ -28,29 +28,46 @@ Four checks, in the order they can fire, none of them expensive:
   3. **`deframe` refuses an embedded `FS`**, so a body carrying `FS` not
      followed by `CR` is rejected rather than silently truncated.
   4. **The bytes following a frame must begin the next one with `VT`.** The
-     remainder of a split message does not. This fires only when those bytes are
-     already buffered, which is why check 2 exists.
+     remainder of a split message does not.
 
 Checks 2 and 4 overlap on purpose and neither subsumes the other: 4 is exact but
 depends on TCP timing, 2 is timing-independent but assumes a conformant sender
 terminates its last segment.
 
-**The residual hole, stated exactly, because it was found by probing rather than
-by reasoning.** A body containing `CR FS CR` defeats both. The truncated half
-then *ends with `CR`*, so check 2 sees a properly terminated last segment and
-passes it; and if the remainder has not yet arrived, check 4 has nothing to look
-at. The half is answered `AA` and applied. This is not fixable inside a stream
-reader: at the instant a frame completes, `VT msg FS CR` followed later by more
-bytes is indistinguishable from a legitimate message followed by another one.
-The real defences are upstream -- `mllp.frame` refuses to build such a message,
-and MLLP requires senders not to put `FS` in a body.
+**The hole checks 2 and 4 both miss, and what closes most of it.** A body
+containing `CR FS CR` defeats check 2: the truncated half then *ends with `CR`*,
+so check 2 sees a properly terminated last segment and passes it. Check 4 would
+catch it -- the remainder begins `ORC|...`, not `VT` -- but only if those bytes
+are in the buffer at the moment the frame completes. Measured against the
+original implementation, when the two halves landed in separate `recv` calls the
+half was answered `AA` and applied: ``acks=['AA','AR'], loops:1``.
 
-What this module does instead is refuse to let it stay silent. When check 4
-fires, the frame accepted immediately before it on the same connection is
-retroactively flagged through `MessageHandler.flag_possible_truncation`, naming
-its control id, because a desynchronised remainder is evidence that the thing
-just acknowledged may have been half a message. That converts an invisible
-false accept into an alert with an identifier a human can pull from the archive.
+So check 4 is given something to look at. **When a frame completes with nothing
+behind it, the reader waits a bounded moment for the bytes that would prove the
+stream is still in sync, before the frame is applied or acknowledged.** This is
+sound because of an asymmetry in how the two cases arise: a truncated half and
+its remainder are two pieces of a *single* `write` by a sender that believes it
+is emitting one message, so the remainder is already in flight and needs no
+round trip -- whereas a sender pipelining a genuine second message has typically
+not written it yet, because MLLP senders block on the ACK. Waiting therefore
+finds the evidence in the case that matters and finds nothing in the case that
+does not.
+
+The wait is `select` with a finite timeout and the reader always proceeds when
+it expires, so a sender blocked on the ACK is never deadlocked; the cost is
+bounded added latency (`DESYNC_GRACE_SECONDS`) on the last frame of each
+delivery, and the check is skipped entirely when bytes are already buffered, so
+pipelining is unaffected. Set `desync_grace=0` to opt out.
+
+**What still gets through.** A remainder delayed *longer* than the grace window
+-- a sender or intermediary that splits its own write and then stalls -- still
+produces an `AA` on the half. So does a sender that emits the half and then
+never sends the remainder at all. The first is caught late: when the remainder
+does arrive and proves the stream desynchronised, the frame accepted immediately
+before it is retroactively flagged through
+`MessageHandler.flag_possible_truncation`, naming its control id, which converts
+an invisible false accept into an alert a human can pull from the archive. The
+second leaves no evidence at all and is not detectable in a stream reader.
 
 Any check failing desynchronises the stream, so the connection is closed after
 the `AR` rather than read on -- the reader can no longer tell where the next
@@ -60,6 +77,7 @@ message starts, and guessing is the thing it is refusing to do. The frame
 from __future__ import annotations
 
 import logging
+import select
 import socket
 import socketserver
 
@@ -79,6 +97,17 @@ RECV_BYTES = 8192
 # A connection an engine has forgotten about otherwise holds a thread forever.
 RECV_TIMEOUT_SECONDS = 300.0
 
+# How long to wait, after a frame completes with an empty buffer behind it, for
+# the bytes that would prove the stream is still synchronised (check 4). The
+# remainder of a message split by an embedded FS CR is part of the same sender
+# write and is already in flight, so it arrives within a network hop; a genuine
+# next message usually has not been written yet, because MLLP senders block on
+# the ACK. This is therefore the delay that separates the two, and it is spent
+# only on the last frame of a delivery -- pipelined frames have their successor
+# already buffered and skip the wait. It is bounded, and the reader always
+# proceeds when it expires, so a sender waiting on the ACK cannot deadlock it.
+DESYNC_GRACE_SECONDS = 0.05
+
 _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 
@@ -91,6 +120,7 @@ class MLLPServer(socketserver.ThreadingTCPServer):
     message_handler: object
     recv_timeout: float
     max_frame_bytes: int
+    desync_grace: float
 
 
 class MLLPRequestHandler(socketserver.BaseRequestHandler):
@@ -143,10 +173,21 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                 if end < 0:
                     break
                 candidate, remainder = buffer[: end + 2], buffer[end + 2:]
+                if not remainder:
+                    # Nothing behind the frame, so check 4 has nothing to look
+                    # at -- the state in which a `CR FS CR` truncation used to
+                    # be answered AA. Wait a bounded moment for the remainder,
+                    # which for a split message is already in flight. Bounded
+                    # and always proceeds on expiry: a sender blocked on the ACK
+                    # is delayed, never deadlocked.
+                    remainder = self._lookahead(server)
+                    buffer = candidate + remainder
                 if remainder and not remainder.startswith(VT):
                     # Check 4. Deliberately before `candidate` is handled: once
                     # the stream is known to be desynchronised, the frame in
-                    # hand cannot be trusted to be whole either.
+                    # hand cannot be trusted to be whole either -- and because
+                    # this now runs before the ACK, the truncated half is
+                    # refused rather than flagged after the fact.
                     self._flag(handler, last_accepted)
                     self._send(handler.reject_malformed(
                         buffer, "bytes after an end block do not begin a new frame"
@@ -168,6 +209,41 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                 last_accepted = peek_control_id(
                     candidate[len(VT):-2].decode("utf-8", errors="replace")
                 )
+
+    def _lookahead(self, server: MLLPServer) -> bytes:
+        """Bytes already behind a completed frame, waiting at most `desync_grace`.
+
+        Returns `b""` on timeout, on end-of-stream, and on a socket error, so
+        every path leads back to "acknowledge the frame in hand". That is the
+        deadlock guard and it is deliberately the fallback rather than a special
+        case: a sender that is blocked waiting for this ACK must get it, and the
+        only thing this method is allowed to do about a silent peer is give up.
+
+        `select` rather than a timed `recv` so the connection's own
+        `recv_timeout` is never disturbed -- a temporarily lowered timeout that
+        an exception path failed to restore would turn a 300-second idle
+        allowance into a 50-millisecond one and drop live connections.
+        """
+        grace = server.desync_grace
+        # `<= 0` rather than `< 0`: zero means off, and off means no syscall.
+        # Mutation M3 (`< 0`, so zero still polls with a zero timeout) survives
+        # the suite and is left surviving deliberately -- it is strictly safer
+        # than this, never less so, and the only case it changes is bytes
+        # already in the kernel buffer, which no deterministic test can stage.
+        # An explicit opt-out that quietly still costs a syscall per frame is
+        # the worse of two harmless options, so this one is the documented one.
+        if grace <= 0:
+            return b""
+        try:
+            ready, _, _ = select.select([self.request], [], [], grace)
+        except (OSError, ValueError):  # pragma: no cover - peer-dependent
+            return b""
+        if not ready:
+            return b""
+        try:
+            return self.request.recv(RECV_BYTES)
+        except OSError:  # pragma: no cover - peer-dependent
+            return b""
 
     @staticmethod
     def _flag(handler, last_accepted: str) -> None:
@@ -218,6 +294,7 @@ def make_mllp_server(
     *,
     recv_timeout: float = RECV_TIMEOUT_SECONDS,
     max_frame_bytes: int = MAX_FRAME_BYTES,
+    desync_grace: float = DESYNC_GRACE_SECONDS,
 ) -> MLLPServer:
     """Bind loopback by default. v1 makes no outbound connection to anyone, us included.
 
@@ -235,4 +312,5 @@ def make_mllp_server(
     server.message_handler = handler
     server.recv_timeout = recv_timeout
     server.max_frame_bytes = max_frame_bytes
+    server.desync_grace = desync_grace
     return server

@@ -47,6 +47,7 @@ from healthcare_rag.referral_loop.listener import (
 )
 from healthcare_rag.referral_loop.matcher import field_value
 from healthcare_rag.referral_loop.mllp import CR, FS, VT, frame
+from healthcare_rag.referral_loop.mllp_server import DESYNC_GRACE_SECONDS
 from healthcare_rag.referral_loop.parse_hl7 import parse_hl7_text
 from healthcare_rag.referral_loop.registry import Registry
 from healthcare_rag.referral_loop.store import LoopStore
@@ -874,36 +875,272 @@ def test_a_body_carrying_fs_cr_is_rejected_when_the_remainder_has_not_arrived(ha
     assert handler.framing_error_count == 1
 
 
-def test_a_cr_terminated_embedded_fs_cr_is_flagged_even_though_it_is_accepted(handler):
-    """The residual hole, pinned rather than papered over.
+def _cr_fs_cr_hostile() -> tuple[bytes, int]:
+    """A body carrying `CR FS CR`, and the offset the wire splits it at.
 
-    Found by probing, not by reasoning. A body carrying `CR FS CR` makes the
-    truncated half end with CR, so the CR-termination check passes it, and with
-    the remainder not yet on the wire the next-frame check has nothing to look
-    at. The half IS accepted -- that is not fixable in a stream reader, because
-    at the instant a frame completes it is indistinguishable from a whole
-    message followed by another one.
-
-    What must hold is that it does not stay silent: when the remainder arrives
-    and proves the stream was desynchronised, the already-acknowledged message
-    is flagged by control id so a human can pull the raw and compare. This test
-    exists so that if someone later claims this case is handled, the assertion
-    below says exactly how far the handling goes.
+    The half ends with CR, so the CR-termination check passes it -- this is the
+    one shape that defeats every in-frame check.
     """
     body = order().replace("DOE^JANE", "DOE\r" + FS.decode("latin-1") + CR.decode("latin-1") + "JANE")
     hostile = VT + body.encode("utf-8") + FS + CR
-    cut = hostile.index(FS + CR) + 2
+    return hostile, hostile.index(FS + CR) + 2
 
+
+def test_a_cr_terminated_embedded_fs_cr_is_refused_when_both_halves_are_on_the_wire(handler):
+    """A sender emits one message with one write, so both halves arrive with no
+    ACK between them. Previously measured `acks=['AA','AR'], loops:1` -- the
+    half applied and acknowledged. It must now be refused outright."""
+    hostile, _ = _cr_fs_cr_hostile()
     with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(hostile)
+            ack = read_ack(sock)
+    assert "|AA|" not in ack, "the truncated half must not be acknowledged"
+    assert "|AR|" in ack
+    assert loops(handler) == [], "and it must not be applied"
+    assert handler.framing_error_count == 1
+
+
+def test_a_cr_terminated_embedded_fs_cr_is_refused_when_the_remainder_is_still_in_flight(handler):
+    """The case the pre-fix reader could not see, and the reason for the grace
+    window. The two halves land in separate `recv` calls, so at the instant the
+    frame completes there is nothing behind it -- but the remainder is part of
+    the same sender write and is already in flight, so waiting a bounded moment
+    finds it. No ACK is read between the two writes: a sender splitting its own
+    message does not stop to wait for one.
+
+    The 5ms pause is an absolute figure, not a fraction of the grace: derived
+    from the constant it would shrink with it, the two halves would land in one
+    `recv`, and check 4 would catch them from the buffer without the lookahead
+    ever running -- so the test would keep passing against a default of zero.
+    Found by mutation (M11), which is exactly how it read before.
+    """
+    assert DESYNC_GRACE_SECONDS >= 0.02, (
+        "the default grace must cover a real network hop, or the guard is decorative"
+    )
+    hostile, cut = _cr_fs_cr_hostile()
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(hostile[:cut])
+            time.sleep(0.005)
+            sock.sendall(hostile[cut:])
+            ack = read_ack(sock)
+    assert "|AA|" not in ack, "the truncated half must not be acknowledged"
+    assert "|AR|" in ack
+    assert loops(handler) == []
+    assert handler.suspect_truncation_count == 0, "refused up front, not flagged after"
+    assert handler.framing_error_count == 1
+
+    # AR means the engine will not redeliver, so the archive is the only
+    # remaining copy of this clinical message. It has to hold all of it --
+    # both the half that completed the frame and the bytes behind it.
+    archived = "".join(handler.store.raw_payloads())
+    assert "MRN123456" in archived, "the half that arrived is not in the archive"
+    assert "ORC|NW|PLACER987" in archived, "the discarded remainder is not in the archive"
+
+
+def test_a_desync_flags_the_frame_acknowledged_immediately_before_it(handler):
+    """One whole message, then a `CR FS CR` truncation, in a single write.
+
+    The first message is genuinely whole and is genuinely acknowledged before
+    the desync is visible, so nothing can un-send that `AA`. What is still owed
+    is the flag: once the stream proves desynchronised, the reader cannot claim
+    the frame it just accepted was whole either. False alarms are accepted here
+    on the same asymmetry the matcher uses -- a wasted look at an archived
+    message costs less than a silently truncated result.
+    """
+    hostile, _ = _cr_fs_cr_hostile()
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(frame(order("WHOLE1")) + hostile)
+            acks = b""
+            sock.settimeout(10)
+            while acks.count(FS + CR) < 2:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                acks += chunk
+    decoded = acks.decode("utf-8", errors="replace")
+    assert decoded.count("|AA|") == 1, "only the whole message is acknowledged"
+    assert "|AR|" in decoded, "the truncation is refused"
+    assert handler.suspect_truncation_count == 1, "and WHOLE1 is flagged as suspect"
+    assert len(loops(handler)) == 1, "the truncated half created nothing"
+
+
+def test_a_remainder_delayed_past_the_grace_window_is_the_narrowed_residual(handler):
+    """What the grace window does NOT close, pinned so nobody overclaims it.
+
+    The sender here withholds the remainder until it has read an ACK for the
+    half -- longer than any bounded wait can cover. The half is accepted, and
+    the requirement falls back to what it was before: it must not be silent.
+    When the remainder arrives and proves the stream desynchronised, the
+    already-acknowledged message is flagged by control id so a human can pull
+    the raw and compare.
+
+    `desync_grace` is set to a value the delay provably exceeds rather than
+    relying on the default, so this test states the residual instead of racing
+    the scheduler for it.
+    """
+    hostile, cut = _cr_fs_cr_hostile()
+    with running_server(handler, desync_grace=0.01) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(hostile[:cut])
+            first = read_ack(sock)          # the sender waits for this
+            sock.sendall(hostile[cut:])
+            time.sleep(0.3)
+
+    assert "|AA|" in first, "documented residual: a stalled remainder is not caught in time"
+    assert handler.suspect_truncation_count == 1, "but it must not be silent"
+    assert handler.framing_error_count == 1, "and the remainder is rejected AR"
+
+
+def test_the_grace_window_is_what_closes_the_cr_fs_cr_hole(handler):
+    """Turning the lookahead off reproduces the original defect exactly.
+
+    Without this, a mutation that made `desync_grace=0` (or any value) behave
+    like the default would pass -- the guard would be untestable from outside.
+    It also pins the opt-out as a real, documented setting rather than dead
+    configuration: a site trading this defence for throughput gets the
+    pre-fix behaviour, and gets it knowingly.
+    """
+    hostile, cut = _cr_fs_cr_hostile()
+    with running_server(handler, desync_grace=0.0) as address:
         with socket.create_connection(address, timeout=10) as sock:
             sock.sendall(hostile[:cut])
             first = read_ack(sock)
             sock.sendall(hostile[cut:])
             time.sleep(0.3)
+    assert "|AA|" in first
+    assert len(loops(handler)) == 1, "the original defect, reproduced with the guard off"
 
-    assert "|AA|" in first, "documented limitation: the truncated half is accepted"
-    assert handler.suspect_truncation_count == 1, "but it must not be silent"
-    assert handler.framing_error_count == 1, "and the remainder is rejected AR"
+
+def test_the_configured_grace_is_the_one_that_is_actually_waited(handler):
+    """Found by mutation (M10): hard-coding DESYNC_GRACE_SECONDS inside the
+    lookahead, ignoring the per-server setting, passed every other test --
+    because every other test's remainder either arrives instantly or not at
+    all, so any positive window behaves the same.
+
+    Here the remainder is delayed by three times the default and the server is
+    configured to wait far longer than that. Only a reader honouring its own
+    setting still has the window open when those bytes land.
+    """
+    delay = 3 * DESYNC_GRACE_SECONDS
+    hostile, cut = _cr_fs_cr_hostile()
+    with running_server(handler, desync_grace=delay + 1.0) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(hostile[:cut])
+            time.sleep(delay)
+            sock.sendall(hostile[cut:])
+            ack = read_ack(sock)
+    assert "|AA|" not in ack, "the configured window was not honoured"
+    assert "|AR|" in ack
+    assert loops(handler) == []
+
+
+def test_the_desync_lookahead_does_not_deadlock_a_sender_waiting_on_the_ack(handler):
+    """The failure mode the lookahead could have introduced, and the reason it
+    is a bounded `select` rather than "read until the next frame".
+
+    An MLLP sender blocks on the ACK before writing its next message, so bytes
+    that would resolve the ambiguity will never come. The reader must give up
+    and answer. Three messages in sequence, each written only after the previous
+    ACK came back: if the wait were unbounded this hangs on the first one.
+    """
+    deadline = 3 * (DESYNC_GRACE_SECONDS + 2.0)
+    started = time.monotonic()
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            for index, control_id in enumerate(("SEQ1", "SEQ2", "SEQ3")):
+                sock.sendall(frame(order(control_id, placer=f"P{index}", filler=f"F{index}")))
+                assert "|AA|" in read_ack(sock), f"{control_id} was never acknowledged"
+    assert time.monotonic() - started < deadline
+    assert len(loops(handler)) == 3
+
+
+def test_a_peer_that_half_closes_after_a_frame_is_still_acknowledged(handler):
+    """End-of-stream during the lookahead means "nothing more is coming", not
+    "give up on the frame in hand". A sender that shuts down its write side
+    immediately after the message is still owed its ACK."""
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(frame(order()))
+            sock.shutdown(socket.SHUT_WR)
+            ack = read_ack(sock)
+    assert "|AA|" in ack
+    assert len(loops(handler)) == 1
+
+
+def test_pipelined_frames_do_not_each_pay_the_grace_window(handler):
+    """Only the last frame of a delivery has an empty buffer behind it, so only
+    that one waits. A lookahead that ran unconditionally would multiply the
+    latency of every pipelined batch by its size."""
+    payload = b"".join(
+        frame(order(cid, placer=f"PP{i}", filler=f"FF{i}"))
+        for i, cid in enumerate(("PIPE1", "PIPE2", "PIPE3", "PIPE4"))
+    )
+    # An exaggerated grace, so "one wait" and "four waits" are 0.4s apart
+    # rather than 0.15s apart and the assertion is not racing the scheduler.
+    grace = 0.4
+    with running_server(handler, desync_grace=grace) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            started = time.monotonic()      # server startup is not the thing measured
+            sock.sendall(payload)
+            acks = b""
+            sock.settimeout(10)
+            while acks.count(FS + CR) < 4:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                acks += chunk
+            elapsed = time.monotonic() - started
+    assert acks.decode().count("|AA|") == 4
+    assert elapsed < 2 * grace, (
+        f"four pipelined frames took {elapsed:.3f}s against a {grace}s grace; "
+        "only the last frame may wait"
+    )
+
+
+def test_a_slow_legitimate_message_split_inside_its_terminator_is_still_accepted(handler):
+    """The grace window must not turn a slow sender into a rejected one. Split
+    between the FS and the CR -- the frame only completes when the second write
+    lands, and the delay exceeds the window -- and it is still one good
+    message."""
+    payload = frame(order())
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(payload[:-1])
+            time.sleep(3 * DESYNC_GRACE_SECONDS)
+            sock.sendall(payload[-1:])
+            ack = read_ack(sock)
+    assert "|AA|" in ack
+    assert len(loops(handler)) == 1
+
+
+def test_an_empty_frame_over_the_wire_is_rejected(handler):
+    """VT FS CR carries no MSH at all. `deframe` returns "" for it happily, so
+    the refusal has to come from the body-must-end-with-CR check."""
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(VT + FS + CR)
+            ack = read_ack(sock)
+    assert "|AR|" in ack
+    assert "|AA|" not in ack
+    assert handler.framing_error_count == 1
+
+
+def test_a_body_carrying_a_bare_fs_with_no_cr_after_it_is_rejected(handler):
+    """The frame terminates at the sender's real FS CR, so the body reaches
+    `deframe` with the stray FS still in it. Nothing is truncated here -- the
+    point is that it is refused rather than accepted as message content."""
+    body = order().replace("DOE^JANE", "DOE" + FS.decode("latin-1") + "JANE")
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(VT + body.encode("utf-8") + FS + CR)
+            ack = read_ack(sock)
+    assert "|AR|" in ack
+    assert "|AA|" not in ack
+    assert loops(handler) == []
+    assert handler.framing_error_count == 1
 
 
 def test_a_start_block_inside_the_body_is_rejected(handler):
