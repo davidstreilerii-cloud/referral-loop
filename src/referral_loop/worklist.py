@@ -96,11 +96,18 @@ questions:
     name the same host:port the request was addressed to. Otherwise
     `Sec-Fetch-Site` must say `same-origin` or `none` (`none` is a user-initiated
     navigation, which no page can forge). With neither header the request is
-    refused unless it is `application/json` -- a content type no CORS-simple
-    request can carry, so a browser that sends neither header, as IE11 and
-    Firefox before 70 do not, still cannot forge one. GET and HEAD are not
-    Origin-checked: an ordinary page load from a bookmark carries no Origin, and
-    the Host rule already closes the read.
+    refused unless it is `application/json`; that carve-out is reachable only
+    when `Origin` is absent, and every browser mechanism that can put a JSON body
+    on a cross-site request is a CORS request and therefore sends one. GET and
+    HEAD are not Origin-checked: an ordinary page load from a bookmark carries no
+    Origin, and the Host rule already closes the read.
+
+The cost of that last rule, stated where it will be found: **the coordinator's
+own page stops working on a browser that sends neither header** -- IE11, Firefox
+before 70. Its forms post url-encoded, so a same-origin acknowledgement from one
+of those is refused exactly as a forged one is. The gate cannot tell them apart,
+and this is the direction it was told to fail in. A site still on such a browser
+needs the fix to be a trusted-origin list, not a loosened default.
 
 What is still unprotected
 -------------------------
@@ -110,13 +117,19 @@ be recorded as whatever name and role they typed. The gate above stops a remote
 web page from driving the coordinator's browser; it stops nobody who is already
 on the host. That is a real gap, not a bounded one.
 
-The answer to it is still an authenticating reverse proxy, and this gate does not
-currently admit one: rewriting Host to loopback gets reads through, but the
-browser's Origin then names the proxy's hostname and every action is refused.
-Fronting this page is therefore a code change here -- a configured list of
-trusted origins -- and not a deployment exercise. Saying so is the point; the
-version of this docstring that claimed the loopback bind bounded the missing
-authentication is the reason this gate had to be written at all.
+The answer to it is still an authenticating reverse proxy, and this gate admits
+one on configuration alone. The proxy must rewrite Host to the loopback name and
+port it forwards to, and then do either of:
+
+  * forward the browser's `Sec-Fetch-Site`, stripping `Origin`; or
+  * rewrite `Origin` to match the Host it forwards.
+
+Both are one `proxy_set_header` line, and neither weakens the gate: a proxy that
+strips `Origin` still forwards `Sec-Fetch-Site: cross-site` on a genuinely
+cross-site post, and one that rewrites `Origin` still cannot manufacture a
+`Sec-Fetch-Site` the browser did not send. Pinned by tests, because this
+paragraph is a claim about behaviour and the first draft of it was wrong: it said
+fronting this page needed a code change, which was never true.
 """
 from __future__ import annotations
 
@@ -463,59 +476,84 @@ def _payload():
     return request.get_json(silent=True) or request.form or {}
 
 
+def _refuse_a_request_this_page_did_not_originate():
+    """Host and Origin validation. See the module docstring for the threat.
+
+    Registered twice, on the app in `create_app` and on the blueprint in
+    `create_blueprint`, because the two placements cover different things and
+    neither covers the other:
+
+      * A blueprint's `before_request` runs only once a rule *in that blueprint*
+        has matched. It therefore never runs for a routing failure -- and
+        `GET /worklist`, without the trailing slash, is one: routing raises
+        RequestRedirect before matching anything, and Werkzeug builds the
+        redirect target out of the Host header. Registered only on the blueprint,
+        this gate let that request through and reflected the caller's Host into
+        both the Location header and the redirect body. The same held for the
+        404s and for `/static/<path:filename>`, which `Flask(__name__)` registers
+        and the blueprint does not.
+      * The app hook only exists on the app `create_app` builds. Keeping the
+        blueprint hook means the gate travels with the routes: an app assembled
+        by hand that registers this blueprint still cannot mount the queues
+        without it.
+
+    Running twice on one request is harmless and deliberate. This reads request
+    headers and returns either None or a response; it holds no state and changes
+    none, so the second call reaches the same answer as the first. When the app
+    hook refuses, Flask short-circuits and the blueprint hook never runs at all.
+
+    The bind check in `make_worklist_server` is a third control answering a
+    different question again, and does not stand in for this one.
+
+    Nothing caller-controlled is echoed or logged. The Host and the Origin are
+    attacker-chosen strings, and a response body and a log record are two of the
+    four artifacts spec test 14 greps -- reflecting a refused Host would make
+    this gate the leak it exists to prevent.
+    """
+    host = request.headers.get("Host")
+    if host is None or not _is_loopback_host(host):
+        logger.warning("Worklist request refused: Host is not a loopback name")
+        return jsonify({"error": "This service answers on loopback names only"}), 403
+
+    if request.method in _SAFE_METHODS:
+        return None
+
+    origin = request.headers.get("Origin")
+    if origin is not None:
+        if _is_same_origin(origin, host):
+            return None
+        logger.warning("Worklist action refused: cross-origin request")
+        return jsonify({"error": "Cross-origin requests may not change anything"}), 403
+
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None:
+        if site.strip().lower() in _SAME_ORIGIN_FETCH_SITES:
+            return None
+        logger.warning("Worklist action refused: cross-site request")
+        return jsonify({"error": "Cross-origin requests may not change anything"}), 403
+
+    # Neither header, so this is an old browser or not a browser at all. What
+    # makes the carve-out below safe is not the CORS-simple list -- that list has
+    # had exceptions -- but the reachability of this branch: it is reachable only
+    # when Origin is absent, and every browser mechanism that can put a JSON body
+    # on a cross-site request is a CORS request, which always carries one. So a
+    # cross-site JSON post cannot arrive here at all; anything that does is a
+    # local caller, which this page does not authenticate anyway.
+    if request.is_json:
+        return None
+    logger.warning("Worklist action refused: no evidence the request is same-origin")
+    return jsonify({
+        "error": "A state-changing request must carry an Origin, or be application/json"
+    }), 403
+
+
 def create_blueprint(store: LoopStore, registry: Registry, pack: RulePack) -> Blueprint:
     bp = Blueprint("worklist", __name__, url_prefix="/worklist")
     base = "/worklist"
 
-    # -------------------------------------------------------------- the gate
-
-    @bp.before_request
-    def _refuse_a_request_this_page_did_not_originate():
-        """Host and Origin validation. See the module docstring for the threat.
-
-        Registered on the blueprint rather than on the app `create_app` builds,
-        so it travels with the routes: any app that registers this blueprint gets
-        it, and there is no way to mount the queues without it. The bind check in
-        `make_worklist_server` is a different control answering a different
-        question and does not stand in for this one.
-
-        Nothing caller-controlled is echoed or logged. The Host and the Origin are
-        attacker-chosen strings, and a response body and a log record are two of
-        the four artifacts spec test 14 greps -- reflecting a refused Host would
-        make this gate the leak it exists to prevent.
-        """
-        host = request.headers.get("Host")
-        if host is None or not _is_loopback_host(host):
-            logger.warning("Worklist request refused: Host is not a loopback name")
-            return jsonify({"error": "This service answers on loopback names only"}), 403
-
-        if request.method in _SAFE_METHODS:
-            return None
-
-        origin = request.headers.get("Origin")
-        if origin is not None:
-            if _is_same_origin(origin, host):
-                return None
-            logger.warning("Worklist action refused: cross-origin request")
-            return jsonify({"error": "Cross-origin requests may not change anything"}), 403
-
-        site = request.headers.get("Sec-Fetch-Site")
-        if site is not None:
-            if site.strip().lower() in _SAME_ORIGIN_FETCH_SITES:
-                return None
-            logger.warning("Worklist action refused: cross-site request")
-            return jsonify({"error": "Cross-origin requests may not change anything"}), 403
-
-        # Neither header: an old browser, or not a browser. Told apart by the one
-        # thing a browser will not let a cross-site request forge -- a content
-        # type outside the CORS-simple set, which needs a preflight this server
-        # answers with no CORS header at all.
-        if request.is_json:
-            return None
-        logger.warning("Worklist action refused: no evidence the request is same-origin")
-        return jsonify({
-            "error": "A state-changing request must carry an Origin, or be application/json"
-        }), 403
+    # The gate. Also registered on the app in `create_app`, which is what covers
+    # the requests that never match a rule here; see the function's own docstring.
+    bp.before_request(_refuse_a_request_this_page_did_not_originate)
 
     # ------------------------------------------------------------ error handlers
 
@@ -826,6 +864,9 @@ def _recent_merges(store: LoopStore) -> list[dict]:
 
 def create_app(store: LoopStore, registry: Registry, pack: RulePack) -> Flask:
     app = Flask(__name__)
+    # Before the blueprint's own copy, and covering what that one cannot: routing
+    # failures, and the /static route Flask registers here rather than there.
+    app.before_request(_refuse_a_request_this_page_did_not_originate)
     app.register_blueprint(create_blueprint(store, registry, pack))
     return app
 

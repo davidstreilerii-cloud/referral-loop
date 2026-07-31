@@ -28,6 +28,7 @@ from healthcare_rag.referral_loop.registry import Registry
 from healthcare_rag.referral_loop.store import LoopStore
 from healthcare_rag.referral_loop.worklist import (
     create_app,
+    create_blueprint,
     make_worklist_server,
 )
 from tests.referral_loop.test_matcher import PACK
@@ -1047,6 +1048,59 @@ def test_the_coordinator_s_own_browser_still_reads_and_acts(http, registry):
     assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
 
 
+def test_a_route_that_redirects_before_matching_is_still_gated(http, registry):
+    """The blueprint hook is not enough, and this is the request that proves it.
+
+    Flask runs a blueprint's before_request only once a rule in that blueprint has
+    matched. `/worklist` without the trailing slash matches nothing: routing
+    raises RequestRedirect first, so a gate registered only on the blueprint never
+    runs -- and Werkzeug builds the redirect target out of the Host header, which
+    put the caller's own string into the Location header and the HTML body.
+    """
+    _resulted(registry)
+    response = _raw(http).get(f"http://{MRN_SENTINEL}.evil.com/worklist")
+    assert response.status_code == 403
+    assert MRN_SENTINEL not in response.headers.get("Location", "")
+    assert MRN_SENTINEL not in response.data.decode()
+
+
+@pytest.mark.parametrize("path", [
+    "/nope",                  # routing produces a 404, matching no blueprint rule
+    "/static/anything.css",   # registered by Flask(__name__), not by the blueprint
+    "/worklist",              # routing produces a 308 before any rule matches
+])
+def test_the_gate_covers_requests_that_match_no_blueprint_rule(http, registry, path):
+    """Everything the app answers, not merely everything the blueprint answers."""
+    _resulted(registry)
+    assert _raw(http).get(f"http://evil.com{path}").status_code == 403
+
+
+def test_the_gate_travels_onto_an_app_that_only_registers_the_blueprint(stack):
+    """The other half: mounting the queues somewhere else must not shed the gate.
+
+    This is why the hook stays on the blueprint as well as on the app -- an app
+    built by hand rather than by create_app still gets it.
+    """
+    from flask import Flask
+
+    _, registry, store = stack
+    other = Flask("some_other_host_app")
+    other.register_blueprint(create_blueprint(store, registry, PACK))
+    client = other.test_client()
+
+    assert client.get("http://evil.com/worklist/?format=json").status_code == 403
+    assert client.get("http://127.0.0.1:5057/worklist/?format=json").status_code == 200
+
+
+def test_a_loopback_request_that_redirects_still_redirects(http, registry):
+    """The negative control for the gate running earlier: a coordinator who types
+    the URL without the trailing slash must still be sent to the page."""
+    _resulted(registry)
+    response = _raw(http).get("http://127.0.0.1:5057/worklist")
+    assert response.status_code == 308
+    assert response.headers["Location"].endswith("/worklist/")
+
+
 def test_an_https_origin_on_this_http_server_is_not_same_origin(http, registry):
     """The scheme is part of an origin. Nothing serves this page over TLS, so an
     https Origin naming the same host:port is a different origin than the one the
@@ -1057,6 +1111,59 @@ def test_an_https_origin_on_this_http_server_is_not_same_origin(http, registry):
         f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
         json={"actor": "a", "role": "r"},
         headers={"Origin": "https://127.0.0.1:5057"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+@pytest.mark.parametrize("proxy_headers", [
+    # The proxy forwards the browser's Sec-Fetch-Site and strips Origin.
+    {"Sec-Fetch-Site": "same-origin"},
+    # The proxy rewrites Origin to the loopback upstream it forwards to.
+    {"Origin": "http://127.0.0.1:5057"},
+])
+def test_an_authenticating_proxy_gets_through_on_configuration_alone(
+        http, registry, proxy_headers):
+    """The module docstring says fronting this page needs only a Host rewrite plus
+    one of these two headers. That is a claim about behaviour, so it is asserted
+    rather than written down -- the previous draft of that paragraph said a code
+    change was required and was simply wrong."""
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        data={"actor": "coordinator-a", "role": "referral_coordinator"},
+        headers=proxy_headers,
+    )
+    assert response.status_code == 200, response.data
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+
+def test_a_proxy_that_strips_origin_still_refuses_a_genuine_cross_site_post(http, registry):
+    """The other half of that claim: the first proxy shape leans on a header the
+    browser sets itself, so stripping Origin does not hand an attacker the page."""
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        data={"actor": "Dr Nobody", "role": "coordinator"},
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+def test_the_coordinator_s_own_page_breaks_on_a_browser_sending_neither_header(
+        http, registry):
+    """The stated cost of the rule, pinned so it cannot be quietly forgotten.
+
+    This is the *same-origin* acknowledgement a coordinator's own click produces
+    on IE11 or Firefox before 70: url-encoded, no Origin, no Sec-Fetch-Site. The
+    gate cannot tell it from a forged one and refuses it. Asserted here so the
+    docstring's warning is a fact about the code rather than a note about it.
+    """
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        data={"actor": "coordinator-a", "role": "referral_coordinator"},
     )
     assert response.status_code == 403
     assert registry.get(loop_id).state is LoopState.RESULTED
