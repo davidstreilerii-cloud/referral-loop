@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from .clock import is_readable_clock
 from .errors import PackVerificationError
 from .events import Loop, LoopState, MatchResult, ParsedMessage
 from .pack import RulePack
@@ -211,6 +212,15 @@ def hl7_datetime(raw: str) -> datetime | None:
     A TS with no offset is site-local time. Treating it as UTC is consistent
     across the order and the result, so the window arithmetic (a difference) is
     unaffected as long as the feed is internally consistent.
+
+    **A syntactically valid year is not a real one.** The window is bounded here
+    (`clock.is_readable_clock`) rather than at each caller, because leaving it to
+    callers is precisely what failed: the registry's clinical watermark, the
+    registry's ordering guard and a loop's `ordered_at` each consumed whatever
+    four digits of year could express, and `99991231235959` broke all three in
+    different ways. Enforced by the function making the claim, for the same
+    reason `staleness.require_thresholds_accepted` is called by `is_stale`
+    itself rather than documented as a precondition.
     """
     text = (raw or "").split("~", 1)[0].split("^", 1)[0].strip()
     if not text:
@@ -230,13 +240,17 @@ def hl7_datetime(raw: str) -> datetime | None:
 
     padded = text[:14].ljust(14, "0")
     try:
-        return datetime(
+        parsed = datetime(
             int(padded[0:4]), int(padded[4:6]), int(padded[6:8]),
             int(padded[8:10]), int(padded[10:12]), int(padded[12:14]),
             tzinfo=tzinfo,
         )
     except ValueError:
         return None
+    # Out of the window is the same answer as unparseable, and for the same
+    # reason: None already means "this timestamp cannot be trusted", and every
+    # caller already has a defined behaviour for it.
+    return parsed if is_readable_clock(parsed) else None
 
 
 def _observed_at(message: ParsedMessage, pack: RulePack) -> datetime | None:

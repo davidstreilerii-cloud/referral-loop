@@ -50,6 +50,7 @@ from healthcare_rag.referral_loop.mllp import CR, FS, VT, frame
 from healthcare_rag.referral_loop.mllp_server import DESYNC_GRACE_SECONDS
 from healthcare_rag.referral_loop.parse_hl7 import parse_hl7_text
 from healthcare_rag.referral_loop.registry import Registry
+from healthcare_rag.referral_loop.staleness import is_stale, staleness_ratio
 from healthcare_rag.referral_loop.store import LoopStore
 from tests.referral_loop.test_matcher import PACK
 
@@ -112,12 +113,12 @@ def obr(placer: str = PLACER, filler: str = FILLER, when: str = ORDERED_AT) -> s
 
 def order(control_id: str = "CTRL_ORM", mrn: str = MRN, placer: str = PLACER,
           filler: str = FILLER, message_at: str = ORDERED_AT,
-          message_type: str = "ORM^O01") -> str:
+          message_type: str = "ORM^O01", observed_at: str = ORDERED_AT) -> str:
     return message(
         msh(message_type, control_id, message_at),
         pid(mrn),
         segment("ORC", {1: "NW", 2: placer}),
-        obr(placer, filler),
+        obr(placer, filler, observed_at),
     )
 
 
@@ -745,6 +746,115 @@ def test_message_at_is_stamped_on_every_message_driven_event(handler):
     handler.handle(order())
     created = handler.store.events_for(loops(handler)[0].loop_id)[0]
     assert created.detail["message_at"].startswith("2026-07-24T08:00:00")
+
+
+# ------------------------------------------------------- one clock-skew policy
+# Three findings with one root cause: an attacker-controlled timestamp consumed
+# with no upper bound. Proved here on the wire, because each one is a sequence
+# of real messages a coordinator would never see go wrong.
+
+
+def _control_ids_on(handler, loop_id) -> list[str]:
+    return [event.control_id for event in handler.store.events_for(loop_id)]
+
+
+def test_a_year_9999_result_cannot_deafen_a_loop_to_its_own_correction(handler):
+    """H1 on the wire, the clinically severe version.
+
+    An ORU matching at tier 1 -- the placer number the ordering feed already
+    knows -- stamped MSH-7=99991231235959. The watermark is a max() over an
+    append-only log, so once it reads year 9999 every later message for that
+    loop is refused: the final report, the correction, the cancellation. A
+    coordinator acknowledges what looks like a normal final read, the genuine
+    amendment arrives saying the prior read was preliminary, and it is silently
+    refused while the worklist goes on reporting the loop handled.
+    """
+    handler.handle(order())
+    handler.handle(result(control_id="ORU_F", obx11="F", message_at="20260725120000"))
+    loop_id = loops(handler)[0].loop_id
+    handler.registry.acknowledge(
+        loop_id, actor="coord1", role="coordinator", control_id="ACK1"
+    )
+    assert handler.store.replay(loop_id).state is LoopState.ACKNOWLEDGED
+
+    handler.handle(
+        result(control_id="ORU_9999", obx11="F", value="poison",
+               message_at="99991231235959")
+    )
+    ack = handler.handle(
+        result(control_id="ORU_CORR", obx11="C",
+               value="3cm mass, prior read was preliminary",
+               message_at="20260726120000")
+    )
+
+    assert ack_code(ack) == "AA"
+    applied = _control_ids_on(handler, loop_id)
+    assert "ORU_CORR" in applied, "the genuine amendment must be applied, not refused"
+    assert "ORU_9999" not in applied, "and the message that could poison the loop must not be"
+    assert handler.registry._latest_result_status(loop_id) == "C"
+
+    loop = handler.store.replay(loop_id)
+    assert loop.state is LoopState.RESULTED
+    assert not loop.ack_at, "safety rule 2 must clear the acknowledgement"
+    assert handler.store.resulted_unacknowledged(MRN), "and put it back on a queue"
+
+
+@pytest.mark.parametrize("msh7", ["", "X"])
+def test_a_cancel_with_an_unreadable_msh7_cannot_close_a_watermarked_loop(handler, msh7):
+    """H2. Omitting MSH-7 disabled the only anti-replay control in the system.
+
+    `CANCELLED` appears in neither open_loops() nor resulted_unacknowledged(),
+    so a cancel that lands on a scheduled loop takes a clinically open referral
+    off every coordinator queue at once -- which is the failure this product
+    exists to prevent, caused by the product.
+    """
+    handler.handle(order())
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
+    assert loops(handler)[0].state is LoopState.SCHEDULED
+
+    ack = handler.handle(scheduling("S2", "SIU^S15", placer=PLACER, message_at=msh7))
+
+    assert ack_code(ack) == "AA", "archived and routed for review, not retried forever"
+    assert loops(handler)[0].state is LoopState.SCHEDULED
+    assert handler.store.open_loops(MRN), "the loop must stay on a coordinator's queue"
+    assert handler.stale_message_count == 1
+
+
+def test_a_future_dated_order_still_ages_and_can_turn_stale(handler, monkeypatch):
+    """M7. `staleness.age()` clamps a future `ordered_at` to zero -- correctly,
+    the failure matrix says clamp and flag elsewhere -- so an OBR-7 in the
+    future left `is_stale` permanently False and `staleness_ratio` permanently
+    0.0, which the worklist sorts dead last. No STALE badge, no counter, no log
+    line: on a queue of a few hundred the loop is functionally invisible. The
+    clamp is not the bug; the missing flag is.
+    """
+    monkeypatch.setenv("REFERRAL_THRESHOLDS_ACCEPTED", "1")
+    now = datetime.now(timezone.utc)
+    ahead = (now + timedelta(days=30)).strftime("%Y%m%d%H%M%S")
+
+    handler.handle(order(observed_at=ahead))
+
+    loop = loops(handler)[0]
+    # Past this pack's `_default` threshold of 336h. A clamped loop reports 0.0
+    # at every `now` there will ever be, so the assertion fails on the defect
+    # rather than on the size of the window chosen here.
+    later = now + timedelta(days=30)
+    assert is_stale(loop, later, PACK) is True
+    assert staleness_ratio(loop, later, PACK) > 1.0
+    assert handler.future_dated_order_count == 1
+
+
+def test_a_year_2099_order_still_ages_and_can_turn_stale(handler, monkeypatch):
+    """The same defect one layer up: an OBR-7 no clock could produce is refused
+    by the parse, and the loop then ages from ingest like any order whose OBR-7
+    was absent -- visible, rather than pinned to the bottom of the queue."""
+    monkeypatch.setenv("REFERRAL_THRESHOLDS_ACCEPTED", "1")
+    handler.handle(order(observed_at="20991231120000"))
+
+    loop = loops(handler)[0]
+    later = datetime.now(timezone.utc) + timedelta(days=30)
+    assert is_stale(loop, later, PACK) is True
+    assert staleness_ratio(loop, later, PACK) > 1.0
 
 
 # ------------------------------------------------------------------- MLLP wire

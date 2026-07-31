@@ -25,10 +25,12 @@ implemented:
      thing that varies between hospitals (spec section 5), so this module reads
      concepts through `matcher.result_key_from_message` and owns no field map of
      its own.
-  3. **MSH-7 travels with every message-driven transition.** The registry's
-     staleness watermark fails open on `message_at=None`, so a listener that did
-     not pass it would leave the guard inert for live traffic and let a
-     clinically older message silently regress a loop.
+  3. **MSH-7 travels with every message-driven transition.** A listener that did
+     not pass it would leave the registry's staleness watermark with nothing to
+     compare and let a clinically older message silently regress a loop. Because
+     it now always travels, the registry no longer fails open on an unreadable
+     one for a destructive transition -- a blank `MSH-7` used to switch the guard
+     off outright (see `Registry._refuse_if_stale`).
 
 **Content-key idempotency.** `MSH-10` dedup alone is insufficient, and the
 design manufactures the gap itself: section 6 requires `AE` so the engine queues
@@ -63,6 +65,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from .clock import MAX_CLOCK_SKEW, is_future_dated
 from .errors import (
     CircularMergeError,
     FramingError,
@@ -289,6 +292,13 @@ class MessageHandler:
         self.mrn_reresolution_count = 0
         self.mrn_retired_count = 0
         self.suspect_truncation_count = 0
+        # A clock, not a message, is what went wrong here: an OBR-7 dated beyond
+        # MAX_CLOCK_SKEW, declined so the loop ages from ingest rather than never
+        # (see _ordered_at). Its MSH-7 counterpart -- a stamp dropped rather than
+        # allowed to poison a watermark -- is Registry.future_dated_message_count,
+        # because that decision belongs to the state machine and the CLI reaches
+        # it without passing through here.
+        self.future_dated_order_count = 0
 
     # --------------------------------------------------------------- entry point
 
@@ -535,10 +545,12 @@ class MessageHandler:
     def _message_at(self, message: ParsedMessage) -> datetime | None:
         """MSH-7, or None when it cannot be read.
 
-        None means "unknown", and the registry's watermark deliberately fails
-        open on it -- an unreadable clock must not refuse traffic. Passing it at
-        all is the point: without it the guard never compares anything, and a
-        clinically older message silently regresses a loop.
+        None means "unknown" -- empty, not a timestamp, or a year no clock could
+        produce (`clock.is_readable_clock`). It is not a fail-open: the registry
+        refuses an unknown clock on a destructive transition once the loop
+        carries a watermark, because a blank MSH-7 was enough to disable the
+        ordering guard entirely. Passing it at all is the point: without it the
+        guard never compares anything.
         """
         return hl7_datetime(field_value(message, _MSH_DATETIME_REF))
 
@@ -557,9 +569,38 @@ class MessageHandler:
             # wrote this field would make that rule a permanent no-op and every
             # ambiguity it should have resolved would route to a coordinator.
             ordering_provider=key.ordering_provider,
-            ordered_at=key.observed_at,
+            ordered_at=self._ordered_at(key.observed_at, message.control_id),
             message_at=self._message_at(message),
         )
+
+    def _ordered_at(self, observed_at: datetime | None, control_id: str) -> datetime | None:
+        """OBR-7, unless it is dated further ahead than a clock can be wrong.
+
+        `staleness.age()` clamps a future `ordered_at` to zero -- correctly; the
+        failure matrix says accept the message, clamp for staleness math, and
+        flag elsewhere. Nothing flagged. So an `OBR-7` of `20991231120000` opened
+        a loop reporting `0.0 h` that could never age out, never turn red and
+        never rise: `is_stale` permanently False, `staleness_ratio` permanently
+        0.0, which `worklist._sort_key` maps to `-0.0` -- dead last, forever, with
+        no STALE badge, no counter and no log line. On a queue of a few hundred
+        that loop is functionally invisible. This is the flag, not a second clamp.
+
+        Declining the value leaves `open_loop` to default `ordered_at` to the
+        moment of ingest, which is what it already does for an order carrying no
+        `OBR-7` at all: the loop then ages from when we first heard of it and
+        reaches the worklist's stale band on the ordinary schedule. Honest, and
+        the opposite of invisible.
+        """
+        if observed_at is None or not is_future_dated(observed_at):
+            return observed_at
+        self.future_dated_order_count += 1
+        logger.warning(
+            "Order %r carries an observation time beyond the clock-skew window (%s); opening "
+            "the loop without it, so it ages from ingest instead of never (%d so far). Either "
+            "a sender's clock is wrong or a message is forged; both need a human.",
+            control_id, MAX_CLOCK_SKEW, self.future_dated_order_count,
+        )
+        return None
 
     def _open_loop_retrying(self, *, mrn: str, **kwargs) -> str:
         """Open a loop, re-resolving if the MRN retired underneath us.

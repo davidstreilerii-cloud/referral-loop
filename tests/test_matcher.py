@@ -744,6 +744,42 @@ def test_date_only_timestamp_parses_to_midnight_utc():
     assert hl7_datetime("20260725") == datetime(2026, 7, 25, 0, 0, tzinfo=timezone.utc)
 
 
+# ------------------------------------------------ the parse window is bounded
+# Four digits of year is not evidence that a year is real. Every consumer of
+# this function reasons over the number it hands back -- the registry's clinical
+# watermark, the ordering guard, a loop's `ordered_at` -- and each one used to
+# trust whatever a TS could express. The bound lives here, at the function that
+# makes the claim, for the same reason staleness.require_thresholds_accepted is
+# called by is_stale rather than documented as a precondition: three separate
+# callers already forgot.
+
+
+def test_a_year_9999_timestamp_is_not_a_readable_clock():
+    """The MSH-7 that poisoned a loop's watermark permanently. The watermark is
+    a max() over an append-only log, so a stamp it should never have taken can
+    never be lowered again and every later message for that loop is refused."""
+    assert hl7_datetime("99991231235959") is None
+
+
+def test_a_timestamp_from_before_living_memory_is_not_a_readable_clock():
+    assert hl7_datetime("18801231235959") is None
+
+
+def test_a_decade_old_timestamp_still_parses():
+    """The past bound stays wide on purpose: a prior study's OBR-7 is
+    legitimately years old, and a narrow one would discard real history."""
+    old = datetime.now(timezone.utc) - timedelta(days=3650)
+    assert hl7_datetime(old.strftime("%Y%m%d%H%M%S")) is not None
+
+
+def test_a_timestamp_half_a_day_ahead_still_parses():
+    """Ordinary RIS clock skew reads as a timestamp. Whether it may be *trusted*
+    as this message's clock is a narrower question each consumer asks with
+    MAX_CLOCK_SKEW; conflating the two would reject real traffic here."""
+    ahead = datetime.now(timezone.utc) + timedelta(hours=12)
+    assert hl7_datetime(ahead.strftime("%Y%m%d%H%M%S")) is not None
+
+
 # ==================================================== the field map drives it
 
 

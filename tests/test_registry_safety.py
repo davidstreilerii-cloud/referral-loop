@@ -382,13 +382,114 @@ def test_a_naive_message_timestamp_is_compared_as_utc(registry):
     assert registry.get(loop_id).state is LoopState.RESULTED
 
 
-def test_an_unknown_message_time_neither_blocks_nor_is_blocked(registry):
-    """Task 10 does not yet pass MSH-7. message_at=None must keep the loop
-    working rather than refusing every message."""
+def test_an_unstamped_message_applies_to_a_loop_that_carries_no_watermark(registry):
+    """The fail-open survives exactly where there is nothing to regress. A loop
+    nobody has stamped has no clinical ordering to protect, so refusing here
+    would refuse a whole site's traffic to defend nothing."""
     loop_id = registry.open_loop(mrn="MRN1", control_id="C1")
-    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=T2)
-    registry.record_result(loop_id, obx11="C", control_id="C3")
+    registry.record_result(loop_id, obx11="F", control_id="C2")
     assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+# ------------------------------------------------------ one clock-skew policy
+# Three findings, one bug: an attacker-controlled timestamp consumed with no
+# upper bound. MSH-7 into the watermark (below), MSH-7 omitted to disable the
+# guard (below), OBR-7 into `ordered_at` (test_listener). The bound is one
+# constant, clock.MAX_CLOCK_SKEW, read at every ingest site.
+
+
+def _beyond_skew() -> datetime:
+    """Far enough ahead that no clock is this wrong, near enough that the parse
+    still reads it -- the band where the registry, not the parser, must act."""
+    return datetime.now(timezone.utc) + timedelta(days=30)
+
+
+def test_a_future_dated_message_does_not_advance_the_watermark(registry):
+    """H1. `_clinical_watermark` is a max() over an append-only log: a stamp it
+    should never have taken can never afterwards be lowered."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="P", control_id="C2", message_at=_beyond_skew())
+    assert registry._clinical_watermark(loop_id) == T0
+
+
+def test_a_future_dated_message_is_still_applied(registry):
+    """Drop the stamp, not the message. A RIS running fast is endemic, and
+    refusing its traffic would strand the results this system exists to keep."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=_beyond_skew())
+    assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+def test_a_dropped_stamp_is_counted(registry):
+    """A silently dropped stamp is how this stayed invisible. A clock this wrong
+    is an interface incident somebody has to be able to see."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=_beyond_skew())
+    assert registry.future_dated_message_count == 1
+
+
+def test_a_future_dated_result_cannot_deafen_a_loop_to_its_own_correction(registry):
+    """H1's clinical sequence, end to end.
+
+    A future-dated read lands, a coordinator acknowledges what looks like a
+    normal final, and then the genuine amendment arrives. With the watermark
+    poisoned the amendment is refused, the corrected finding exists only as a
+    log line, and the worklist goes on reporting the loop handled.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=T1)
+    registry.record_result(loop_id, obx11="F", control_id="C3", message_at=_beyond_skew())
+    registry.acknowledge(loop_id, actor="coord1", role="coordinator", control_id="C4")
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+    registry.record_result(loop_id, obx11="C", control_id="C5", message_at=T2)
+
+    loop = registry.get(loop_id)
+    assert loop.state is LoopState.RESULTED, "the amendment must reopen the loop"
+    assert not loop.ack_at, "safety rule 2 must still clear the acknowledgement"
+    assert "C5" in [event.control_id for event in registry.store.events_for(loop_id)]
+
+
+def test_an_unstamped_cancel_cannot_regress_a_watermarked_loop(registry):
+    """H2. `CANCELLED` appears in neither open_loops() nor
+    resulted_unacknowledged(), so an unstamped SIU^S15 naming a scheduled loop
+    took a clinically open referral off every coordinator queue at once."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.schedule(loop_id, control_id="C2", message_at=T2)
+    with pytest.raises(StaleMessageError):
+        registry.cancel(loop_id, control_id="C3")
+    assert registry.get(loop_id).state is LoopState.SCHEDULED
+
+
+def test_an_unstamped_result_cannot_regress_a_watermarked_loop(registry):
+    """The same hole under record_result: an unstamped final landing on top of
+    an applied correction would re-arm acknowledgement on a superseded read."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="C", control_id="C2", message_at=T2)
+    with pytest.raises(StaleMessageError):
+        registry.record_result(loop_id, obx11="F", control_id="C3")
+    assert registry._latest_result_status(loop_id) == "C"
+
+
+def test_an_unstamped_attachment_is_not_refused(registry):
+    """A coordinator attaching an orphan is a human decision routed through
+    record_result, not a replayed message, and it carries no MSH-7 for the same
+    reason acknowledge() carries none. Refusing it for the absence would close
+    the orphan queue's only exit -- which the first draft of this guard did, to
+    six tests in test_eval and test_orphan_attach."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=T2)
+    registry.record_result(loop_id, obx11="C", control_id="C3", attached_from="O-1")
+    assert registry._latest_result_status(loop_id) == "C"
+
+
+def test_an_unstamped_schedule_keeps_the_fail_open(registry):
+    """OPEN -> SCHEDULED hides nothing: both states are in `_OPEN_STATES` and
+    both are staleable, so a replayed SIU^S12 costs a coordinator nothing.
+    Refusing it would trade a real refusal for no protection at all."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T2)
+    registry.schedule(loop_id, control_id="C2")
+    assert registry.get(loop_id).state is LoopState.SCHEDULED
 
 
 # ------------------------------------------------- _latest_result_status probes

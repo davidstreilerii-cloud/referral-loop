@@ -135,6 +135,7 @@ from .audit import (
     RefusalCode,
     audited,
 )
+from .clock import MAX_CLOCK_SKEW, is_future_dated
 from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
 from .events import LabelType, Loop, LoopEvent, LoopState
 from .store import LoopStore
@@ -246,6 +247,12 @@ class Registry:
         # on _materialize says the same; that is a deployment constraint, not
         # something this module can express.
         self._lock = threading.RLock()
+        # A counter, not metrics plumbing -- the same shape the listener's
+        # counters have. A message dated beyond MAX_CLOCK_SKEW is applied
+        # without advancing the watermark (see _stamp), and that decision has to
+        # be countable: a stamp dropped silently is exactly how an unbounded
+        # MSH-7 poisoning a loop forever went unnoticed in the first place.
+        self.future_dated_message_count = 0
 
     def get(self, loop_id: str) -> Loop:
         return self.store.replay(loop_id)
@@ -342,6 +349,7 @@ class Registry:
                             "ordered_at": (ordered_at or _now()).isoformat(),
                         },
                         message_at,
+                        control_id,
                     ),
                 )
             )
@@ -368,7 +376,9 @@ class Registry:
             LoopEvent(
                 loop_id, "orphaned", _now(), control_id,
                 self._stamp(
-                    {**detail, "mrn": mrn, "submitted_mrn": submitted_mrn or mrn}, message_at
+                    {**detail, "mrn": mrn, "submitted_mrn": submitted_mrn or mrn},
+                    message_at,
+                    control_id,
                 ),
             )
         )
@@ -628,7 +638,10 @@ class Registry:
                 raise ReferralLoopError(f"Cannot schedule a loop in state {loop.state}")
             self._refuse_if_stale(loop_id, message_at, "schedule")
             self.store.append_event(
-                LoopEvent(loop_id, "scheduled", _now(), control_id, self._stamp({}, message_at))
+                LoopEvent(
+                    loop_id, "scheduled", _now(), control_id,
+                    self._stamp({}, message_at, control_id),
+                )
             )
 
     def cancel(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
@@ -639,9 +652,15 @@ class Registry:
                     f"Cannot cancel a loop in state {loop.state}: an order that already produced "
                     "a result cannot be un-ordered, and CANCELLED appears on no worklist"
                 )
-            self._refuse_if_stale(loop_id, message_at, "cancel")
+            # Destructive: CANCELLED appears in neither open_loops() nor
+            # resulted_unacknowledged(), so a cancel applied on an unreadable
+            # clock takes a clinically open referral off every queue at once.
+            self._refuse_if_stale(loop_id, message_at, "cancel", require_message_time=True)
             self.store.append_event(
-                LoopEvent(loop_id, "cancelled", _now(), control_id, self._stamp({}, message_at))
+                LoopEvent(
+                    loop_id, "cancelled", _now(), control_id,
+                    self._stamp({}, message_at, control_id),
+                )
             )
 
     def record_result(
@@ -690,7 +709,15 @@ class Registry:
             if obx11 not in (PRELIMINARY, FINAL, CORRECTED):
                 raise ReferralLoopError(f"Unhandled OBX-11 status: {obx11!r}")
 
-            self._refuse_if_stale(loop_id, message_at, f"result {obx11!r}")
+            # Destructive: a result supersedes the read a coordinator
+            # acknowledged, and one applied out of clinical order re-arms an
+            # acknowledgement on a read that a correction has already replaced.
+            # `attached_from` is the exception -- a human's attachment, not a
+            # message, carrying no MSH-7 by design (see _refuse_if_stale).
+            self._refuse_if_stale(
+                loop_id, message_at, f"result {obx11!r}",
+                require_message_time=not attached_from,
+            )
 
             provenance: dict = {"obx11": obx11}
             if match_tier is not None:
@@ -703,13 +730,14 @@ class Registry:
             # because that acknowledgement was made against a read this message
             # supersedes.
             if obx11 == CORRECTED or loop.state is LoopState.ACKNOWLEDGED:
-                detail = self._stamp({**provenance, **_CLEARED_ACK}, message_at)
+                detail = self._stamp({**provenance, **_CLEARED_ACK}, message_at, control_id)
                 self.store.append_event(LoopEvent(loop_id, "reopened", _now(), control_id, detail))
                 return
 
             self.store.append_event(
                 LoopEvent(
-                    loop_id, "resulted", _now(), control_id, self._stamp(provenance, message_at)
+                    loop_id, "resulted", _now(), control_id,
+                    self._stamp(provenance, message_at, control_id),
                 )
             )
 
@@ -1224,9 +1252,35 @@ class Registry:
         event = self._latest_result_event(loop_id)
         return event.detail.get(_MATCH_TIER) if event else None
 
-    @staticmethod
-    def _stamp(detail: dict, message_at: datetime | None) -> dict:
+    def _stamp(self, detail: dict, message_at: datetime | None, control_id: str) -> dict:
+        """Record this message's MSH-7 on the event, unless the clock forbids it.
+
+        A message dated beyond `MAX_CLOCK_SKEW` is applied but **not stamped**.
+        `_clinical_watermark` is a max() over an append-only log, so a stamp
+        taken from a clock running years fast can never afterwards be lowered,
+        and every real message that follows -- the final report, the correction,
+        the cancellation -- is refused as stale for the life of the loop.
+
+        Dropping the stamp rather than refusing the message is the deliberate
+        half of that. The watermark is a defence, not clinical content: declining
+        to advance a defence on untrusted input costs ordering information for
+        one message, where refusing the message costs the result itself, and a
+        RIS running fast is endemic rather than exotic. An unstamped event still
+        orders by arrival (see `_latest_result_event`), which is the best
+        evidence a mis-clocked feed offers.
+
+        Counted, not merely dropped. A silent drop is how this stayed invisible.
+        """
         if message_at is None:
+            return detail
+        if is_future_dated(message_at, _now()):
+            self.future_dated_message_count += 1
+            logger.warning(
+                "Message %r is dated beyond the clock-skew window (%s); applying it but not "
+                "advancing the loop's clinical watermark (%d so far). Either a sender's clock "
+                "is wrong or a message is forged; both need a human.",
+                control_id, MAX_CLOCK_SKEW, self.future_dated_message_count,
+            )
             return detail
         return {**detail, _MESSAGE_AT: _as_utc(message_at).isoformat()}
 
@@ -1253,20 +1307,54 @@ class Registry:
         times = [t for t in map(self._message_time, self.store.events_for(loop_id)) if t]
         return max(times) if times else None
 
-    def _refuse_if_stale(self, loop_id: str, message_at: datetime | None, what: str) -> None:
+    def _refuse_if_stale(
+        self,
+        loop_id: str,
+        message_at: datetime | None,
+        what: str,
+        *,
+        require_message_time: bool = False,
+    ) -> None:
         """Refuse a message clinically older than one already accepted.
 
         Strictly older, never equal: MSH-7 is routinely minute-precision, so two
         messages in the same minute share a timestamp and rejecting on equality
         would discard real results.
 
-        message_at=None means the caller could not determine MSH-7. Such a
-        message is neither blocked nor blocking -- it is not compared, and it
-        does not move the watermark. Task 10's listener does not yet pass MSH-7,
-        so until it does this guard is inert for live traffic; that is a
-        deliberate fail-open on an unknown rather than refusing all traffic.
+        `message_at=None` means the caller could not read MSH-7 -- it is empty,
+        it is not a timestamp, or it names a year no clock could produce
+        (`clock.is_readable_clock`). `require_message_time` refuses that unknown
+        once the loop carries a watermark, and the two destructive transitions
+        set it, because the fail-open *was* the exploit: a blank MSH-7 turned off
+        the only anti-replay control in the system, and a replayed `SIU^S15`
+        naming a scheduled loop then cancelled it out of `open_loops()` and
+        `resulted_unacknowledged()` alike -- clinically open, on no coordinator
+        queue at all. The stated justification for failing open here ("Task 10's
+        listener does not yet pass MSH-7") expired when the listener started
+        passing it on every message-driven transition.
+
+        Three callers deliberately do not set it:
+
+          * `schedule`. `OPEN -> SCHEDULED` hides nothing -- both states are in
+            the store's `_OPEN_STATES` and both are staleable -- so a replayed
+            `SIU^S12` costs a coordinator nothing, where refusing it would buy no
+            protection at the price of real refusals.
+          * `attach_orphan`, through `record_result`'s `attached_from`. That is a
+            coordinator's decision, not a replayed message, and it carries no
+            MSH-7 for the same reason `acknowledge` carries none. Refusing it
+            would close the orphan queue's only exit.
+          * any loop carrying no watermark at all: there is no clinical ordering
+            there to regress, and refusing would reject a whole site's traffic
+            to defend nothing.
         """
         if message_at is None:
+            if require_message_time and self._clinical_watermark(loop_id) is not None:
+                raise StaleMessageError(
+                    f"Refusing {what} for loop {loop_id}: the message carries no readable "
+                    "MSH-7 and this loop already has clinical ordering to protect, so there "
+                    "is no way to tell whether applying it would regress the loop. Route for "
+                    "human review; the raw message is archived."
+                )
             return
         mark = self._clinical_watermark(loop_id)
         if mark is None:

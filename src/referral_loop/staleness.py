@@ -85,7 +85,12 @@ def age(loop: Loop, now: datetime) -> timedelta:
 
     Clock skew between a RIS and an interface engine is endemic; the failure
     matrix says accept the message, clamp for staleness math, and flag
-    elsewhere (parsing/matching), not here. A loop with no known order time
+    elsewhere (parsing/matching), not here. The clamp shipped without the flag,
+    and the gap was a defect in its own right: a loop whose `ordered_at` was
+    dated in the future clamped to zero age forever -- never stale, never red,
+    last on every worklist, with nothing counting it. `listener._ordered_at` is
+    that flag, and `matcher.hl7_datetime` refuses a year no clock could produce
+    before it ever reaches here. A loop with no known order time
     (`ordered_at is None`) also reports zero age -- this is a raw-duration
     primitive with no basis for inventing a timestamp, and it makes no clinical
     claim by itself. See is_stale for why a missing ordered_at is nonetheless
