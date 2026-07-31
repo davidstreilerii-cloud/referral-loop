@@ -562,6 +562,185 @@ where the model path first exists. No LLM is invoked anywhere in slice 1.
 - The signed rule pack: **verify signature before parsing.** The pack is data only — no
   expressions, no `eval`, no path that executes pack content.
 
+### 11.6 Confirmed findings — audit of 2026-07-31
+
+Four parallel read-only audits of `healthcare_rag/referral_loop/` at commit `4a597f6`. These are
+**verified against the actual code**, not hypothetical. Fixes land in the source module before
+extraction so they carry through `git filter-repo` with history.
+
+Clean results worth recording: **no SQL injection** (every dynamic fragment is code-derived, every
+value bound — full inventory in the audit); no `pickle`/`marshal`/`eval`/`exec`/`yaml`; pack
+signature verified *before* parsing; public key from env, not shipped beside the pack; segment
+allowlist is exact-match and case-sensitive; Jinja autoescaping pinned explicitly with
+`StrictUndefined`; no CSV export exists, so formula injection is not applicable.
+
+#### CRITICAL
+
+**C1 — MSH-2 encoding characters are never validated.** `parse_hl7.py:72` treats MSH-2 as
+"whatever lies between the first and second pipe" rather than the fixed four bytes at offsets 4–7.
+A two-byte edit (`^~\&` → `^|\&`) shifts every MSH field: MSH-7 reads `RFAC`, MSH-9 reads empty,
+MSH-10 reads `ORU^R01`. The message is archived under a fabricated control id, `is_known_type`
+returns False, and the listener answers **AA** — a critical result is discarded with a positive
+acknowledgement, and every later message of that class collides on the fabricated control id and
+is deduped away. Confirms §11.2's pinning requirement, with a working exploit.
+*Fix:* read MSH-2 positionally; reject any message where `segment[4:8] != "^~\\&"`.
+
+**C2 — No transport authentication and no peer identity recorded anywhere.**
+`mllp_server.py:311`. Plain `ThreadingTCPServer`; `client_address`, `getpeername`, and `ssl` appear
+zero times in the package. Nothing — not even self-asserted MSH-3/MSH-4 — is stored as message
+origin; the only recorded provenance is MSH-10, which the attacker authors. Four exploits, all
+from ordinary wire traffic: **control-id pre-claim** (send junk carrying the control id the real
+interface engine will use next; the genuine result is then deduped away and answered AA, leaving
+only an INFO log indistinguishable from engine chatter), `ADT^A40` patient-identity manipulation,
+`SIU^S15` mass cancellation (CANCELLED appears in neither worklist, so the clinically open loop
+vanishes), and forged `ORU` results. Confirms §11.1.
+
+#### HIGH
+
+**H1 — Unbounded MSH-7 poisons a loop's clinical watermark permanently.** `registry.py:1251`,
+`matcher.py:233`. `hl7_datetime` accepts year 9999; the watermark is `max()` of applied MSH-7s and
+the event log is append-only, so it can never be lowered. One future-dated message freezes a loop:
+every later message — including a **corrected critical result** (`OBX-11=C`) — is refused with
+`StaleMessageError` and answered **AA**. The correction survives only as a log warning while the
+worklist reports the loop handled. A RIS with a mis-set clock does this by accident.
+*Fix:* bound `hl7_datetime` to `[now-100y, now+1y]`; refuse to *advance* the watermark beyond
+`now + MAX_CLOCK_SKEW`.
+
+**H2 — Omitting MSH-7 disables the ordering guard outright.** `registry.py:1269-1270` —
+`if message_at is None: return`. Any unparseable MSH-7 (empty, or `X`) fails open. Blank the field
+and you can cancel any loop by placer number. The docstring justifies this as temporary pending
+listener support for MSH-7; `listener.py:650,707,715,724` all pass it now, so the justification has
+expired. *Fix:* for the destructive transitions (`cancel`, `record_result`), refuse an unstamped
+message once the loop carries a watermark.
+
+**H3 — An ORU with no PID-3 matches any patient's loop at tiers 1–2.** `matcher.py:311`
+(`_mrn_agrees` returns True when `key.mrn` is empty) and `listener.py:619` (candidate set is
+`loops_in_states(...)` — every loop for every patient, unscoped). Omit the PID segment, supply a
+known or guessed accession in OBR-3, and a result naming no patient attaches to another patient's
+loop at confidence 1.0. Tiers 3–4 are correctly MRN-scoped; 1–2 are not. The trade is deliberate
+and tested, but the asymmetry is not: the failing-open side is the attacker-controlled one, while
+the case the docstring defends (loop lacks an MRN) cannot occur — `open_loop` refuses it at
+`registry.py:281`. *Fix:* keep the fail-open when `loop.mrn` is empty; when `key.mrn` is empty and
+`loop.mrn` is not, demote below `confidence_floor` so it routes to review as an attachable orphan.
+Scope the candidate query by patient wherever the key names one.
+
+**H4 — The append-only audit authorizer is bypassable.** `guardrails/immutable_audit.py:42-55`
+inspects only action codes 9 (DELETE) and 23 (UPDATE). Verified empirically: `DROP TRIGGER`,
+`ALTER TABLE … RENAME`, `PRAGMA writable_schema=ON`, and `ATTACH` are all permitted. Renaming the
+table moves rows out from under the authorizer's table-name comparison; delete, rename back,
+recreate the triggers, and the file looks fully armed. This erases `RETENTION_PURGED` records —
+the only durable account of a PHI deletion. The module docstring claims "any attempt to modify or
+remove audit records raises a RuntimeError," which is false, and `retention.py:74-76` relies on
+that claim. *Fix:* deny-by-default authorizer allowing only SELECT/READ/INSERT/TRANSACTION/FUNCTION
+plus the specific CREATEs `init_audit_db` needs behind a one-shot flag; correct the docstring to
+state that filesystem permissions are the real boundary.
+
+**H5 — DNS rebinding defeats the loopback boundary.** `worklist.py:672`. No `SERVER_NAME`, no
+`before_request`, no Host or Origin validation, so the server answers any hostname resolving to
+127.0.0.1. A malicious page re-points its own short-TTL A record to loopback, reads every queue
+cross-origin (origin is still the attacker's), harvests real loop ids, then POSTs acknowledgements
+and dismissals with attacker-chosen `actor`/`role`. The audit trail records the fabricated
+coordinator as the responsible human. The module docstring's claim that the loopback bind bounds
+the missing auth and CSRF is wrong. *Fix:* `before_request` rejecting non-loopback Host and
+cross-site Origin on state-changing methods — closes H5 and the CSRF gap together.
+
+**H6 — Denial of service, three vectors.** (a) `_ack_for` returns `intact=True` even when
+`handle()` answers AR (`mllp_server.py:281`), so an application-level rejection leaves the
+connection open; a loop of 16 MiB malformed frames with one byte varied per iteration forces a
+SHA-256, a UTF-8 decode, and an fsynced 16 MiB INSERT each time, with no rate limit. (b) No
+connection cap, no absolute connection deadline — `RECV_TIMEOUT_SECONDS` is per-`recv`, so one byte
+every 290 s holds a thread forever. (c) `parse_hl7._pad` pads every segment to 32 fields with no
+segment cap: measured **69.7× memory amplification**, so a 16 MiB frame retains ≈1.1 GB.
+
+**H7 — A permanently-unacceptable message is answered AE, wedging the feed.** An empty MSH-10
+makes `record_raw` raise `StoreUnavailableError` → **AE** ("queue and retry"). Those bytes can
+never become acceptable, so an interface engine retries forever with the whole clinical feed
+queued behind it, nothing archived, and MSA-2 sanitized to `UNKNOWN` so the sender cannot
+correlate. This is the exact class `listener.py:12` says must be AR. Note this is the *inverse* of
+the change specified in §10.2 — both are needed: AR for permanently-unacceptable input, AA for
+well-formed input whose transition is rejected.
+
+#### MEDIUM
+
+**M1 — No pack anti-rollback.** `pack.py:110-198` verifies the signature but never compares
+`pack.version` against a floor. Anyone who can write `--pack-dir` (default `rules/`, mode 0644,
+beside the code) substitutes an **earlier, validly signed** pack — e.g. one with
+`confidence_floor` 0.60 instead of 0.90 — and boots clean, audit-logged as a normal pack load. The
+vendor's own past artifact is the payload; no key compromise needed. *Fix:* persist the highest
+version ever loaded and refuse anything below it.
+
+**M2 — Purge tamper-check validates trigger names, not bodies.** `store.py:1349-1370` checks only
+that names exist, then `store.py:1583-1584` re-arms by executing DDL text read back out of
+`sqlite_master`. Replace a guard trigger with a no-op body of the same name and the tamper detector
+reports green while the purge faithfully restores the neutered trigger. *Fix:* compare against the
+module DDL constants and recreate from those, not from the file.
+
+**M3 — PHI database files are world-readable.** `store.py:496` — `sqlite3.connect()` creates at
+`0644`; no `chmod`/`umask` anywhere in `healthcare_rag/`. `raw_messages.payload` holds verbatim
+HL7. Any local account reads every patient's identifiers and results. Volume encryption
+(`cli.py:133`) gives zero protection — the volume is decrypted while the service runs. This is
+newly load-bearing given §3.3's decision to persist PHI. *Fix:* `chmod 0600` on files, `0700` on
+directories, plus a boot gate symmetric with the existing three.
+
+**M4 — MRNs reach application logs through four exception paths.** `listener.py:336,409,424,428`
+log `%s` of exceptions whose messages interpolate MRNs (`CircularMergeError`, `MrnRetiredError`,
+`ReferralLoopError`, `StoreUnavailableError`). Triggered by ordinary wire traffic — two `ADT^A40`
+messages forming a merge cycle, which registration interfaces really do produce. `registry.py:456`
+applies the correct rule ("the control id and not the MRN") two lines below one of the leaks. The
+covering test passes vacuously because it uses a non-sentinel MRN.
+
+**M5 — Bare LF is treated as a segment terminator.** `parse_hl7.py:85` normalizes `\n` → `\r`.
+HL7 v2 terminates on CR only, so a newline inside narrative OBX-5 text — extremely common in real
+radiology and pathology reports — is promoted to a segment boundary, letting note text forge an
+`OBR`, `ORC`, `PID`, or `MRG`. Primarily a parser-differential and forensic problem (the archived
+raw does not contain that segment under any correct reading), and a real corruption risk.
+
+**M6 — No escape decoding, so content-key dedup is bypassable.** `content_key` hashes verbatim
+field strings. Re-send an applied result under a fresh MSH-10 with one field re-encoded
+(`\X20\` for a space) and both dedup layers miss. `registry.py:705` turns a result landing on an
+ACKNOWLEDGED loop into a `reopened` event, clearing the coordinator's acknowledgement — repeatable
+at will to keep a loop permanently un-acknowledgeable. Same root cause also produces missed matches
+between two conformant senders that escape differently.
+
+**M7 — Future OBR-7 makes a loop permanently invisible.** `staleness.py:96` clamps a future
+`ordered_at` to zero, so `is_stale` is permanently False and `staleness_ratio` permanently 0.0,
+sorting the row dead last in the queue forever with no badge, no counter, no log line. The
+docstring says such values should be "flagged elsewhere"; nothing flags them anywhere. *Fix:* pass
+`ordered_at=None` beyond `now + MAX_CLOCK_SKEW`, which already routes to `is_stale → True` and
+sorts to the top — the fail-toward-visibility direction used everywhere else in that module.
+
+**M8 — Unvalidated JSON at rest darkens the whole worklist.** `store.py:832,863` — a single row
+whose `detail` is not a dict, or whose `ordered_at` is an HL7-format string, raises `ValueError`
+out of `_loops_where`, which catches only `sqlite3.Error`. Every loop fails, not just the bad one,
+and the coordinator queue returns 500. `_doomed_loops` gets this right at `store.py:1430`; the read
+path does not.
+
+#### LOW
+
+**L1** eval replay writes verbatim PHI to the OS temp dir (`eval.py:232`), outside the retention
+and encryption policy, surviving a SIGKILL. **L2** security counters increment outside the lock
+(`listener.py:450,472`), so the two counters that would signal an attack undercount under exactly
+the concurrency an attacker creates. **L3** `last_accepted` is set from AR-rejected frames, so
+truncation alerts name a control id with no archive row. **L4** no field-length bound at the parse
+boundary; a 15 MiB MSH-10 reaches the DB key and the log while only the ACK is capped.
+
+### 11.7 Requirements added by the audit
+
+Beyond the fixes above, three requirements enter the spec:
+
+1. **Peer-scoped idempotency.** Dedup keys (`applied_messages.control_id`, `content_key`) must be
+   scoped by resolved peer identity. Global control-id dedup is what makes C2's pre-claim attack
+   work; scoping removes it even absent mTLS.
+2. **Clock-skew policy as a first-class concept.** H1, H2, and M7 are one bug in three places:
+   attacker-controlled timestamps consumed without bounds. A single `MAX_CLOCK_SKEW` constant and a
+   `bounded_hl7_datetime()` used at every ingest site, with out-of-bounds values counted and
+   flagged rather than silently clamped or trusted.
+3. **Docstring claims are security claims.** Three modules assert protections they do not deliver
+   (`immutable_audit.py` on RuntimeError, `worklist.py` on loopback bounding auth and CSRF,
+   `staleness.py` on flagging future dates elsewhere). For a control narrative shipped to a
+   hospital's compliance office, an overstated docstring is itself a finding. Every claimed
+   protection needs a test that would fail if the claim were false.
+
 ---
 
 ## 12. Testing and acceptance
