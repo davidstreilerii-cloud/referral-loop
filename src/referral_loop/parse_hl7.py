@@ -90,10 +90,19 @@ class _Fields(list):
     __slots__ = ()
 
     def __getitem__(self, index):
-        try:
-            return super().__getitem__(index)
-        except IndexError:
+        """Field n, or "" when the sender stopped before field n.
+
+        Only a non-negative integer index is answered that way. Field numbers
+        are non-negative by definition, so a negative index is not a short
+        segment but a caller computing the wrong thing, and a slice is no
+        longer field-indexed at all -- its element 0 is not field 0 -- which
+        is why a slice stays a plain list rather than inheriting a promise
+        that would then mean something different. Masking either would hide a
+        bug here instead of a sender's omission.
+        """
+        if isinstance(index, int) and index >= len(self):
             return ""
+        return super().__getitem__(index)
 
 
 def _split_fields(segment: str) -> _Fields:
@@ -138,11 +147,20 @@ def _iter_segments(text: str) -> list[str]:
     conformant sender never trips this; that is precisely the reasoning this
     module rejects for denylists, so it is enforced rather than assumed.
 
-    At most MAX_SEGMENTS + 1 segments are returned. The one over the cap is
-    the evidence that the cap was passed: structural_fault reports it and the
-    listener rejects the message, so nothing beyond the cap is ever parsed.
-    Returning it rather than silently stopping at the cap is the same "flag,
-    don't silently drop" rule -- a truncated message must not look whole.
+    At most MAX_SEGMENTS + 1 segments are returned, the extra one being the
+    evidence that the cap was passed. Detecting that is structural_fault's
+    job and refusing the message is the listener's: handle() calls
+    structural_fault before anything else reads the text, so nothing over the
+    cap is parsed, counted or acted on there.
+
+    A caller that skips structural_fault -- eval replaying an archive, a test
+    calling parse_hl7_text directly -- does see the truncated list as though
+    it were whole. That is a real gap and not a comment about one, and it is
+    left open deliberately: closing it here means either raising, which
+    parse_hl7_text promises never to do, or returning a sentinel every caller
+    must remember to check, which is the same gap moved one level up. The cap
+    is admission control at the listener, and this is where that is written
+    down rather than assumed.
     """
     kept: list[str] = []
     for match in _SEGMENT.finditer(text):
@@ -206,6 +224,17 @@ def structural_fault(text: str) -> str:
                 f"MSH-2 encoding characters are {raw[4:8]!r}, "
                 f"expected {ENCODING_CHARACTERS!r}"
             )
+        # The separator that closes MSH-2. Checking only the four characters
+        # above is not enough: HL7 v2.7 defines a fifth encoding character
+        # ("#", for truncation), whose first four are conformant, so a message
+        # carrying it would pass the check above while the separator -- and
+        # therefore every field _split_msh_fields reads from offset 9 -- has
+        # moved one position right. That renumbers MSH-10 out of MSH-9, which
+        # is the same discarded-result-under-AA outcome as a "|" inside MSH-2.
+        # These three offsets together are what make the split sound; no two
+        # of them are.
+        if raw[8:9] != "|":
+            return f"MSH-2 is not closed by a field separator at offset 8, found {raw[8:9]!r}"
     return ""
 
 

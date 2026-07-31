@@ -296,24 +296,31 @@ class MessageHandler:
         """Persist, then parse, then apply. Never the other way round."""
         control_id = peek_control_id(text)
 
-        # Before the archive, because this is not a message: zero MSH segments
-        # is not HL7, and more than one is two messages inside a single frame.
-        # Either way the control id we would key the archive on is not the one
-        # the sender used for what we would then process.
+        # Before the archive, because none of this is a message we could act
+        # on. An MSH declaring a non-standard encoding set means every "^"
+        # split we would then perform reads the wrong characters, and a frame
+        # over the segment cap is one we refuse to hold in memory rather than
+        # parse partially.
+        #
+        # First, and specifically before the MSH count: over the cap,
+        # parse_hl7 stops scanning, so a message whose only MSH sits past the
+        # cap would otherwise be reported to an operator as "found 0 MSH
+        # segments" -- true of the truncated view, and a wrong lead for
+        # somebody debugging the sender that emitted it.
+        fault = structural_fault(text)
+        if fault:
+            return self.reject_malformed(text.encode("utf-8", errors="replace"), fault)
+
+        # Zero MSH segments is not HL7, and more than one is two messages
+        # inside a single frame. Either way the control id we would key the
+        # archive on is not the one the sender used for what we would then
+        # process.
         count = msh_segment_count(text)
         if count != 1:
             return self.reject_malformed(
                 text.encode("utf-8", errors="replace"),
                 f"expected exactly one MSH segment, found {count}",
             )
-
-        # Same reason, same point in the flow: an MSH declaring a non-standard
-        # encoding set means every "^" split we would then perform reads the
-        # wrong characters, and a frame over the segment cap is a message we
-        # refuse to hold in memory rather than one we parse partially.
-        fault = structural_fault(text)
-        if fault:
-            return self.reject_malformed(text.encode("utf-8", errors="replace"), fault)
 
         # 1. Durable write. Everything after this point may fail without losing
         #    the message: it is on disk and replayable.

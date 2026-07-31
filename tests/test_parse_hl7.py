@@ -1,6 +1,9 @@
+import pytest
+
 from healthcare_rag.referral_loop.parse_hl7 import (
     ALLOWED_SEGMENTS,
     MAX_SEGMENTS,
+    MSH_DATETIME,
     OBR_FILLER_ORDER_NUMBER,
     OBR_PLACER_ORDER_NUMBER,
     OBX_RESULT_STATUS,
@@ -27,6 +30,26 @@ ORU = (
 # under a fabricated control id, makes is_known_type false, and answers AA --
 # discarding a clinical result while positively acknowledging it.
 SHIFTED_MSH = "MSH|^|\\&|SEND|SFAC|RECV|RFAC|20260101010101||ORU^R01|CTRL_REAL|P|2.5.1\r"
+
+# The same outcome one character further out. HL7 v2.7 added a fifth encoding
+# character -- "#", for truncation -- so this MSH-2 is conformant to a later
+# version of the standard rather than malformed. Its first four characters
+# match, so a check that stops there passes it, and the separator that closes
+# MSH-2 has moved to offset 9: every later field renumbers by one and the
+# reader lands on the C1 outcome again.
+V27_MSH = "MSH|^~\\&#|SEND|SFAC|RECV|RFAC|20260101010101||ORU^R01|CTRL_REAL|P|2.5.1\r"
+
+
+def msh_with(encoding: str) -> str:
+    """One message, varying only MSH-2.
+
+    No candidate carries a "|". A separator inside MSH-2 closes the field, so
+    those bytes are a *different message* rather than a different MSH-2 --
+    `MSH|^~\\&||SEND` is a conformant header with an empty MSH-3, and reading
+    it as a renumbering would make a test of this defect assert the wrong
+    thing. The auditor's pipe injection is kept separately as SHIFTED_MSH.
+    """
+    return f"MSH|{encoding}|SEND|SFAC|RECV|RFAC|20260101010101||ORU^R01|CTRL_REAL|P|2.5.1\r"
 
 
 def test_allowlist_is_exactly_the_documented_set():
@@ -149,6 +172,7 @@ def test_msh_fields_are_read_by_offset_not_by_splitting_on_the_separator():
     not a parse quirk -- it is a discarded clinical result.
     """
     msg = parse_hl7_text(SHIFTED_MSH)
+    assert msg.segments["MSH"][0][MSH_DATETIME] == "20260101010101", "MSH-7, not RFAC"
     assert msg.message_type == "ORU^R01", "MSH-9, not the field one to its left"
     assert msg.control_id == "CTRL_REAL", "MSH-10, not the message type"
 
@@ -176,6 +200,65 @@ def test_a_bare_msh_segment_is_a_structural_fault():
 
 def test_a_conformant_message_has_no_structural_fault():
     assert structural_fault(ORU) == ""
+
+
+def test_an_encoding_field_longer_than_four_characters_is_a_structural_fault():
+    """HL7 v2.7's five-character MSH-2. Conformant to a later version of the
+    standard, and still refused: this parser reads MSH-2 at offsets 4-7 and
+    everything after it from offset 9, so a fifth character moves every field
+    it names. Refusing is honest; reading it would not be."""
+    assert structural_fault(V27_MSH) != ""
+
+
+def test_no_encoding_field_shape_is_accepted_and_renumbered():
+    """The defect class, not the two strings we happen to know about.
+
+    MSH-1, MSH-2 and the separator closing MSH-2 are all read at fixed
+    offsets, so one invariant covers every one of them: whatever MSH-2 a
+    sender writes, this parser either refuses the message or reads MSH-7,
+    MSH-9 and MSH-10 from where the spec puts them. "Accepted and renumbered"
+    is the state that answers AA to a clinical result it discarded, and it is
+    reachable for *any* MSH-2 whose first four characters happen to conform --
+    which is why checking those four is not enough on its own.
+    """
+    shapes = [
+        "^~\\&",        # conformant
+        "^~\\&#",       # HL7 v2.7 truncation character
+        "^~\\&#@",      # longer still
+        "^~\\&&&&&",
+        "^~\\",         # short
+        "^~",
+        "^",
+        "",
+        "&\\~^",        # the right characters, the wrong order
+        "abcd",
+    ]
+    accepted = []
+    for encoding in shapes:
+        text = msh_with(encoding)
+        if structural_fault(text):
+            continue
+        accepted.append(encoding)
+        msg = parse_hl7_text(text)
+        assert msg.segments["MSH"][0][MSH_DATETIME] == "20260101010101", encoding
+        assert msg.message_type == "ORU^R01", encoding
+        assert msg.control_id == "CTRL_REAL", encoding
+
+    assert accepted == ["^~\\&"], "only the conformant encoding field is accepted"
+
+
+def test_field_access_is_forgiving_forward_and_ordinary_everywhere_else():
+    """Field numbers are non-negative, so forward is the only direction that
+    gets the "" answer. A negative index is not a field number, and a slice is
+    no longer field-indexed at all -- its element 0 is not field 0 -- so
+    answering "" for either would hide a caller's bug rather than a sender's
+    short segment."""
+    fields = parse_hl7_text(MSH + "OBR|1|PLACER1\r").segments["OBR"][0]
+    assert fields[11] == "", "forward past the end is a short segment"
+    with pytest.raises(IndexError):
+        fields[-9]
+    assert fields[1:] == ["1", "PLACER1"]
+    assert type(fields[1:]) is list, "a slice is not field-indexed, so not _Fields"
 
 
 # ------------------------------------------------------------------ segment cap
@@ -223,5 +306,7 @@ def test_the_listener_answers_ar_to_every_structural_fault(tmp_path):
     handler = MessageHandler(store=store, registry=Registry(store), pack=PACK)
 
     assert ack_code(handler.handle(SHIFTED_MSH)) == "AR"
+    assert ack_code(handler.handle(V27_MSH)) == "AR"
     assert ack_code(handler.handle(MSH + "OBX|1\r" * MAX_SEGMENTS)) == "AR"
-    assert store.raw_count() == 2, "failure matrix: AR, archive raw, alert"
+    assert store.raw_count() == 3, "failure matrix: AR, archive raw, alert"
+    assert handler.unknown_type_count == 0, "rejected before it could be misread"
