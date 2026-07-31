@@ -63,16 +63,67 @@ Log records are an artifact too. Nothing here logs a `str(exc)` from a store or
 registry failure, because `MrnRetiredError` and the alias errors compose their
 messages from MRNs; the exception *type* and the loop id are logged instead.
 
-No authentication and no CSRF token. Both are real gaps and both are bounded by
-the loopback bind, which is why `make_worklist_server` refuses a non-loopback
-host outright rather than warning like the MLLP listener does -- ingress from an
-interface engine on another host is a real deployment, an unauthenticated
-coordinator queue reachable from the ward network is not.
+What the loopback bind does and does not bound
+----------------------------------------------
+`make_worklist_server` refuses a non-loopback bind outright rather than warning
+like the MLLP listener does -- ingress from an interface engine on another host
+is a real deployment, an unauthenticated coordinator queue reachable from the
+ward network is not.
+
+That refusal bounds *which interface* accepts a connection. It bounds nothing
+about who can drive the browser that makes one, and an earlier version of this
+docstring claimed otherwise. DNS rebinding is the counterexample: a page on
+evil.com whose A record is re-pointed to 127.0.0.1 after it loads can fetch this
+server from the coordinator's own workstation, and because the page's origin is
+still evil.com the same-origin policy lets it *read* every queue. A plain
+cross-site `<form method="post">` needs no rebinding at all -- it is a
+CORS-simple request, so no preflight ever asks this server's permission, and
+`_payload` accepts `request.form`.
+
+So `create_blueprint` installs a `before_request` gate. It is not belt-and-braces
+alongside the bind check; it is the only thing standing between this page and a
+browser being used as a confused deputy, and the two checks answer different
+questions:
+
+  * **Host must be loopback**, on any port. Under rebinding the browser puts the
+    attacker's hostname in Host -- that is unavoidable for them, because naming a
+    loopback host in the URL is what makes the response unreadable to their page.
+    A request with no Host header at all is refused rather than allowed: Werkzeug
+    falls back to SERVER_NAME, which is always this socket, so a check reading
+    `request.host` would let anything that simply omitted the header through.
+    This closes the read. It also means nothing here may ever emit a CORS header.
+  * **State-changing methods must prove same origin.** An `Origin`, if sent, must
+    name the same host:port the request was addressed to. Otherwise
+    `Sec-Fetch-Site` must say `same-origin` or `none` (`none` is a user-initiated
+    navigation, which no page can forge). With neither header the request is
+    refused unless it is `application/json` -- a content type no CORS-simple
+    request can carry, so a browser that sends neither header, as IE11 and
+    Firefox before 70 do not, still cannot forge one. GET and HEAD are not
+    Origin-checked: an ordinary page load from a bookmark carries no Origin, and
+    the Host rule already closes the read.
+
+What is still unprotected
+-------------------------
+There is still **no authentication**. Any user logged into this workstation, and
+any process running on it, can read every queue and take every action -- and will
+be recorded as whatever name and role they typed. The gate above stops a remote
+web page from driving the coordinator's browser; it stops nobody who is already
+on the host. That is a real gap, not a bounded one.
+
+The answer to it is still an authenticating reverse proxy, and this gate does not
+currently admit one: rewriting Host to loopback gets reads through, but the
+browser's Origin then names the proxy's hostname and every action is refused.
+Fronting this page is therefore a code change here -- a configured list of
+trusted origins -- and not a deployment exercise. Saying so is the point; the
+version of this docstring that claimed the loopback bind bounded the missing
+authentication is the reason this gate had to be written at all.
 """
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+
+from urllib.parse import urlsplit
 
 import jinja2
 from flask import Blueprint, Flask, jsonify, request
@@ -92,6 +143,15 @@ from .store import LoopStore
 logger = logging.getLogger(__name__)
 
 _LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+# Methods that change nothing. Everything else has to prove same origin; see the
+# module docstring for why GET is deliberately not in that set.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# The only Sec-Fetch-Site values a page on this origin, or a user typing the URL,
+# can produce. `same-site` is a sibling host under one registrable domain, which
+# for a loopback service means somebody else's; it is refused with `cross-site`.
+_SAME_ORIGIN_FETCH_SITES = frozenset({"same-origin", "none"})
 
 # The control id written on a coordinator's action. Not a message, so there is no
 # MSH-10 -- and the event log should say so rather than carry an empty string
@@ -354,6 +414,51 @@ class _BadInput(Exception):
     """A malformed request, not a refused one. 400, never 409."""
 
 
+def _is_loopback_host(raw: str) -> bool:
+    """Is this Host header naming this machine by a name only this machine has?
+
+    The port is parsed but not compared against anything. A browser copies into
+    Host whatever port the URL named, and the operator may run this on any port,
+    so there is nothing to compare it to -- `create_blueprint` does not know the
+    bind port, and coupling it to one would put the check back where the bind
+    check already is. The port is also not what the attack turns on: an attacker
+    who names 127.0.0.1 in the URL to satisfy a port rule gets a response their
+    page may not read. It is parsed only so that a Host of `localhost:evil` is
+    not read as the host `localhost`.
+    """
+    host = raw.strip().lower()
+    if host.startswith("["):  # [::1], with or without a port
+        closed = host.find("]")
+        if closed == -1:
+            return False
+        name, rest = host[1:closed], host[closed + 1:]
+        if rest and not rest.startswith(":"):
+            return False
+        port = rest[1:]
+    else:
+        name, _, port = host.partition(":")
+    if port and not port.isdigit():
+        return False
+    return name in _LOOPBACK
+
+
+def _is_same_origin(origin: str, host: str) -> bool:
+    """Does this Origin name the very host:port the request was addressed to?
+
+    Compared against the Host header rather than against `_LOOPBACK`, because
+    `http://localhost:5057` and `http://127.0.0.1:5057` are genuinely different
+    origins and no browser will mix them. `Origin: null` -- a sandboxed iframe, a
+    file:// page -- parses to an empty netloc and so matches nothing.
+
+    The scheme is part of an origin and this server speaks http, so `http` is the
+    only one that can be same-origin with it. `https://127.0.0.1:5057` is a
+    different origin that nothing here serves; accepting it would widen the rule
+    for a deployment that does not exist.
+    """
+    parts = urlsplit(origin.strip())
+    return parts.scheme == "http" and parts.netloc.lower() == host.strip().lower()
+
+
 def _payload():
     return request.get_json(silent=True) or request.form or {}
 
@@ -361,6 +466,56 @@ def _payload():
 def create_blueprint(store: LoopStore, registry: Registry, pack: RulePack) -> Blueprint:
     bp = Blueprint("worklist", __name__, url_prefix="/worklist")
     base = "/worklist"
+
+    # -------------------------------------------------------------- the gate
+
+    @bp.before_request
+    def _refuse_a_request_this_page_did_not_originate():
+        """Host and Origin validation. See the module docstring for the threat.
+
+        Registered on the blueprint rather than on the app `create_app` builds,
+        so it travels with the routes: any app that registers this blueprint gets
+        it, and there is no way to mount the queues without it. The bind check in
+        `make_worklist_server` is a different control answering a different
+        question and does not stand in for this one.
+
+        Nothing caller-controlled is echoed or logged. The Host and the Origin are
+        attacker-chosen strings, and a response body and a log record are two of
+        the four artifacts spec test 14 greps -- reflecting a refused Host would
+        make this gate the leak it exists to prevent.
+        """
+        host = request.headers.get("Host")
+        if host is None or not _is_loopback_host(host):
+            logger.warning("Worklist request refused: Host is not a loopback name")
+            return jsonify({"error": "This service answers on loopback names only"}), 403
+
+        if request.method in _SAFE_METHODS:
+            return None
+
+        origin = request.headers.get("Origin")
+        if origin is not None:
+            if _is_same_origin(origin, host):
+                return None
+            logger.warning("Worklist action refused: cross-origin request")
+            return jsonify({"error": "Cross-origin requests may not change anything"}), 403
+
+        site = request.headers.get("Sec-Fetch-Site")
+        if site is not None:
+            if site.strip().lower() in _SAME_ORIGIN_FETCH_SITES:
+                return None
+            logger.warning("Worklist action refused: cross-site request")
+            return jsonify({"error": "Cross-origin requests may not change anything"}), 403
+
+        # Neither header: an old browser, or not a browser. Told apart by the one
+        # thing a browser will not let a cross-site request forge -- a content
+        # type outside the CORS-simple set, which needs a preflight this server
+        # answers with no CORS header at all.
+        if request.is_json:
+            return None
+        logger.warning("Worklist action refused: no evidence the request is same-origin")
+        return jsonify({
+            "error": "A state-changing request must carry an Origin, or be application/json"
+        }), 403
 
     # ------------------------------------------------------------ error handlers
 

@@ -70,7 +70,13 @@ def stack(tmp_path, monkeypatch):
     registry = Registry(store, pack_version=PACK.version)
     app = create_app(store=store, registry=registry, pack=PACK)
     app.config["TESTING"] = True
-    return store, registry, app.test_client()
+    client = app.test_client()
+    # The client stands in for the coordinator's browser, so it sends what one
+    # sends on its own page's forms: an Origin matching the default Host. Without
+    # it the form posts below are indistinguishable from cross-site ones, which
+    # worklist.py refuses. See tests/referral_loop/test_worklist.py for the gate.
+    client.environ_base["HTTP_ORIGIN"] = "http://localhost"
+    return store, registry, client
 
 
 @pytest.fixture()

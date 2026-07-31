@@ -50,7 +50,13 @@ def stack(tmp_path, accepted):
     registry = Registry(store)
     app = create_app(store=store, registry=registry, pack=PACK)
     app.config["TESTING"] = True
-    return app.test_client(), registry, store
+    client = app.test_client()
+    # This client stands in for the coordinator's browser, so it sends what one
+    # sends: an Origin matching the Host the test client defaults to. Without it
+    # every form post below would be indistinguishable from a cross-site one --
+    # which is the point of the host/origin tests, and would be an accident here.
+    client.environ_base["HTTP_ORIGIN"] = "http://localhost"
+    return client, registry, store
 
 
 @pytest.fixture()
@@ -842,6 +848,235 @@ def test_the_page_references_no_external_resource(http, registry):
 def test_a_get_on_an_action_is_405(http, registry):
     loop_id = _resulted(registry)
     assert http.get(f"/worklist/{loop_id}/acknowledge").status_code == 405
+
+
+# ------------------------------------------------- host and origin validation
+
+def _raw(http):
+    """A client carrying none of the headers a same-origin browser would send.
+
+    The `http` fixture stands in for the coordinator's browser and therefore
+    sends `Origin`. An attacker's page, an old browser and a curl script do not
+    all send the same things, so every test below builds the exact header set it
+    is about rather than inheriting one.
+    """
+    return http.application.test_client()
+
+
+def test_a_rebound_host_header_cannot_read_the_queue(http, registry):
+    """H5. The bind is loopback and the attack does not care.
+
+    evil.com is served with a short TTL and re-pointed at 127.0.0.1 after the
+    page loads. The browser's origin is still evil.com, so the same-origin policy
+    lets the page *read* the response -- every loop id, state and modality in all
+    three queues. The only thing that distinguishes this request from a
+    coordinator's is the Host header it carries.
+    """
+    loop_id = _resulted(registry)
+    response = _raw(http).get("http://evil.com/worklist/?format=json")
+    assert response.status_code == 403
+    assert loop_id.encode() not in response.data
+
+
+def test_a_hostname_that_merely_resolves_to_loopback_is_refused(http, registry):
+    """The rebinding family, not one domain. localtest.me and *.nip.io resolve to
+    127.0.0.1 by design and need no DNS trickery at all."""
+    _resulted(registry)
+    assert _raw(http).get("http://localtest.me:5057/worklist/").status_code == 403
+    assert _raw(http).get("http://127.0.0.1.nip.io:5057/worklist/").status_code == 403
+
+
+def test_a_request_with_no_host_header_is_refused(http, registry):
+    """HTTP/1.0 has no required Host. Werkzeug then falls back to SERVER_NAME,
+    which is the socket -- always loopback here -- so a check reading
+    `request.host` would pass anything that simply omitted the header."""
+    from werkzeug.test import EnvironBuilder, run_wsgi_app
+
+    _resulted(registry)
+    # Driven as raw WSGI: the test client insists on a Host header, which is the
+    # assumption this test exists to refuse to make.
+    environ = EnvironBuilder("/worklist/?format=json").get_environ()
+    environ.pop("HTTP_HOST", None)
+    assert environ["SERVER_NAME"] == "localhost"  # the fallback that would pass
+    _, status, _ = run_wsgi_app(http.application, environ)
+    assert status.startswith("403")
+
+
+def test_a_loopback_host_is_accepted_on_whatever_port_it_was_given(http, registry):
+    """The port is not part of the defence. A browser puts in the Host header
+    whatever port the URL named, and an attacker who names a loopback host in the
+    URL gets a response the same-origin policy will not let their page read."""
+    _resulted(registry)
+    for url in ("http://127.0.0.1:5057/worklist/", "http://localhost:8080/worklist/",
+                "http://[::1]:9999/worklist/", "http://localhost/worklist/"):
+        assert _raw(http).get(url).status_code == 200, url
+
+
+def test_a_cross_origin_acknowledge_leaves_the_loop_untouched(http, registry):
+    """The write half of H5, and the reason a 403 is not the assertion that
+    matters: what must be true is that the loop was not acknowledged by a
+    coordinator who does not exist."""
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        json={"actor": "Dr Nobody", "role": "referral_coordinator"},
+        headers={"Origin": "http://evil.com"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.RESULTED
+    assert not registry.get(loop_id).ack_by  # nobody, not "Dr Nobody"
+
+
+def test_a_cross_origin_form_post_cannot_dismiss_an_orphan(http, registry):
+    """The CORS-simple case: a plain <form method="post"> needs no preflight, so
+    nothing in the browser asks this server's permission before sending it.
+    Dismissal is terminal, which is what makes this the worst of the three."""
+    orphan_id = registry.orphan(control_id="C-ORU", mrn=MRN_SENTINEL, detail={"modality": "CT"})
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{orphan_id}/dismiss",
+        data={"actor": "Dr Nobody", "role": "coordinator", "reason": "not ours"},
+        headers={"Origin": "http://evil.com"},
+    )
+    assert response.status_code == 403
+    assert registry.get(orphan_id).state is LoopState.ORPHAN
+
+
+def test_a_cross_site_undo_match_is_refused_on_sec_fetch_site_alone(http, registry):
+    """undo_match detaches a real result and re-orphans it. A browser that sends
+    Sec-Fetch-Site says cross-site plainly; no Origin comparison is needed."""
+    loop_id = _acknowledged(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/undo_match",
+        data={"actor": "Dr Nobody", "role": "coordinator", "reason": "not ours"},
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+
+def test_a_same_site_request_is_not_treated_as_same_origin(http, registry):
+    """A sibling host under the same registrable domain is a different origin and
+    has no business posting here."""
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        json={"actor": "a", "role": "r"},
+        headers={"Sec-Fetch-Site": "same-site"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+def test_a_null_origin_is_refused(http, registry):
+    """A sandboxed iframe and a file:// page both post with Origin: null. Neither
+    is the coordinator's page, and `null` matches no host."""
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        json={"actor": "a", "role": "r"}, headers={"Origin": "null"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+def test_a_form_post_with_no_same_origin_evidence_at_all_is_refused(http, registry):
+    """The classic hole, and the reason the Origin check alone is not enough.
+
+    A browser old enough to send neither Sec-Fetch-Site nor an Origin on a
+    cross-site form submission -- IE11, Firefox before 70 -- would otherwise walk
+    straight through. What such a request cannot do is set a Content-Type outside
+    the CORS-simple set, so form-encoded with no evidence fails closed.
+    """
+    orphan_id = registry.orphan(control_id="C-ORU", mrn=MRN_SENTINEL, detail={"modality": "CT"})
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{orphan_id}/dismiss",
+        data={"actor": "Dr Nobody", "role": "coordinator", "reason": "not ours"},
+    )
+    assert response.status_code == 403
+    assert registry.get(orphan_id).state is LoopState.ORPHAN
+
+
+def test_a_json_post_with_no_browser_headers_still_works(http, registry):
+    """The deliberate exception, and the line the whole rule rests on: a
+    cross-site request a browser will send without asking permission first cannot
+    carry Content-Type: application/json. Anything that does was either preflighted
+    -- and this server answers no preflight -- or is not a browser at all.
+
+    Non-browser local callers are unprotected here by design; there is no
+    authentication. This keeps a local script working rather than pretending
+    blocking it would have bought something.
+    """
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        json={"actor": "coordinator-a", "role": "referral_coordinator"},
+    )
+    assert response.status_code == 200
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+
+def test_a_get_is_not_origin_checked(http, registry):
+    """Reads are bounded by Host, not by Origin. A coordinator arriving from a
+    bookmark or the address bar sends no Origin at all, so an Origin rule on GET
+    would either reject every ordinary page load or allow a missing one -- and a
+    cross-origin read of a loopback URL is already unreadable to the page that
+    asked for it."""
+    loop_id = _resulted(registry)
+    response = _raw(http).get("http://127.0.0.1:5057/worklist/?format=json",
+                              headers={"Origin": "http://evil.com"})
+    assert response.status_code == 200
+    assert loop_id in _ids(response.get_json()["queues"]["awaiting_acknowledgement"])
+
+
+def test_the_coordinator_s_own_browser_still_reads_and_acts(http, registry):
+    """The negative control, end to end and with the headers a real browser sends
+    on its own page's form: the queue renders and the acknowledgement lands."""
+    loop_id = _resulted(registry)
+    browser = _raw(http)
+    page = browser.get("http://127.0.0.1:5057/worklist/",
+                       headers={"Sec-Fetch-Site": "none"})
+    assert page.status_code == 200
+    assert loop_id.encode() in page.data
+
+    acted = browser.post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        data={"actor": "coordinator-a", "role": "referral_coordinator"},
+        headers={"Origin": "http://127.0.0.1:5057", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert acted.status_code == 200, acted.data
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+
+def test_an_https_origin_on_this_http_server_is_not_same_origin(http, registry):
+    """The scheme is part of an origin. Nothing serves this page over TLS, so an
+    https Origin naming the same host:port is a different origin than the one the
+    coordinator's page has -- and widening the rule to admit it would be widening
+    it for a deployment that does not exist."""
+    loop_id = _resulted(registry)
+    response = _raw(http).post(
+        f"http://127.0.0.1:5057/worklist/{loop_id}/acknowledge",
+        json={"actor": "a", "role": "r"},
+        headers={"Origin": "https://127.0.0.1:5057"},
+    )
+    assert response.status_code == 403
+    assert registry.get(loop_id).state is LoopState.RESULTED
+
+
+def test_the_refusal_echoes_nothing_the_caller_sent(http, registry, caplog):
+    """A 403 body and its log record are artifacts too, and the Host and Origin
+    are caller-controlled text. Spec test 14 greps both."""
+    _resulted(registry)
+    with caplog.at_level(logging.INFO):
+        response = _raw(http).get(f"http://{MRN_SENTINEL}.evil.com/worklist/?format=json")
+        forged = _raw(http).post(
+            f"http://127.0.0.1:5057/worklist/L-000000000000/dismiss",
+            json={"actor": "a", "role": "r", "reason": "x"},
+            headers={"Origin": f"http://{MRN_SENTINEL}.evil.com"},
+        )
+    assert response.status_code == 403 and forged.status_code == 403
+    assert MRN_SENTINEL not in response.data.decode()
+    assert MRN_SENTINEL not in forged.data.decode()
+    assert MRN_SENTINEL not in caplog.text
 
 
 # ---------------------------------------------------------------- binding
