@@ -14,9 +14,19 @@ documented requirement.
 """
 from __future__ import annotations
 
+import re
+
 from .events import ParsedMessage
 
 ALLOWED_SEGMENTS = frozenset({"MSH", "PID", "MRG", "PV1", "ORC", "OBR", "OBX", "SCH", "RF1"})
+
+# MSH-2, the four encoding characters: component, repetition, escape,
+# subcomponent. They are not a field a sender may redefine as far as this
+# parser is concerned -- every component split downstream (message type, MRN,
+# universal service id) is a literal "^" split, so a message declaring any
+# other set would be read with confidently wrong clinical identifiers rather
+# than refused. structural_fault refuses it instead.
+ENCODING_CHARACTERS = "^~\\&"
 
 KNOWN_MESSAGE_TYPES = frozenset(
     {"REF^I12", "ORM^O01", "OMG^O19", "ORU^R01", "SIU^S12", "SIU^S15", "ADT^A40"}
@@ -44,32 +54,78 @@ OBX_OBSERVATION_IDENTIFIER = 3
 OBX_OBSERVATION_VALUE = 5
 OBX_RESULT_STATUS = 11
 
-# Every segment is padded to at least this width so field access by index is
-# always safe. Segments longer than this keep all their fields -- PV1 runs to
-# ~52 and OBR to ~49 in real traffic, and silently dropping the tail would
-# violate this module's own "flag, don't silently drop" rule.
-_MIN_PADDED_FIELDS = 32
+# The most segments one message may carry. Real HL7 v2 messages are small:
+# even a large ORU^R01 -- a microbiology sensitivity panel, a genomic report --
+# runs to a few hundred OBX, so a few thousand is an order of magnitude of
+# headroom over anything conformant. A cap is needed at all because the only
+# limit upstream is mllp_server's 16 MiB frame, which bounds the bytes read
+# and not the objects retained, and the server threads connections without a
+# cap of its own: without this, one frame of `OBX|1` retained ~1.1 GB.
+MAX_SEGMENTS = 5000
+
+# A segment is a run of characters between line breaks. Matched lazily rather
+# than with str.split so a frame far over MAX_SEGMENTS is abandoned as soon as
+# the cap is passed instead of being materialised in full first -- the split
+# list is itself a multiple of the frame size.
+_SEGMENT = re.compile(r"[^\r\n]+")
 
 
-def _pad(fields: list[str]) -> list[str]:
-    if len(fields) < _MIN_PADDED_FIELDS:
-        fields.extend([""] * (_MIN_PADDED_FIELDS - len(fields)))
-    return fields
+class _Fields(list):
+    """A segment's fields, where reading past the last one yields "".
+
+    Callers index by field number -- OBX-11 is read on every result -- and
+    plenty of conformant segments simply stop earlier than the field being
+    read. The obvious way to make that safe is to pad every segment out to a
+    fixed width, which is what this module used to do, but that allocates for
+    fields nobody sent: padding to 32 measured 69.7x amplification against the
+    raw bytes, so a 16 MiB frame retained ~1.1 GB. Answering "" from
+    __getitem__ costs nothing and keeps exactly the same contract, including
+    for the callers that index without a bounds check of their own.
+
+    Slices and iteration keep list semantics, so the natural width is what a
+    caller sees in len() and in `fields[1:]` -- the trailing "" a pad would
+    have added were never data.
+    """
+
+    __slots__ = ()
+
+    def __getitem__(self, index):
+        try:
+            return super().__getitem__(index)
+        except IndexError:
+            return ""
 
 
-def _split_fields(segment: str) -> list[str]:
-    """Split a segment so that index n holds field n, padded but never truncated.
+def _split_fields(segment: str) -> _Fields:
+    """Split a segment so that index n holds field n, never truncated.
 
     For every segment except MSH, index 0 is the segment id and field n lands
     at index n naturally. MSH shifts by one because MSH-1 *is* the separator;
     _split_msh_fields handles that case.
+
+    Segments longer than the fields we name keep all of them -- PV1 runs to
+    ~52 and OBR to ~49 in real traffic, and silently dropping the tail would
+    violate this module's own "flag, don't silently drop" rule.
     """
-    return _pad(segment.split("|"))
+    return _Fields(segment.split("|"))
 
 
-def _split_msh_fields(segment: str) -> list[str]:
-    """MSH-1 is the field separator itself, so MSH fields shift by one."""
-    return _pad([segment[:3], "|"] + segment[4:].split("|"))
+def _split_msh_fields(segment: str) -> _Fields:
+    """MSH-1 is the field separator itself, so MSH fields shift by one.
+
+    MSH-1 and MSH-2 are read by *offset*, never by splitting on "|". MSH-1 is
+    the single separator character at offset 3 and MSH-2 the four encoding
+    characters at offsets 4-7, with MSH-3 starting after the pipe at offset 8.
+    Splitting the whole segment on "|" instead treats MSH-2 as "whatever lies
+    between the first two pipes", which lets a sender put a separator inside
+    it and renumber every later field by one: MSH-10 is then read out of MSH-9,
+    so the message is archived under a control id nobody sent and its real
+    type never matches -- a clinical result discarded under a positive
+    acknowledgement. structural_fault refuses such a message outright; this
+    stays positional regardless, because the rejection still has to report the
+    control id that actually arrived.
+    """
+    return _Fields([segment[:3], segment[3:4], segment[4:8]] + segment[9:].split("|"))
 
 
 def _iter_segments(text: str) -> list[str]:
@@ -81,8 +137,22 @@ def _iter_segments(text: str) -> list[str]:
     exists to prevent. HL7 v2 ids are always exactly 3 characters, so a
     conformant sender never trips this; that is precisely the reasoning this
     module rejects for denylists, so it is enforced rather than assumed.
+
+    At most MAX_SEGMENTS + 1 segments are returned. The one over the cap is
+    the evidence that the cap was passed: structural_fault reports it and the
+    listener rejects the message, so nothing beyond the cap is ever parsed.
+    Returning it rather than silently stopping at the cap is the same "flag,
+    don't silently drop" rule -- a truncated message must not look whole.
     """
-    return [s for s in text.replace("\n", "\r").split("\r") if s.strip()]
+    kept: list[str] = []
+    for match in _SEGMENT.finditer(text):
+        segment = match.group()
+        if not segment.strip():
+            continue
+        kept.append(segment)
+        if len(kept) > MAX_SEGMENTS:
+            break
+    return kept
 
 
 def _is_segment(raw: str, seg_id: str) -> bool:
@@ -102,6 +172,41 @@ def msh_segment_count(text: str) -> int:
     its clinical timestamp and its message type silently discarded.
     """
     return len(_msh_segments(text))
+
+
+def structural_fault(text: str) -> str:
+    """Why this text cannot be trusted as one HL7 message, or "" if it can.
+
+    Same division of labour as msh_segment_count: this module decides, the
+    listener rejects. Every fault named here is a permanent property of the
+    bytes rather than of our state, so the listener answers AR -- an engine
+    told to queue would redeliver them forever, wedging the interface behind a
+    message that can never be processed.
+    """
+    segments = _iter_segments(text)
+    if len(segments) > MAX_SEGMENTS:
+        return f"more than {MAX_SEGMENTS} segments in one message"
+
+    # Every MSH, not only the one peek_control_id would pick. This does not
+    # depend on the caller having already refused a multi-MSH frame, and a
+    # header that declares nothing readable is worth naming wherever it sits.
+    for raw in segments:
+        if not _is_segment(raw, "MSH"):
+            continue
+        # _is_segment admits a bare three-character "MSH", which carries no
+        # separator and no encoding characters at all -- hence the slice
+        # rather than an index, and hence this check being reachable.
+        if raw[3:4] != "|":
+            return "MSH-1 is not the field separator '|'"
+        if raw[4:8] != ENCODING_CHARACTERS:
+            # !r, not str: this is unvalidated sender bytes on its way into an
+            # operator's log line, and repr escapes the CR that would otherwise
+            # forge a second line there.
+            return (
+                f"MSH-2 encoding characters are {raw[4:8]!r}, "
+                f"expected {ENCODING_CHARACTERS!r}"
+            )
+    return ""
 
 
 def peek_control_id(text: str) -> str:

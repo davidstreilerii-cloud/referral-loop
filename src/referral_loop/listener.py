@@ -97,6 +97,7 @@ from .parse_hl7 import (
     msh_segment_count,
     parse_hl7_text,
     peek_control_id,
+    structural_fault,
 )
 from .registry import CORRECTED, FINAL, PRELIMINARY, Registry
 from .store import LoopStore
@@ -305,6 +306,14 @@ class MessageHandler:
                 text.encode("utf-8", errors="replace"),
                 f"expected exactly one MSH segment, found {count}",
             )
+
+        # Same reason, same point in the flow: an MSH declaring a non-standard
+        # encoding set means every "^" split we would then perform reads the
+        # wrong characters, and a frame over the segment cap is a message we
+        # refuse to hold in memory rather than one we parse partially.
+        fault = structural_fault(text)
+        if fault:
+            return self.reject_malformed(text.encode("utf-8", errors="replace"), fault)
 
         # 1. Durable write. Everything after this point may fail without losing
         #    the message: it is on disk and replayable.
