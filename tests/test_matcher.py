@@ -423,11 +423,17 @@ def test_ordering_provider_tiebreak_is_skipped_when_the_result_names_nobody():
 # collision lands another patient's loop at full confidence. That is the worst
 # outcome this system can produce.
 #
-# "Where both are known" is load-bearing in the other direction: a result with
-# no PID-3 must still match an exact accession, or a real class of ORU is
-# demoted to an orphan for carrying *less* data -- trading a rare false match
-# for a common false negative. The tests below pin both halves, because either
-# one alone has a cheap wrong implementation that passes the other.
+# The two absences are *not* symmetric, and the tests below pin each side
+# separately because a boolean "either side unknown means agree" passes half of
+# them:
+#
+#   * A loop with no MRN cannot arrive here -- `open_loop` refuses one -- so
+#     that branch stays open on the grounds that the loop side is site data and
+#     the branch is unreachable anyway.
+#   * A result with no MRN arrives all the time and is the half a sender
+#     chooses. Failing open there let an ORU with no PID segment match any
+#     patient's accession at full confidence (defect H3), so it now declines
+#     into review with the tier intact instead of attaching.
 
 
 def test_tier1_declines_when_the_mrn_disagrees():
@@ -471,28 +477,69 @@ def test_tier2_still_matches_when_the_mrn_agrees():
     assert result.tier == 2
 
 
-def test_result_carrying_no_mrn_still_matches_an_exact_accession():
-    """The reason "where both are known" is in the predicate at all.
+@pytest.mark.parametrize("field, tier", [("filler", 2), ("placer", 1)])
+def test_a_result_naming_no_patient_does_not_attach_to_an_exact_order_number(field, tier):
+    """Defect H3, at the unit that decided it.
 
-    An ORU with no readable PID-3 is a real class of message. Demoting it to an
-    orphan for carrying *less* data trades a rare false match for a common false
-    negative -- a fix worse than the bug.
+    These two tests previously asserted the opposite -- `loop_id == "L1"` at
+    full confidence -- on the reasoning that an ORU with no readable PID-3 must
+    still match an exact accession or a real class of message is demoted for
+    carrying *less* data. That trade only works if the two absences are
+    comparable, and they are not: `open_loop` refuses a loop with no MRN, so the
+    absence being protected cannot occur, while the absence being accepted is
+    the one a sender controls. An order number is printed on requisitions and is
+    frequently sequential; an ORU that names one and no patient is evidence
+    about an order and no evidence at all about a patient.
     """
+    loops = [_loop("L1", mrn="MRN1", **{f"{field}_order_number": "ID1"})]
+    result = match_result(_key(mrn="", **{field: "ID1"}), loops, PACK)
+
+    assert result.loop_id is None, "a result naming no patient must not attach itself"
+    assert result.tier == tier, "the tier that fired is kept, so the queue shows a near-miss"
+    assert result.patient_unverified is True
+    assert "names no patient" in result.reason
+
+
+@pytest.mark.parametrize("floor", [0.0, 0.9])
+def test_the_decline_does_not_depend_on_the_packs_confidence_floor(floor):
+    """The floor is signed pack data. Demoting the confidence to just under it
+    would read more naturally than declining outright and would be undone by a
+    pack whose floor is 0.0 -- a control a data edit can switch off."""
     loops = [_loop("L1", mrn="MRN1", filler_order_number="ACC1")]
-    result = match_result(_key(mrn="", filler="ACC1"), loops, PACK)
-    assert result.loop_id == "L1"
-    assert result.tier == 2
+    result = match_result(_key(mrn="", filler="ACC1"), loops, _pack(confidence_floor=floor))
+    assert result.loop_id is None, (
+        "a pack floor of 0.0 must not turn the decline back into an attachment"
+    )
+    assert result.confidence == 0.0
 
 
-def test_result_carrying_no_mrn_still_matches_an_exact_placer():
-    loops = [_loop("L1", mrn="MRN1", placer_order_number="P1")]
-    result = match_result(_key(mrn="", placer="P1"), loops, PACK)
-    assert result.loop_id == "L1"
+def test_a_result_naming_no_patient_declines_at_the_tier_that_fired():
+    """It declines rather than falling through, which is the opposite of what a
+    cross-patient collision does -- and right for the opposite reason. A
+    collision must not consume the result's turn at the lower tiers, because
+    another patient's numbering scheme is not evidence about this one. Here
+    there is no lower tier to protect: tiers 3-4 are MRN-keyed, so a key with no
+    MRN can never reach them, and falling through would only replace a legible
+    tier-1 near-miss with "no candidate loop".
+    """
+    loops = [
+        _loop("L_placer", mrn="MRN1", placer_order_number="P1"),
+        _loop("L_filler", mrn="MRN1", filler_order_number="ACC1", service_code="71260"),
+    ]
+    result = match_result(_key(mrn="", placer="P1", filler="ACC1", service_code="71260"),
+                          loops, PACK)
+    assert result.loop_id is None
     assert result.tier == 1
 
 
 def test_loop_carrying_no_mrn_still_matches_an_exact_accession():
-    """The same clause from the other side."""
+    """The side that stays open, and the reason it can.
+
+    `Registry.open_loop` refuses a loop with no MRN outright, so this branch is
+    unreachable through ingest and is kept as a defensive one: were it ever
+    reached, the missing identifier would be *our* record rather than something
+    a sender omitted, and the loop is still a loop somebody at this site opened.
+    """
     loops = [_loop("L1", mrn="", filler_order_number="ACC1")]
     result = match_result(_key(mrn="MRN1", filler="ACC1"), loops, PACK)
     assert result.loop_id == "L1"
@@ -500,18 +547,21 @@ def test_loop_carrying_no_mrn_still_matches_an_exact_accession():
 
 
 @pytest.mark.parametrize("absent", ["", None])
-def test_an_absent_mrn_is_unknown_on_either_side_however_it_is_spelled(absent):
+def test_an_absent_mrn_is_the_same_absence_however_it_is_spelled(absent):
     """`""` and `None` both mean "not known", and must not diverge.
 
-    A guard written as `loop.mrn == key.mrn` makes two absences *agree*, which
-    reads the same here but is the `"" == ""` equivalence class this file
-    already pins elsewhere -- so the absent case is asserted as "no constraint",
-    reached only because the accession still had to match exactly.
+    A guard written as `loop.mrn == key.mrn` would make two absences *agree* --
+    the `"" == ""` equivalence class this file pins elsewhere -- and one written
+    as `not loop.mrn or not key.mrn` makes both of them a licence to attach.
+    Neither is what the two sides mean, so each spelling is asserted on each
+    side.
     """
+    # Result side: no patient named, so no automatic attachment at any tier.
     assert match_result(
         replace(_key(filler="ACC1"), mrn=absent),
         [_loop("L1", mrn="MRN1", filler_order_number="ACC1")], PACK,
-    ).loop_id == "L1"
+    ).loop_id is None
+    # Loop side: unreachable through ingest, and still no constraint.
     assert match_result(
         _key(mrn="MRN1", filler="ACC1"),
         [replace(_loop("L1", filler_order_number="ACC1"), mrn=absent)], PACK,

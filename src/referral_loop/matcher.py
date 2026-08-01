@@ -26,6 +26,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 from .clock import is_readable_clock
 from .errors import PackVerificationError
@@ -61,10 +62,17 @@ _RESULTABLE_STATES = frozenset({LoopState.OPEN, LoopState.SCHEDULED, LoopState.R
 _EXACT_TIER_STATES = _RESULTABLE_STATES | frozenset({LoopState.ACKNOWLEDGED})
 
 # Every state match_result can return a loop from. Exported so ingest asks the
-# store for exactly this set rather than deciding for itself which loops to
+# store for exactly this set rather than deciding for itself which *states* to
 # offer: a listener that supplied a narrower set would silently disable a tier,
 # and omitting ACKNOWLEDGED specifically would make safety rule 2 dead code
 # without any test in this module noticing.
+#
+# Which *rows* within those states ingest offers is a different question and one
+# it is entitled to answer: `listener._candidates` narrows to the patient the
+# result names plus the order numbers it carries, which is the union of what
+# tiers 1-4 can reach. Dropping a row no tier could return is not disabling a
+# tier; handing every patient's loops to every arriving message is how a result
+# naming no patient came to match one (defect H3).
 MATCHABLE_STATES = _EXACT_TIER_STATES
 
 _TIER_PLACER = 1
@@ -294,8 +302,22 @@ def result_key_from_message(
 # -------------------------------------------------------------------- matching
 
 
-def _mrn_agrees(loop: Loop, key: ResultKey) -> bool:
-    """Do the loop and the result agree on the patient, *where both name one*?
+class _MrnCheck(Enum):
+    """What comparing a loop's MRN with a result's can establish -- three answers.
+
+    Three, not two, because "these name the same patient" and "nothing here
+    names a patient" are different facts and only one of them is grounds to
+    attach. Collapsing them into a boolean is how an ORU carrying no `PID-3` at
+    all came to match any patient's loop at full confidence.
+    """
+
+    AGREES = "agrees"
+    UNVERIFIED = "unverified"
+    DISAGREES = "disagrees"
+
+
+def _mrn_check(loop: Loop, key: ResultKey) -> _MrnCheck:
+    """Compare the patient the loop names with the patient the result names.
 
     The exact tiers key on an order number, and an order number is not a
     site-wide identifier: placer numbers are unique per placing application, so
@@ -306,17 +328,33 @@ def _mrn_agrees(loop: Loop, key: ResultKey) -> bool:
     namespace through a signed pack edit, which does not pass code review the
     way a code change would. So the tier checks the patient in code as well.
 
-    **"Where both are known" is load-bearing, not softening.** An absent MRN is
-    not a value to compare, it is the absence of a constraint: a result with no
-    readable `PID-3` must still match an exact accession, or a real class of ORU
-    is demoted to an orphan for carrying *less* data -- trading a rare false
-    match for a common false negative, which is the fix being worse than the
-    bug. Both sides get the same treatment, because a loop can lack one too.
+    **The two absences are not symmetric, and an earlier version of this
+    function treated them as if they were.** It answered "agrees" whenever
+    either side lacked an MRN, on the reasoning that an absent identifier is the
+    absence of a constraint rather than a value to compare. That reasoning holds
+    for the loop and not for the result:
 
-    This is deliberately *not* `loop.mrn == key.mrn`. That form makes two
-    absences agree, which lands on the same answer here but is the `"" == ""`
-    equivalence class this module refuses everywhere else -- and it would block
-    the one-sided absence, which is exactly the case that must not break.
+    * A loop with no MRN cannot occur. `Registry.open_loop` refuses one outright
+      -- it would be invisible to every patient-scoped query -- and the only
+      records here that may carry an empty MRN are orphans, which are never in
+      `_EXACT_TIER_STATES`. So the loop-side branch is defensive and unreachable,
+      and it is kept that way rather than deleted: were it ever reachable, the
+      loop is site data, not something a sender chose.
+    * A result with no MRN happens all the time, and `PID-3` is exactly what a
+      forged or misrouted ORU omits. That side is chosen by whoever sent the
+      message, so a fail-open there is a fail-open on the attacker-controlled
+      half: omit the PID segment, name an order number lifted from a requisition,
+      and the tier fires on evidence about an order that says nothing about a
+      patient.
+
+    So the result-side absence is reported as UNVERIFIED rather than as
+    agreement, and `match_result` declines it into the coordinator's queue with
+    the tier and the rationale intact. The message keeps its evidence and loses
+    only its ability to attach itself; see `_unattributable`.
+
+    This is still deliberately *not* `loop.mrn == key.mrn`. That form makes two
+    absences *agree*, which is the `"" == ""` equivalence class this module
+    refuses everywhere else.
 
     No alias resolution happens here. Both identifiers are already the surviving
     one: resolution runs once, at ingest, before the registry or the matcher
@@ -324,9 +362,11 @@ def _mrn_agrees(loop: Loop, key: ResultKey) -> bool:
     site the spec ruled out -- and this comparison therefore cannot
     false-negative on a merge.
     """
-    if not loop.mrn or not key.mrn:
-        return True
-    return loop.mrn == key.mrn
+    if not loop.mrn:
+        return _MrnCheck.AGREES
+    if not key.mrn:
+        return _MrnCheck.UNVERIFIED
+    return _MrnCheck.AGREES if loop.mrn == key.mrn else _MrnCheck.DISAGREES
 
 
 def _in_window(loop: Loop, key: ResultKey, pack: RulePack) -> bool:
@@ -434,6 +474,47 @@ def _resolve(
     return MatchResult(ranked[0].loop_id, tier, confidence, reason)
 
 
+def _unattributable(hits: list[Loop], tier: int, reason: str) -> MatchResult:
+    """An exact order-number hit that nothing attributes to a patient.
+
+    The order number matched and the result names nobody, so the evidence is
+    real and the attribution is not. Two things follow, and they are the whole
+    of this decision:
+
+    * **It does not attach.** `loop_id` is None, so the result reaches the
+      coordinator's orphan queue instead of marking a patient's referral
+      resulted. The alternative -- requiring a second field (service code or
+      modality) to corroborate before the tier fires -- was considered and
+      rejected: the corroborating field travels in the same OBR as the order
+      number, chosen by the same sender, and is printed on the same requisition,
+      so it constrains a typo but not a forgery. It would cost recall and buy
+      no assurance about the patient, which is the question actually open.
+    * **It keeps the tier and says why.** The tier travels into the orphan's
+      `match_tier` and this reason into its `match_reason`, so the queue shows a
+      near-miss with a named cause rather than "no candidate loop", and a
+      coordinator can attach it deliberately through `attach_orphan` -- which
+      also records the label the flywheel reads (spec section 7).
+
+    Confidence 0.0, not a pack-relative demotion. Scoring it just under
+    `pack.confidence_floor` would route it to review through `_resolve`'s floor
+    gate and read more naturally, but the floor is signed pack data: a pack with
+    a floor of 0.0 would turn the demotion back into an attachment, and a
+    control that a data edit can switch off is not a control. 0.0 is also what
+    the ambiguity decline reports, for the same reason -- neither is a weak
+    match, both are the absence of one.
+
+    Counts, never identifiers: the reason lands in audit detail, which spec
+    section 3 requires to be non-identifying. The control id and the running
+    total are logged by the listener, which is the layer that has them.
+    """
+    return MatchResult(
+        None, tier, 0.0,
+        f"{reason}, but the result names no patient; {len(hits)} candidate "
+        "loop(s) left for review rather than attached",
+        patient_unverified=True,
+    )
+
+
 def match_result(key: ResultKey, loops: list[Loop], pack: RulePack) -> MatchResult:
     """Resolve a result to one open loop, or decline.
 
@@ -444,10 +525,15 @@ def match_result(key: ResultKey, loops: list[Loop], pack: RulePack) -> MatchResu
     accident.
 
     A *hit* means the whole tier predicate, not just its identifier. Tiers 1-2
-    require the MRN to agree where both sides carry one, so a result whose only
-    exact-number match belongs to another patient has not found a hit at all --
-    it falls through rather than declining, and the lower tiers still get their
-    turn. See _mrn_agrees for why the check is there and why it is conditional.
+    require the MRN to agree, so a result whose only exact-number match belongs
+    to another patient has not found a hit at all -- it falls through rather
+    than declining, and the lower tiers still get their turn.
+
+    A result that names *no* patient is the third case and is neither: its
+    exact-number candidates are real, so the tier fires, but nothing attributes
+    them, so it declines into review rather than attaching. See `_mrn_check` for
+    why the two absences are treated differently and `_unattributable` for what
+    the decline preserves.
 
     Empty is never a match. Every tier requires its key field to be populated,
     so an absent placer cannot match another absent placer -- the `"" == ""` bug
@@ -467,17 +553,28 @@ def match_result(key: ResultKey, loops: list[Loop], pack: RulePack) -> MatchResu
     # numbering overlap is.
     mrn_rejected: set[str] = set()
 
-    def exact(hits: list[Loop]) -> list[Loop]:
-        """Apply the MRN half of the tier-1/2 predicate, recording what it drops."""
-        agreeing = []
+    def exact(hits: list[Loop]) -> tuple[list[Loop], list[Loop]]:
+        """Apply the MRN half of the tier-1/2 predicate: (attributed, unattributed).
+
+        Three answers into two lists and a set, because the tier acts
+        differently on each: a hit attributed to this patient is a match; a hit
+        nothing attributes at all is a decline that keeps the tier (see
+        `_unattributable`); a hit belonging to somebody else is neither, and is
+        counted in `mrn_rejected` for the tier-5 report.
+        """
+        agreeing: list[Loop] = []
+        unverified: list[Loop] = []
         for loop in hits:
-            if _mrn_agrees(loop, key):
+            check = _mrn_check(loop, key)
+            if check is _MrnCheck.AGREES:
                 agreeing.append(loop)
+            elif check is _MrnCheck.UNVERIFIED:
+                unverified.append(loop)
             else:
                 mrn_rejected.add(loop.loop_id)
-        return agreeing
+        return agreeing, unverified
 
-    # Tier 1 -- placer order number exact, and MRN agrees where both are known.
+    # Tier 1 -- placer order number exact, and the MRN agrees.
     #
     # The MRN is part of the *predicate*, so a cross-patient collision means the
     # tier never fires -- it does not fire and then decline. That distinction is
@@ -486,20 +583,27 @@ def match_result(key: ResultKey, loops: list[Loop], pack: RulePack) -> MatchResu
     # do. Falling through cannot manufacture a match, because every tier below
     # is either MRN-keyed (3-4) or carries this same guard (2).
     if key.placer:
-        hits = exact([loop for loop in exact_candidates if loop.placer_order_number == key.placer])
+        hits, unattributed = exact(
+            [loop for loop in exact_candidates if loop.placer_order_number == key.placer]
+        )
         if hits:
             return _resolve(
                 hits, key, pack, _TIER_PLACER, "placer order number exact", tiebreak=False
             )
+        if unattributed:
+            return _unattributable(unattributed, _TIER_PLACER, "placer order number exact")
 
-    # Tier 2 -- filler order number / accession exact, and MRN agrees where both
-    # are known.
+    # Tier 2 -- filler order number / accession exact, and MRN agrees.
     if key.filler:
-        hits = exact([loop for loop in exact_candidates if loop.filler_order_number == key.filler])
+        hits, unattributed = exact(
+            [loop for loop in exact_candidates if loop.filler_order_number == key.filler]
+        )
         if hits:
             return _resolve(
                 hits, key, pack, _TIER_FILLER, "filler order number exact", tiebreak=False
             )
+        if unattributed:
+            return _unattributable(unattributed, _TIER_FILLER, "filler order number exact")
 
     same_patient = [
         loop for loop in loops

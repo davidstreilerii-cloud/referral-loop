@@ -74,9 +74,10 @@ from .errors import (
     StaleMessageError,
     StoreUnavailableError,
 )
-from .events import ParsedMessage
+from .events import Loop, ParsedMessage
 from .matcher import (
     MATCHABLE_STATES,
+    ResultKey,
     concept_value,
     field_value,
     hl7_datetime,
@@ -292,6 +293,13 @@ class MessageHandler:
         self.mrn_reresolution_count = 0
         self.mrn_retired_count = 0
         self.suspect_truncation_count = 0
+        # Results that matched an exact order number and named no patient, so
+        # the matcher declined them into the queue rather than attaching them
+        # (matcher._unattributable). A subset of orphan_count and worth its own
+        # number: every one of these is a result that used to auto-attach at
+        # full confidence, and a rising count means either a sender has started
+        # omitting PID segments or somebody is guessing accession numbers.
+        self.unattributable_result_count = 0
         # A clock, not a message, is what went wrong here: an OBR-7 dated beyond
         # MAX_CLOCK_SKEW, declined so the loop ages from ingest rather than never
         # (see _ordered_at). Its MSH-7 counterpart -- a stamp dropped rather than
@@ -665,19 +673,62 @@ class MessageHandler:
             )
         return PRELIMINARY
 
+    def _candidates(self, key: ResultKey) -> list[Loop]:
+        """The loops an arriving result could match, and no others.
+
+        Every candidate this narrowing drops is one the matcher could not have
+        returned anyway: tiers 3-4 are keyed on the patient, and tiers 1-2 on an
+        order number the message names. So this is not a policy about matching,
+        it is the same predicate expressed where the rows are, and it is here
+        rather than left to the matcher because a full-table scan should not be
+        the posture ingest takes towards a message it has not authenticated.
+
+        `MATCHABLE_STATES` rather than `open_loops()`: an ACKNOWLEDGED loop must
+        stay a candidate at the exact tiers or a correction lands in the orphan
+        queue while the loop it corrects goes on reporting "handled". The states
+        are the matcher's to choose; only the rows are narrowed here.
+
+        The order numbers are still looked up across patients, so a loop
+        belonging to somebody else that carries this result's accession is
+        *seen* -- and reported as a collision by the matcher -- instead of
+        quietly missing from the query. Narrowing to the patient alone would
+        have silently retired that warning.
+
+        A key naming neither a patient nor an order number can satisfy no tier,
+        so it gets no candidates rather than all of them. That is the same
+        answer by a shorter route, and it is the route that stays right if a
+        tier is ever added: an unnarrowed `loops_in_states` is every loop in the
+        site, which is exactly what defect H3 needed to work.
+        """
+        if not (key.mrn or key.placer or key.filler):
+            return []
+        return self.store.loops_in_states(
+            MATCHABLE_STATES, mrn=key.mrn, order_numbers=(key.placer, key.filler)
+        )
+
     def _apply_result(self, message: ParsedMessage, *, mrn: str, submitted_mrn: str) -> None:
         key = result_key_from_message(message, self.pack, mrn=mrn)
         obx11 = self._result_status(message)
         message_at = self._message_at(message)
 
-        # MATCHABLE_STATES rather than open_loops(): an ACKNOWLEDGED loop must
-        # stay a candidate at the exact tiers or a correction lands in the
-        # orphan queue while the loop it corrects goes on reporting "handled".
-        candidates = self.store.loops_in_states(MATCHABLE_STATES)
-        outcome = match_result(key, candidates, self.pack)
+        outcome = match_result(key, self._candidates(key), self.pack)
 
         if outcome.loop_id is None:
             self.orphan_count += 1
+            if outcome.patient_unverified:
+                # Warning, where an ordinary orphan is info: the orphan queue
+                # absorbs this one either way, but "an order number matched and
+                # nothing said whose it was" is a fact about the feed that
+                # somebody has to act on. Control id and count only -- no MRN,
+                # and there is none to print in any case.
+                self.unattributable_result_count += 1
+                logger.warning(
+                    "Result %r matched an exact order number at tier %d but names no patient; "
+                    "left in the coordinator queue instead of attached (%d so far). Either a "
+                    "sender is omitting PID segments or an order number is being guessed; both "
+                    "need a human.",
+                    message.control_id, outcome.tier, self.unattributable_result_count,
+                )
             logger.info(
                 "Result %r routed to the orphan queue at tier %d: %s",
                 message.control_id, outcome.tier, outcome.reason,
@@ -731,7 +782,13 @@ class MessageHandler:
         it -- the same posture as the matcher's confidence floor.
         """
         key = result_key_from_message(message, self.pack, mrn=mrn)
-        open_loops = self.store.open_loops(mrn)
+        # `open_loops("")` is not "this patient's open loops", it is *every*
+        # open loop in the site -- the mrn argument is a filter, and an absent
+        # filter does not filter. A scheduling message carrying no readable
+        # PID-3 therefore arrived at the single-open-loop fallback below holding
+        # the whole site's work, and on a site with one open loop it cancelled
+        # it. A message that names no patient gets no patient's loops.
+        open_loops = self.store.open_loops(mrn) if mrn else []
 
         if key.placer or key.filler:
             outcome = match_result(key, open_loops, self.pack)

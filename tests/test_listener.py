@@ -23,6 +23,7 @@ the test states.
 """
 from __future__ import annotations
 
+import logging
 import socket
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from pathlib import Path
 
 import pytest
 
+from healthcare_rag.referral_loop import listener as listener_module
 from healthcare_rag.referral_loop.errors import StoreUnavailableError
 from healthcare_rag.referral_loop.events import LoopState
 from healthcare_rag.referral_loop.listener import (
@@ -130,6 +132,25 @@ def result(control_id: str = "CTRL_ORU", mrn: str = MRN, placer: str = PLACER,
         pid(mrn),
         obr(placer, filler, observed_at),
         segment("OBX", {1: "1", 2: "TX", 3: "71260^CT CHEST^CT", 5: value, 11: obx11}),
+    )
+
+
+def result_naming_no_patient(control_id: str = "CTRL_NO_PID", placer: str = "",
+                             filler: str = FILLER, obx11: str = "F",
+                             message_at: str = RESULTED_AT) -> str:
+    """An `ORU^R01` with the PID segment omitted entirely.
+
+    The H3 exploit shape: a result that names no patient at all, carrying an
+    order number lifted from a requisition or a worklist. Built by leaving the
+    segment out rather than by blanking PID-3, because that is what the wire
+    carries and because a blank PID-3 and an absent PID are two different
+    messages that must reach the same answer.
+    """
+    return message(
+        msh("ORU^R01", control_id, message_at),
+        obr(placer, filler, ORDERED_AT),
+        segment("OBX", {1: "1", 2: "TX", 3: "71260^CT CHEST^CT", 5: "No acute finding",
+                        11: obx11}),
     )
 
 
@@ -490,6 +511,189 @@ def test_oru_with_no_matching_order_creates_an_orphan(handler):
     handler.handle(result(placer="NOSUCH", filler="NOSUCH"))
     assert len(orphans(handler)) == 1
     assert handler.orphan_count == 1
+
+
+# ------------------------------- a result that names no patient (defect H3)
+#
+# Accession and placer numbers are frequently sequential and are printed on
+# requisitions and worklists, so an order number is guessable in a way an MRN
+# paired with one is not. An ORU carrying one but no PID therefore has to be
+# treated as evidence about an order and no evidence at all about a patient:
+# it may reach a coordinator as a candidate, and it may not attach itself.
+
+
+def _result_with_a_blank_patient_id(control_id: str = "CTRL_BLANK_PID") -> str:
+    """The PID segment present and PID-3 empty, rather than the segment absent.
+
+    A different message on the wire and the same absence of a patient, so it
+    must reach the same answer -- and it is the shape a misconfigured feed
+    produces, where the omitted segment is the shape a forgery produces.
+    """
+    return message(
+        msh("ORU^R01", control_id, RESULTED_AT),
+        segment("PID", {1: "1", 5: "DOE^JANE", 8: "F"}),
+        obr("", FILLER, ORDERED_AT),
+        segment("OBX", {1: "1", 2: "TX", 3: "71260^CT CHEST^CT", 5: "No acute finding", 11: "F"}),
+    )
+
+
+@pytest.mark.parametrize(
+    "build", [result_naming_no_patient, _result_with_a_blank_patient_id],
+    ids=["pid-segment-absent", "pid-3-blank"],
+)
+def test_an_oru_naming_no_patient_never_auto_attaches_to_a_loop(handler, build):
+    """Defect H3. Before the fix: tier 2 fired at confidence 1.0 and the loop
+    reached RESULTED -- "awaiting acknowledgement" -- on a result that named
+    nobody, so a coordinator confirming the queue would report patient A's
+    referral handled."""
+    handler.handle(order())
+    handler.handle(build())
+
+    assert loops(handler)[0].state is LoopState.OPEN, (
+        "a result naming no patient must not advance a patient's loop"
+    )
+    assert handler.matched_count == 0
+    assert len(orphans(handler)) == 1
+
+
+def test_the_same_result_carrying_its_pid_segment_still_attaches(handler):
+    """The other direction of the same fix. The decline must cost the ordinary
+    ORU nothing: same order number, same OBX, one segment more, and it attaches
+    exactly as before. A matcher that stops attaching scores a perfect
+    false-match rate while the product quietly stops working (spec 10.4)."""
+    handler.handle(order())
+    handler.handle(result(control_id="ORU_WITH_PID"))
+
+    assert loops(handler)[0].state is LoopState.RESULTED
+    assert handler.matched_count == 1
+    assert handler.unattributable_result_count == 0
+    assert orphans(handler) == []
+
+
+def test_a_result_whose_pid_names_another_patient_still_falls_through(handler):
+    """Unchanged by this fix, and asserted here because the two cases are one
+    line apart in `_mrn_check`: a *disagreeing* MRN drops the loop from the tier
+    without declining, so the collision cannot consume the result's turn at the
+    lower tiers."""
+    handler.handle(order())
+    handler.handle(result(control_id="ORU_OTHER", mrn="MRN_SOMEONE_ELSE"))
+
+    assert loops(handler)[0].state is LoopState.OPEN
+    assert handler.unattributable_result_count == 0, "nothing here is unattributable"
+    detail = handler.store.events_for(orphans(handler)[0].loop_id)[0].detail
+    assert "MRN disagreed" in detail["match_reason"]
+
+
+def test_a_result_naming_no_patient_is_counted_and_logged_by_control_id(handler, caplog):
+    """The `mrn_rejected` warning never fires for this shape -- nothing was
+    rejected -- so the decline needs a counter and a line of its own, or the
+    only symptom of a feed omitting PID segments is a quietly growing queue.
+
+    The line carries the control id and the running total and no identifier: a
+    separate finding in this subsystem is that MRNs reach logs through exception
+    paths, and the message that names a *missing* patient identifier is a poor
+    place to print a present one.
+    """
+    handler.handle(order())
+    caplog.set_level(logging.DEBUG)
+    handler.handle(result_naming_no_patient(control_id="ORU_NO_PID", filler=FILLER))
+
+    assert handler.unattributable_result_count == 1
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "ORU_NO_PID" in text
+    assert MRN not in text
+
+
+def test_a_result_naming_no_patient_reaches_the_queue_as_a_named_near_miss(handler):
+    """Option (b): the information survives the decline. The orphan carries the
+    tier that fired and why it was not acted on, so a coordinator can attach it
+    deliberately -- which is a labeled example (spec section 7) -- rather than
+    triaging it as a result nobody ordered."""
+    handler.handle(order())
+    handler.handle(result_naming_no_patient(filler=FILLER))
+
+    detail = handler.store.events_for(orphans(handler)[0].loop_id)[0].detail
+    assert detail["match_tier"] == 2
+    assert "names no patient" in detail["match_reason"]
+
+
+def _candidates_offered(handler, monkeypatch) -> list:
+    """Capture the loops ingest hands the matcher, without replacing it.
+
+    The real matcher still runs and still decides; the spy only records what it
+    was shown. Which loops reach it is not observable from the outcome -- an
+    unrelated patient's loop changes no answer -- and is exactly the property
+    under test, so it is asserted at the boundary where it exists.
+    """
+    offered: list = []
+    real = listener_module.match_result
+
+    def spy(key, loops, pack):
+        offered.append(list(loops))
+        return real(key, loops, pack)
+
+    monkeypatch.setattr(listener_module, "match_result", spy)
+    return offered
+
+
+def test_ingest_offers_the_matcher_one_patients_loops_not_the_whole_table(handler, monkeypatch):
+    """The other half of defect H3: nothing narrowed the candidate set by
+    patient before matching began, so every loop in the site was a candidate for
+    every arriving result and the MRN comparison was the only thing between
+    them."""
+    handler.handle(order(control_id="ORM_A", mrn="MRN_A", placer="P_A", filler="F_A"))
+    handler.handle(order(control_id="ORM_B", mrn="MRN_B", placer="P_B", filler="F_B"))
+    offered = _candidates_offered(handler, monkeypatch)
+
+    handler.handle(result(control_id="ORU_A", mrn="MRN_A", placer="P_A", filler="F_A"))
+
+    assert [loop.mrn for loop in offered[0]] == ["MRN_A"]
+
+
+def test_ingest_still_offers_a_loop_that_shares_an_order_number(handler, monkeypatch):
+    """Scoping must not blind the matcher to a cross-feed numbering collision.
+    It can only report a collision it was shown, and "two placing systems
+    numbering from the same seed" is a site-wide fault that gets worse
+    silently."""
+    handler.handle(order(control_id="ORM_B", mrn="MRN_B", placer="P_SHARED", filler="F_B"))
+    handler.handle(result(control_id="ORU_A", mrn="MRN_A", placer="P_SHARED", filler="F_A"))
+
+    detail = handler.store.events_for(orphans(handler)[0].loop_id)[0].detail
+    assert "MRN disagreed" in detail["match_reason"]
+
+
+def test_a_result_naming_neither_a_patient_nor_an_order_number_gets_no_candidates(
+    handler, monkeypatch
+):
+    """No tier can fire on such a key, so the answer is the same either way --
+    but "no candidates" and "every loop in the site" are the same answer only
+    for today's four tiers, and the second is what defect H3 needed to work."""
+    handler.handle(order())
+    offered = _candidates_offered(handler, monkeypatch)
+
+    handler.handle(message(
+        msh("ORU^R01", "ORU_BARE", RESULTED_AT),
+        segment("OBR", {1: "1", 4: SERVICE, 7: ORDERED_AT}),
+        segment("OBX", {1: "1", 2: "TX", 3: "71260^CT CHEST^CT", 5: "text", 11: "F"}),
+    ))
+
+    assert offered[0] == []
+    assert loops(handler)[0].state is LoopState.OPEN
+
+
+def test_a_scheduling_message_naming_no_patient_changes_no_loop(handler):
+    """`open_loops("")` is every open loop in the site, so an `SIU^S15` with no
+    PID segment reached the "the patient has exactly one open loop" fallback
+    with the *site's* only open loop -- and cancelling a loop removes it from
+    every worklist while it is still clinically open."""
+    handler.handle(order())
+    handler.handle(message(
+        msh("SIU^S15", "S_NO_PID", RESULTED_AT),
+        segment("SCH", {1: "APPT1", 2: "APPT1"}),
+    ))
+
+    assert loops(handler)[0].state is LoopState.OPEN
+    assert handler.untargeted_count == 1
 
 
 def test_a_correction_reaches_an_acknowledged_loop(handler):

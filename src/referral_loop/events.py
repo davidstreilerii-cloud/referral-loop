@@ -158,3 +158,10 @@ class MatchResult:
     tier: int              # 1-4 matched, 5 = no match
     confidence: float
     reason: str
+    # Set when an exact tier found candidates but the result named no patient,
+    # so the match was declined rather than made (matcher._unattributable). A
+    # field rather than something the listener re-derives from `reason` or from
+    # the tier: it is the trigger for an operational counter and a warning, and
+    # a counter keyed on a substring of a prose sentence stops counting the
+    # first time the sentence is reworded.
+    patient_unverified: bool = False

@@ -393,6 +393,53 @@ def test_loops_in_states_returns_only_the_requested_states(tmp_path):
     assert store.loops_in_states([]) == []
 
 
+def _candidate_store(tmp_path) -> LoopStore:
+    """Two patients, each with an open loop, plus one order number shared."""
+    store = LoopStore(tmp_path / "loops.db")
+    store.append_event(LoopEvent("L-a", "created", NOW, "C1", {
+        "mrn": "M_A", "placer_order_number": "P_A", "filler_order_number": "F_A"}))
+    store.append_event(LoopEvent("L-b", "created", NOW, "C2", {
+        "mrn": "M_B", "placer_order_number": "P_SHARED", "filler_order_number": "F_B"}))
+    store.append_event(LoopEvent("L-c", "created", NOW, "C3", {"mrn": "M_C"}))
+    return store
+
+
+def test_loops_in_states_narrows_to_one_patient(tmp_path):
+    """Ingest must be able to ask for one patient's loops rather than every
+    patient's. Unscoped, an arriving result is compared against the whole
+    table, and the only thing standing between it and another patient's loop is
+    a field the sender chose."""
+    store = _candidate_store(tmp_path)
+    found = store.loops_in_states([LoopState.OPEN], mrn="M_A")
+    assert {loop.loop_id for loop in found} == {"L-a"}
+
+
+def test_loops_in_states_also_admits_the_order_numbers_named(tmp_path):
+    """The other patient's loop is still reachable *by order number*, which is
+    what keeps a cross-feed numbering collision detectable: the matcher can only
+    report a collision it was shown."""
+    store = _candidate_store(tmp_path)
+    found = store.loops_in_states([LoopState.OPEN], mrn="M_A", order_numbers=("P_SHARED",))
+    assert {loop.loop_id for loop in found} == {"L-a", "L-b"}
+
+
+def test_loops_in_states_ignores_an_empty_order_number(tmp_path):
+    """`""` is not an order number, and a loop carrying no placer must not be
+    admitted by a result carrying no placer -- the `"" == ""` equivalence class
+    that would hand back most of the table under the guise of a narrowed query.
+    """
+    store = _candidate_store(tmp_path)
+    found = store.loops_in_states([LoopState.OPEN], mrn="M_A", order_numbers=("", ""))
+    assert {loop.loop_id for loop in found} == {"L-a"}
+
+
+def test_loops_in_states_is_unnarrowed_when_no_filter_is_given(tmp_path):
+    """The worklist asks for every loop in a state and must keep getting it."""
+    store = _candidate_store(tmp_path)
+    found = store.loops_in_states([LoopState.OPEN])
+    assert {loop.loop_id for loop in found} == {"L-a", "L-b", "L-c"}
+
+
 def test_a_content_key_can_only_be_claimed_once(tmp_path):
     """The unique index, tested at the store rather than through the listener.
 

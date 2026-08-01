@@ -1259,7 +1259,7 @@ class LoopStore:
         """
         return self._loops_where("mrn = ?", (mrn,))
 
-    def loops_in_states(self, states) -> list[Loop]:
+    def loops_in_states(self, states, mrn: str = "", order_numbers=()) -> list[Loop]:
         """Loops in any of the given states, read through idx_loops_state.
 
         The matcher owns which states may receive a result; this only answers
@@ -1269,12 +1269,47 @@ class LoopStore:
         in the orphan queue while the loop it corrects went on reporting
         "handled". all_loops() would answer it too, by replaying every event in
         the file and discarding all but the still-open work.
+
+        `mrn` and `order_numbers` narrow the rows, and they are **OR'd**, which
+        is the shape ingest needs and the reason they are one call rather than
+        two: the matcher's exact tiers look up an order number without regard to
+        whose it is (so that a number belonging to another patient is *seen* and
+        reported as a collision, rather than silently missing), and its lower
+        tiers look up a patient. Either filter alone would disable one of those.
+        Passing neither returns every loop in the states, which is what the
+        worklist asks for.
+
+        An empty string in `order_numbers` is dropped rather than matched. A
+        loop carrying no placer must not be admitted by a result carrying no
+        placer: that is the `"" == ""` equivalence class the matcher refuses at
+        every tier, and admitting it here would hand back most of the table
+        under the guise of a narrowed query.
+
+        `mrn` is a plain equality test and is correct across merges without
+        knowing anything about them: identity is resolved once at ingest and
+        `merge_patient` rewrites the loops it moves, so both sides of this
+        comparison are already the surviving identifier (registry.py header).
         """
         values = tuple(getattr(s, "value", s) for s in states)
         if not values:
             return []
-        placeholders = ", ".join("?" * len(values))
-        return self._loops_where(f"state IN ({placeholders})", values)
+        clause = f"state IN ({', '.join('?' * len(values))})"
+        params: tuple = values
+
+        narrowings: list[str] = []
+        if mrn:
+            narrowings.append("mrn = ?")
+            params += (mrn,)
+        numbers = tuple(number for number in order_numbers if number)
+        if numbers:
+            placeholders = ", ".join("?" * len(numbers))
+            narrowings.append(f"placer_order_number IN ({placeholders})")
+            narrowings.append(f"filler_order_number IN ({placeholders})")
+            params += numbers + numbers
+        if narrowings:
+            clause += f" AND ({' OR '.join(narrowings)})"
+
+        return self._loops_where(clause, params)
 
     def all_loops(self) -> list[Loop]:
         return self._loops_where("1 = 1", ())
