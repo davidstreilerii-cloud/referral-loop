@@ -70,7 +70,7 @@ def test_missing_signature_refuses_to_load(tmp_path):
         load_pack(tmp_path, pubkey)
 
 
-SHIPPED_PACK = Path(__file__).parent.parent.parent / "healthcare_rag" / "referral_loop" / "rules"
+SHIPPED_PACK = Path(__file__).parent.parent / "src" / "referral_loop" / "rules"
 
 
 @pytest.mark.skipif(

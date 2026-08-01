@@ -54,8 +54,8 @@ from referral_loop.pack import RulePack, load_pack
 from referral_loop.registry import Registry
 from referral_loop.store import LoopStore
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SHIPPED_PACK_DIR = REPO_ROOT / "healthcare_rag" / "referral_loop" / "rules"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SHIPPED_PACK_DIR = REPO_ROOT / "src" / "referral_loop" / "rules"
 
 
 # ------------------------------------------------------------------- fixtures

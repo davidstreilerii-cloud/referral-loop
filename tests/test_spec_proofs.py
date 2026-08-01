@@ -67,8 +67,8 @@ from referral_loop.store import LoopStore
 from referral_loop.worklist import create_app
 from tests import spec_guards
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SHIPPED_PACK_DIR = REPO_ROOT / "healthcare_rag" / "referral_loop" / "rules"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SHIPPED_PACK_DIR = REPO_ROOT / "src" / "referral_loop" / "rules"
 
 # The key the shipped pack was signed with. Pinned as a literal in
 # test_boot_gates and test_eval too; if it rotates all three fail together,
@@ -974,7 +974,7 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
     **`-m "not docker"` is not a coverage gap, and adding those tests back would
     not close one.** Do not "fix" it. Both guards are `monkeypatch`-installed
     inside *this* pytest process: `socket.socket.connect` is rebound on this
-    interpreter's socket module, and `anthropic`/`claude_cli` are poisoned in
+    interpreter's socket module, and `spec_guards.MODEL_MODULES` are poisoned in
     this interpreter's `sys.modules`. A `docker build` or `docker run` is a
     child process with its own interpreter -- and, for the container, its own
     kernel namespace -- so neither guard is in force inside it and neither can
@@ -993,11 +993,11 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
         pytest.skip("already inside the guarded run; not recursing")
 
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/referral_loop", "-q",
+        [sys.executable, "-m", "pytest", "tests", "-q",
          "-p", "tests.spec_guards",
          "-m", "not docker",
          "--deselect",
-         "tests/referral_loop/test_spec_proofs.py::"
+         "tests/test_spec_proofs.py::"
          "test_spec_12_and_13_the_whole_suite_runs_under_both_guards"],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=3600,
         env={**os.environ, spec_guards.ARMED_ENV: "1"},
@@ -1036,28 +1036,35 @@ def test_spec_12_the_egress_guard_can_actually_fail():
 
 
 def test_spec_13_the_model_guard_can_actually_fail():
-    """`anthropic` and `claude_cli` must raise on use, including through a
-    reference bound before the guard was installed -- which is the realistic
-    case, since `healthcare_rag/__init__.py` imports `claude_cli` at package
-    import time."""
-    prebound = sys.modules.get("healthcare_rag.claude_cli")
+    """Every module in `spec_guards.MODEL_MODULES` must raise on use.
+
+    The monorepo also listed `claude_cli`, and the interesting half of this test
+    was that a reference bound before the guard was installed still raised --
+    `healthcare_rag/__init__.py` imported the shim at package import time, so
+    that was the realistic case. Nothing imports a model client here, so the
+    prebound branch below is inert until one does. It stays because that is the
+    case the poisoning in `_poison_in_place` exists for, and it would go silently
+    untested otherwise.
+    """
+    assert spec_guards.MODEL_MODULES == ("anthropic",), (
+        "a model client was added to the guard without a proof that it raises"
+    )
+    prebound = sys.modules.get("anthropic")
 
     with spec_guards.armed():
         import anthropic
         with pytest.raises(spec_guards.ModelCallAttempted):
             anthropic.Anthropic(api_key="not-a-key")
 
-        from healthcare_rag import claude_cli
-        with pytest.raises(spec_guards.ModelCallAttempted):
-            claude_cli.build_claude_fn()
-
         if prebound is not None:
             with pytest.raises(spec_guards.ModelCallAttempted):
-                prebound.install_shim()
+                prebound.Anthropic(api_key="not-a-key")
 
     # Restored, or the poisoned module leaks into every test after this one.
+    # `is prebound` rather than a callability check because the module is absent
+    # from sys.modules here, and putting a stub back would also read as callable.
     if not os.environ.get(spec_guards.ARMED_ENV):
-        assert callable(getattr(sys.modules["anthropic"], "Anthropic", None))
+        assert sys.modules.get("anthropic") is prebound
 
 
 # ================================================ 14. no PHI in artifacts

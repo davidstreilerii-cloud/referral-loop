@@ -52,6 +52,7 @@ from referral_loop.peers import (
 )
 from referral_loop.registry import Registry
 from referral_loop.store import LoopStore
+from tests._pack import PACK
 from tests.test_listener import (
     MRN,
     RESULTED_AT,
@@ -64,9 +65,10 @@ from tests.test_listener import (
     result,
     scheduling,
 )
-from tests._pack import PACK
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# The package moved under src/; see the note in test_store.py.
+SRC_ROOT = REPO_ROOT / "src"
 
 SYNTHETIC = "SYNTHETIC-TEST-ONLY-DO-NOT-TRUST"
 
@@ -1164,7 +1166,7 @@ def _legacy_database(path, *, raw_rows=2) -> None:
 # for reasons the real failure would not supply.
 _CRASH_SCRIPT = """
 import os, sqlite3, sys
-sys.path.insert(0, {repo!r})
+sys.path.insert(0, {src!r})
 
 # sqlite3.Connection is an immutable type, so the seam is a connection factory
 # rather than a patched method.
@@ -1188,7 +1190,7 @@ def _crash_during_migration(tmp_path, db_path, trigger_sql: str):
 
     script = tmp_path / "crash.py"
     script.write_text(
-        _CRASH_SCRIPT.format(repo=str(REPO_ROOT), db=str(db_path), trigger=trigger_sql),
+        _CRASH_SCRIPT.format(src=str(SRC_ROOT), db=str(db_path), trigger=trigger_sql),
         encoding="utf-8",
     )
     return subprocess.run([sys.executable, str(script)], capture_output=True, text=True,

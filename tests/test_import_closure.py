@@ -1,10 +1,10 @@
 """Success criterion 6: the referral install needs neither ChromaDB nor the corpus.
 
 This MUST run in a clean subprocess. An in-process sys.modules snapshot passes
-vacuously: under `pytest tests/` another test has already imported
-healthcare_rag.db long before this one runs, so db never appears as "newly
-imported" and the assertion silently proves nothing. Verified -- the snapshot
-form passes even with healthcare_rag.db loaded.
+vacuously: under `pytest tests/` a forbidden module already imported by an
+earlier test never appears as "newly imported", so the assertion silently proves
+nothing about what this package pulls in. The subprocess is what makes the
+closure the interpreter's whole closure rather than this test's share of it.
 
 Same principle as spec test 7: assert on the real end state, not on a proxy.
 """
@@ -15,12 +15,15 @@ from pathlib import Path
 
 import pytest
 
+# The ML-stack entries are what stop a convenience import dragging torch back in.
+# `healthcare_rag` is here so a stray reference to the namespace this package was
+# extracted from fails loudly instead of resolving against whatever copy of the
+# monorepo happens to be installed. `anthropic` is here because there is no longer
+# a parent package installing a CLI shim -- see the test below.
 FORBIDDEN = [
     "chromadb", "sentence_transformers", "torch", "transformers",
     "lightrag", "raganything", "mcp", "ollama",
-    "healthcare_rag.revenue_integrity", "healthcare_rag.denial_rca",
-    "healthcare_rag.db", "healthcare_rag.audit_trail",
-    "healthcare_rag.guardrails.tenant_isolation",
+    "anthropic", "healthcare_rag",
 ]
 
 _PROBE = """
@@ -52,21 +55,23 @@ def test_referral_import_closure_in_a_clean_interpreter():
     assert leaked == [], f"referral_loop pulled in forbidden modules: {leaked}"
 
 
-def test_anthropic_is_in_the_closure_and_that_is_expected():
-    """Documents a constraint so nobody 'fixes' it wrongly later.
+def test_anthropic_is_not_in_the_closure_and_that_is_the_point():
+    """The inverse of what this test asserted in the monorepo, and the reason is
+    the extraction.
 
-    healthcare_rag/__init__.py:5-6 calls claude_cli.install_shim(), which imports
-    anthropic. Every healthcare_rag.* import therefore pulls it in, and short of
-    restructuring the parent package that cannot be avoided.
+    There, `healthcare_rag/__init__.py` called `claude_cli.install_shim()`, which
+    imports anthropic, so every `healthcare_rag.*` import pulled it in and the
+    honest thing to do was document that it could not be avoided. There is no such
+    parent package here. Nothing in this closure has any reason to reach for a
+    model client, so anthropic appearing in it means someone added one.
 
-    This does not weaken the v1 claim. "No model calls" is proven by spec test 6
-    (a later task), which monkeypatches anthropic and claude_cli to raise and runs
-    the whole suite -- an assertion about behavior, not about the import graph. A
-    module being importable is not a model call.
+    This is still an assertion about the import graph, not about behaviour --
+    importing a module is not a model call. The behavioural claim is spec 13,
+    which poisons anthropic and runs the whole suite against it.
     """
-    assert "anthropic" in _run_probe(), (
-        "If anthropic is no longer in the closure the parent package changed; "
-        "re-check that spec test 6 still proves what it claims."
+    assert "anthropic" not in _run_probe(), (
+        "referral_loop pulled in a model client; v1 makes no model calls, and "
+        "spec 13 proves that behaviourally only for the clients it knows to poison."
     )
 
 

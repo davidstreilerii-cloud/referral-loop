@@ -56,7 +56,7 @@ from tests.test_worklist import (
     _E2E_UNMATCHED,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 MRN_SENTINEL = "ZZSENTINELMRN0001"
 REASON_SENTINEL = "ZZSENTINELREASON"
@@ -709,8 +709,15 @@ def test_init_runs_once_per_path_not_once_per_write(registry, monkeypatch):
 
 def test_the_default_audit_database_is_the_guardrail_stacks_own():
     """Spec section 3: referral audit routes through immutable_audit, which
-    "already owns its own append-only database". Not a new file beside the loop
-    store, and not `rag_growth.db` -- `db.py` is excluded.
+    "already owns its own append-only database" -- one file, not one per caller,
+    and not `rag_growth.db`.
+
+    The name is the monorepo's: the module was the guardrail stack's and the
+    database was the one that stack already had. Vendored, it is this package's,
+    and its default sits in <repo>/data beside the loop store rather than inside
+    the package -- see the note on _DEFAULT_AUDIT_DIR in immutable_audit.py. What
+    this still pins is that the default is that one path and nothing else has
+    quietly moved it.
 
     The conftest redirects the live path, so this reads the value captured
     before any redirect rather than the patched one.
@@ -797,7 +804,7 @@ audit.set_audit_db(sys.argv[1])
 with audit.audited(audit.AuditAction.PACK_LOADED, actor="s", role="system") as scope:
     scope.pack_version = "1.0.0"
 assert audit.write_failures() == 0, "the probe did not manage to write a row"
-print(json.dumps(sorted(m for m in sys.modules if "guardrails" in m)))
+print(json.dumps(sorted(sys.modules)))
 """
 
 
@@ -811,39 +818,24 @@ def _probe(tmp_path, prelude: str = "") -> list[str]:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-def test_auditing_does_not_pull_in_tenant_isolation(tmp_path):
+def test_the_audit_module_is_a_sibling_not_a_package_import(tmp_path):
     """The behavioural form of the import-closure test. `test_import_closure`
     imports the package and looks at `sys.modules`, which cannot see a lazy
     import; this actually writes an audit row and then looks.
 
-    Spec section 3 keeps `tenant_isolation` out because "importing an unexercised
-    isolation control would suggest a guarantee the build does not test", and
-    `healthcare_rag/guardrails/__init__.py` re-exports it -- so importing the one
-    permitted module the ordinary way would settle that question the wrong way.
+    In the monorepo the store was loaded by file path, to reach one module inside
+    a package whose `__init__` re-exported the whole guardrails stack --
+    `tenant_isolation` among it, which spec section 3 keeps out because
+    "importing an unexercised isolation control would suggest a guarantee the
+    build does not test". Vendored, that hazard is gone; the property that
+    remains is that writing an audit row pulls in the audit store and nothing
+    from the namespace this package was extracted from.
     """
     loaded = _probe(tmp_path)
-    assert "healthcare_rag.guardrails.immutable_audit" in loaded
-    assert "healthcare_rag.guardrails.tenant_isolation" not in loaded
-    assert "healthcare_rag.guardrails" not in loaded
-
-
-def test_one_module_object_whichever_import_happens_first(tmp_path):
-    """Two module objects would mean two `_db_lock`s over one file, which is
-    worse than the problem being avoided. Asserted in both orders, in a clean
-    interpreter, because in-process the answer depends on what ran before."""
-    check = (
-        "import sys\n"
-        "from referral_loop import audit\n"
-        "from healthcare_rag.guardrails import immutable_audit as pkg\n"
-        "assert audit._module() is pkg, 'two module objects over one database'\n"
-        "assert audit._module()._db_lock is pkg._db_lock\n"
+    assert "referral_loop.immutable_audit" in loaded
+    assert not any(m.startswith("healthcare_rag") for m in loaded), sorted(
+        m for m in loaded if m.startswith("healthcare_rag")
     )
-    _probe(tmp_path, prelude=check)
-    _probe(tmp_path, prelude=(
-        "from healthcare_rag.guardrails import immutable_audit as pkg\n"
-        "from referral_loop import audit\n"
-        "assert audit._module() is pkg, 'two module objects over one database'\n"
-    ))
 
 
 def test_the_suite_never_writes_to_the_installed_audit_database():

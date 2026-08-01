@@ -3,8 +3,9 @@
 Both spec tests are worded as properties of the suite, not of a module:
 
   12. **No egress.** Block non-loopback `socket.connect`; full suite passes.
-  13. **No model calls.** Monkeypatch `anthropic` and `claude_cli` to raise; full
-      suite passes.
+  13. **No model calls.** Monkeypatch every model client to raise; full suite
+      passes. In the monorepo that was `anthropic` and `claude_cli`; here it
+      is `anthropic` alone -- see MODEL_MODULES.
 
 Two per-module tests already assert "this function opened no socket"
 (`test_listener.py::test_the_listener_makes_no_outbound_connection`,
@@ -43,6 +44,11 @@ LOOPBACK_HOSTS = frozenset(
 )
 
 _INET_FAMILIES = frozenset({socket.AF_INET, socket.AF_INET6})
+
+# Every model client spec 13 poisons. One entry, because this package ships no
+# model client at all; `install_guards` and `armed` must agree on it, which is
+# why it is named rather than written out twice.
+MODEL_MODULES = ("anthropic",)
 
 
 class EgressAttempted(AssertionError):
@@ -91,10 +97,10 @@ def _raising_model_module(name: str) -> types.ModuleType:
     """A stand-in module where touching *any* attribute raises.
 
     Replacing `sys.modules[name]` alone would leave every already-bound
-    reference live -- `healthcare_rag/__init__.py` imports `claude_cli` at
-    package import, long before this plugin loads -- so `install_guards` also
-    poisons the real module objects in place. This covers the other direction:
-    code that imports the name *after* the guard is armed.
+    reference live -- anything that imported the module before this plugin
+    loaded still holds it -- so `install_guards` also poisons the real module
+    objects in place. This covers the other direction: code that imports the
+    name *after* the guard is armed.
     """
     module = types.ModuleType(name)
     module.__doc__ = f"{name} disabled by spec test 13."
@@ -157,15 +163,19 @@ def install_guards() -> None:
     socket.socket.connect = guarded_connect
     socket.socket.connect_ex = guarded_connect_ex
 
-    for name in ("anthropic", "healthcare_rag.claude_cli"):
+    # `anthropic` alone. The monorepo also poisoned `healthcare_rag.claude_cli`,
+    # its CLI shim; this package ships no model client of any kind, so that is the
+    # whole list. Adding a client means adding it here -- test_import_closure is
+    # what makes forgetting to fail loudly.
+    for name in MODEL_MODULES:
         existing = sys.modules.get(name)
         if isinstance(existing, types.ModuleType):
             _poison_in_place(existing, name)
         stub = _raising_model_module(name)
         sys.modules[name] = stub
-        # A submodule is reachable as an attribute of its package as well as
-        # through sys.modules, and `healthcare_rag.claude_cli` is bound on the
-        # package object by `healthcare_rag/__init__.py`'s own import.
+        # A dotted name is reachable as an attribute of its package as well as
+        # through sys.modules, so a stub in sys.modules alone would miss anything
+        # holding the package. No name in MODEL_MODULES is dotted today.
         package, _, leaf = name.rpartition(".")
         parent = sys.modules.get(package) if package else None
         if parent is not None:
@@ -184,7 +194,7 @@ def armed():
     """
     saved_connect = socket.socket.connect
     saved_connect_ex = socket.socket.connect_ex
-    names = ("anthropic", "healthcare_rag.claude_cli")
+    names = MODEL_MODULES
     saved_modules = {name: sys.modules.get(name) for name in names}
     saved_attrs = {}
     for name in names:

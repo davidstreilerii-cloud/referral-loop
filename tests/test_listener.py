@@ -71,7 +71,10 @@ from referral_loop.staleness import is_stale, staleness_ratio
 from referral_loop.store import LoopStore
 from tests._pack import PACK
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# The package moved under src/ while the tests package stayed at the repo root, so
+# a child that needs both needs both paths.
+SRC_ROOT = REPO_ROOT / "src"
 
 MRN = "MRN123456"
 SURVIVING_MRN = "MRN999999"
@@ -272,6 +275,7 @@ def test_raw_survives_process_death_mid_parse(tmp_path):
     script.write_text(
         "import sys, time\n"
         f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        f"sys.path.insert(0, {str(SRC_ROOT)!r})\n"
         "import referral_loop.listener as listener_mod\n"
         "from referral_loop.listener import MessageHandler\n"
         "from referral_loop.registry import Registry\n"

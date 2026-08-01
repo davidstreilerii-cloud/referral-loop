@@ -46,8 +46,8 @@ from referral_loop.retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV
 from referral_loop.store import LoopStore
 from tests.test_listener import MRN, ORDERED_AT, order, result
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SHIPPED_PACK_DIR = REPO_ROOT / "healthcare_rag" / "referral_loop" / "rules"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SHIPPED_PACK_DIR = REPO_ROOT / "src" / "referral_loop" / "rules"
 SHIPPED_PUBKEY = "adb7af9938740d48d237fc2e191c7a52d41000654d7e8335d08edd51a97ed105"
 
 
@@ -540,7 +540,7 @@ def test_help_works_with_no_pack_no_environment_and_no_database(tmp_path):
     env = {k: v for k, v in os.environ.items()
            if k not in {"PHI_MODE", "PHI_ENCRYPTION_VERIFIED",
                         "REFERRAL_THRESHOLDS_ACCEPTED", PUBKEY_ENV}}
-    env["PYTHONPATH"] = str(REPO_ROOT)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
     proc = subprocess.run(
         [sys.executable, "-m", "referral_loop.cli", "--help"],
         capture_output=True, text=True, timeout=180, cwd=tmp_path, env=env,

@@ -39,8 +39,8 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DOCKERFILE = REPO_ROOT / "Dockerfile.referral"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DOCKERFILE = REPO_ROOT / "Dockerfile"
 IMAGE = "referral-loop:test"
 
 # Distribution names as pip reports them, not import names.

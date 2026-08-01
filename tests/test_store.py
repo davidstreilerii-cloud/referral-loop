@@ -16,7 +16,11 @@ from referral_loop.events import LoopEvent, LoopState
 from referral_loop.store import LoopStore
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The package moved under src/, so the repo root is no longer the directory that
+# holds it. A child pointed at the repo root would import whatever copy happens to
+# be installed instead of the tree under test.
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
 
 
 def test_raw_message_persists_before_any_parse(tmp_path):
@@ -101,7 +105,7 @@ def test_replay_survives_process_restart(tmp_path):
 
 _HARD_KILL_CHILD = """
 import os, sys, time
-sys.path.insert(0, {repo!r})
+sys.path.insert(0, {src!r})
 from datetime import datetime, timezone
 from referral_loop.events import LoopEvent
 from referral_loop.store import LoopStore
@@ -132,7 +136,7 @@ def test_durability_survives_a_hard_kill(tmp_path):
     ready = tmp_path / "ready"
     child = tmp_path / "child.py"
     child.write_text(_HARD_KILL_CHILD.format(
-        repo=REPO_ROOT, db=str(db), ready=str(ready)))
+        src=SRC_ROOT, db=str(db), ready=str(ready)))
 
     proc = subprocess.Popen([sys.executable, str(child)])
     try:

@@ -74,7 +74,7 @@ def stack(tmp_path, monkeypatch):
     # The client stands in for the coordinator's browser, so it sends what one
     # sends on its own page's forms: an Origin matching the default Host. Without
     # it the form posts below are indistinguishable from cross-site ones, which
-    # worklist.py refuses. See tests/referral_loop/test_worklist.py for the gate.
+    # worklist.py refuses. See tests/test_worklist.py for the gate.
     client.environ_base["HTTP_ORIGIN"] = "http://localhost"
     return store, registry, client
 
