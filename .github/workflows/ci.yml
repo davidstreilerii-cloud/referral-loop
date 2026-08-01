@@ -41,28 +41,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install ruff
+      # The package and its real dependencies, not a bare `pip install ruff mypy`.
+      # ruff does not care, but mypy does: with cryptography and flask absent,
+      # --ignore-missing-imports turns them into Any and mypy checks strictly less
+      # than it does locally. That matters most for --warn-unused-ignores below,
+      # which would otherwise be judging a different set of errors than the one
+      # the ignore was written against. Both tools are already in [dev].
+      - run: python -m pip install -e ".[dev]"
       - run: ruff check src/ tests/
 
-      # There is deliberately no mypy step yet, and this comment is here so that
-      # absence is a decision on the record rather than an oversight.
-      #
-      # `mypy src/referral_loop/ --ignore-missing-imports --check-untyped-defs`
-      # reports six pre-existing errors, all of them in code this extraction
-      # copied unchanged:
-      #   audit.py:571      assigning a str to a RefusalCode | None field
-      #   retention.py:186-192  from_env(env: dict | None) is handed os.environ,
-      #                     which is _Environ[str], not dict -- four errors from
-      #                     the one annotation
-      #   eval.py:895       dict.get() handed an Any | None key
-      #
-      # None is a bug; all are annotations that are narrower than the values the
-      # code actually passes. Fixing them means editing src/, and the extraction
-      # this repository came out of is under a zero-behaviour-change rule -- so
-      # the choice was between a job that is red on every push and no job. A
-      # permanently-red required check trains people to ignore CI, which costs
-      # more than the type coverage is worth. Add this step in the same change
-      # that fixes the six; do not add it before.
+      # --warn-unused-ignores on purpose. There is exactly one `# type: ignore`
+      # in src/ (eval.py, where dict.get is handed a key the checker types as
+      # `Any | None`), and this flag is what stops it outliving the error it was
+      # added for -- an ignore nobody notices has gone stale is how a silenced
+      # checker turns into an unchecked one.
+      - run: mypy src/referral_loop/ --ignore-missing-imports --check-untyped-defs --warn-unused-ignores
 
   image:
     runs-on: ubuntu-latest

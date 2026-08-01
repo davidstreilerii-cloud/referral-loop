@@ -88,6 +88,7 @@ picking a side, and ``corpus_from_site`` counts what it could not rebuild.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -180,7 +181,10 @@ class RetentionPolicy:
         _checked(RESOLVED_DAYS_ENV, self.resolved_days)
 
     @classmethod
-    def from_env(cls, env: dict | None = None) -> "RetentionPolicy":
+    # Mapping, not dict: the default argument is os.environ, which is _Environ[str]
+    # and not a dict. Every caller already passed one or the other; the annotation
+    # was simply narrower than the values the method has always received.
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "RetentionPolicy":
         import os
 
         env = os.environ if env is None else env

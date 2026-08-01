@@ -433,7 +433,13 @@ class AuditScope:
     def __init__(self) -> None:
         self.loops_moved: int | None = None
         self.pack_version: str = ""
-        self.refusal: RefusalCode | None = None
+        # `str` as well as `RefusalCode`, because `record_peer_refusal` stores a
+        # bare string here and always has. `_refusal()` below branches on
+        # `isinstance(value, RefusalCode)` precisely because both arrive -- the
+        # annotation was narrower than the two cases the reader already handles.
+        # (RefusalCode subclasses str, so the union is documentation of intent
+        # rather than a widening: normally a code, sometimes a plain string.)
+        self.refusal: RefusalCode | str | None = None
         # Retention (spec section 6). Counts of what a purge removed and the
         # periods in force when it did.
         self.raw_deleted: int | None = None

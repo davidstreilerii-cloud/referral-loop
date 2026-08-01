@@ -892,7 +892,14 @@ def corpus_from_site(store: LoopStore) -> list[LabeledCase]:
     archive = _archive_index(store)
 
     for row in rows:
-        build = reconstructors.get(row.get("outcome"))
+        # An ignore rather than an annotation, because no annotation removes this
+        # one: `store.labels()` returns untyped dicts, so
+        # `row.get("outcome")` is `Any | None`, and `dict.get` insists on its exact
+        # key type. Widening `reconstructors` to accept a None key would be a lie
+        # -- nothing ever puts one there. A row with no "outcome" is a legitimate
+        # miss and the very thing the outer `.get` is here to absorb: it returns
+        # None and the `build is None` guard on the next line skips the row.
+        build = reconstructors.get(row.get("outcome"))  # type: ignore[arg-type]
         loop_id = row.get("loop_id") or ""
         if build is None or not loop_id:
             continue
