@@ -504,6 +504,70 @@ def test_a_future_dated_final_does_not_outrank_a_genuine_correction(registry, st
     assert acked[0].detail["ack_result_status"] == "C"
 
 
+def test_a_trusted_older_result_does_not_mask_a_distrusted_newer_one(registry, store):
+    """The inversion flipped rather than removed.
+
+    An unconditional `trusted` flag decided the ranking *before* the times were
+    compared, so the mixed comparison was hidden rather than eliminated: a
+    genuine correction from a RIS whose clock jumped -- endemic, by this
+    subsystem's own account -- was masked by the very final it corrected. The
+    transition fired and the loop stayed on the queue, but the audit recorded a
+    coordinator as having vouched for the superseded read.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(
+        loop_id, obx11="F", control_id="C2",
+        message_at=datetime.now(timezone.utc) - timedelta(days=4),
+    )
+    registry.acknowledge(loop_id, actor="coord1", role="coordinator", control_id="C3")
+
+    registry.record_result(loop_id, obx11="C", control_id="C4", message_at=_beyond_skew())
+
+    assert registry.get(loop_id).state is LoopState.RESULTED
+    assert registry._latest_result_status(loop_id) == "C"
+
+    registry.acknowledge(loop_id, actor="coord2", role="coordinator", control_id="C5")
+    acked = [e for e in store.events_for(loop_id) if e.event_type == "acknowledged"]
+    assert acked[-1].detail["ack_result_status"] == "C", (
+        "the audit must name the read the coordinator was actually shown"
+    )
+
+
+def test_a_distrusted_final_can_still_close_a_loop_left_preliminary(registry):
+    """The second variant of the same flip, and a permanent block of the same
+    class as the watermark poisoning this began with: a trusted `P` masked a
+    distrusted `F`, so the loop could never be acknowledged at all."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(
+        loop_id, obx11="P", control_id="C2",
+        message_at=datetime.now(timezone.utc) - timedelta(days=4),
+    )
+    registry.record_result(loop_id, obx11="F", control_id="C3", message_at=_beyond_skew())
+
+    assert registry._latest_result_status(loop_id) == "F"
+    registry.acknowledge(loop_id, actor="coord1", role="coordinator", control_id="C4")
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+
+def test_a_future_dated_merge_is_counted_without_changing_the_merge(registry, store):
+    """An ADT^A40 is exempt from the *ordering* guard, not from visibility.
+
+    `merge_message_at` is read by nothing -- deliberately, and it stays that way
+    -- so a skewed A40 can regress nothing. But "either a sender's clock is wrong
+    or a message is forged, and both need a human" is exactly as true of the
+    highest-value message type in the subsystem, and the counter never fired.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    carried = registry.merge_patient(
+        prior_mrn="MRN1", surviving_mrn="MRN2", control_id="A40",
+        message_at=_beyond_skew(),
+    )
+
+    assert carried == [loop_id], "the merge itself must be unchanged"
+    assert registry.get(loop_id).mrn == "MRN2"
+    assert registry.future_dated_message_count == 1
+
+
 def test_a_message_dated_beyond_every_bound_takes_the_same_path_as_ordinary_skew(registry):
     """One future bound, one behaviour. An earlier draft bounded the *parse* at
     a year and *trust* at a day, so the year-9999 exploit that motivated the fix

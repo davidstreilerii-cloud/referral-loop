@@ -209,13 +209,11 @@ _MESSAGE_AT = "message_at"
 # on why an identity correction is not a clinical observation.
 _MERGE_MESSAGE_AT = "merge_message_at"
 
-# Marks an event whose MSH-7 was refused as clock-skewed (see _stamp). Records
-# that the *absence* of a stamp here was a decision, not a message that arrived
-# without one -- the two must rank differently in _latest_result_event, because
-# falling back to arrival time for a timestamp we deliberately distrusted lets
-# it outrank every genuine result dated in the past. A bare boolean: it says
-# something about a clock, never about a patient.
-_MESSAGE_AT_UNTRUSTED = "message_at_untrusted"
+# Ranks an event for which no clinical time can be established at all -- one
+# appended before any trusted stamp exists on the loop. Never compared against a
+# real timestamp: the leading flag in _latest_result_event's key separates the
+# two classes first, so this only orders such events against each other.
+_NO_CLINICAL_TIME = datetime.min.replace(tzinfo=timezone.utc)
 
 # Written by any event that supersedes an acknowledgement.
 _CLEARED_ACK = {"ack_by": "", "ack_role": "", "ack_at": ""}
@@ -552,6 +550,7 @@ class Registry:
                                 "submitted_prior_mrn": prior_mrn,
                             },
                             message_at,
+                            control_id,
                         ),
                     )
                 )
@@ -1281,14 +1280,11 @@ class Registry:
         one message, where refusing the message costs the result itself, and a
         RIS running fast is endemic rather than exotic.
 
-        The event is marked `_MESSAGE_AT_UNTRUSTED` rather than merely left bare.
-        An event with no stamp falls back to arrival time in
-        `_latest_result_event`, and arrival is *now* -- later than every
-        legitimately past MSH-7 -- so a distrusted read would otherwise become
-        the loop's newest result permanently: a `P` blocking acknowledgement for
-        good, or an `F` outranking the correction that superseded it. The mark
-        distinguishes "we refused this clock" from "this message carried no
-        clock", which is the difference between the two rankings.
+        The event is left with no stamp at all, and carries no mark saying so.
+        `_latest_result_event` ranks an event that has no clinical time by its
+        position in the append-only log, which is the same thing it must do for
+        a message that genuinely carried no MSH-7 -- so the two need no telling
+        apart, and a marker would be state nothing reads.
 
         Counted, not merely dropped. A silent drop is how this stayed invisible.
         """
@@ -1302,14 +1298,34 @@ class Registry:
                 "is wrong or a message is forged; both need a human.",
                 control_id, MAX_CLOCK_SKEW, self.future_dated_message_count,
             )
-            return {**detail, _MESSAGE_AT_UNTRUSTED: True}
+            return detail
         return {**detail, _MESSAGE_AT: _as_utc(message_at).isoformat()}
 
-    @staticmethod
-    def _stamp_merge(detail: dict, message_at: datetime | None) -> dict:
-        """Record an A40's MSH-7 without letting it govern clinical ordering."""
+    def _stamp_merge(self, detail: dict, message_at: datetime | None, control_id: str) -> dict:
+        """Record an A40's MSH-7 without letting it govern clinical ordering.
+
+        Written even when the clock is beyond `MAX_CLOCK_SKEW`, unlike `_stamp`.
+        `_MERGE_MESSAGE_AT` is read by nothing -- `_message_time` looks only at
+        `_MESSAGE_AT`, `merged_in` is not a result event, and no state depends on
+        it -- so a skewed A40 can regress nothing, and dropping the value here
+        would lose an audit record to defend against nothing.
+
+        It is still **counted**, on the same counter as every other skewed
+        message. The merge's exemption is from the ordering guard, not from
+        visibility: "a sender's clock is wrong or a message is forged" is exactly
+        as true of an ADT^A40, and an identity merge is the highest-consequence
+        message this subsystem accepts.
+        """
         if message_at is None:
             return detail
+        if is_future_dated(message_at, _now()):
+            self.future_dated_message_count += 1
+            logger.warning(
+                "ADT^A40 %r is dated beyond the clock-skew window (%s); the merge is applied "
+                "unchanged, as its timestamp governs no ordering (%d skewed message(s) so far). "
+                "Either a sender's clock is wrong or a message is forged; both need a human.",
+                control_id, MAX_CLOCK_SKEW, self.future_dated_message_count,
+            )
         return {**detail, _MERGE_MESSAGE_AT: _as_utc(message_at).isoformat()}
 
     @staticmethod
@@ -1398,17 +1414,35 @@ class Registry:
         is exactly when getting it wrong would let a loop be acknowledged on a
         superseded read, so it is defended here rather than assumed away.
 
-        **An event whose clock this registry refused ranks below every event
-        that has one.** That premise above -- arrival order equals clinical order
-        for anything appended here -- stopped being true the moment `_stamp`
-        began deliberately withholding a stamp: arrival for such an event is
-        *now*, later than every legitimately past MSH-7, so it would win the
-        ranking outright and permanently. A future-dated `P` then blocked
-        acknowledgement of the loop for good ("has no final or corrected
-        result") even after a genuine correction landed, and a future-dated `F`
-        outranked the very correction that superseded it. Ranking it last is not
-        discarding it: it still supplies the status when it is the only result
-        the loop holds, so a mis-clocked feed still reaches a queue.
+        **A message time is never compared against an arrival time.** That is
+        the whole rule, and two successive bugs came from breaking it. An event
+        with no usable clock -- a message whose MSH-7 was refused as skewed, a
+        coordinator's attachment -- used to fall back to `occurred_at`, i.e.
+        *now*, which beats every legitimately past MSH-7 and made such an event
+        the loop's newest result permanently: a `P` blocking acknowledgement for
+        good, an `F` outranking the correction that superseded it. Sorting those
+        events unconditionally *below* stamped ones only moved the mixed
+        comparison to the other side of the boundary and inverted the harm: a
+        trusted older final then masked a genuinely newer correction from a RIS
+        whose clock had jumped, and the audit recorded a coordinator vouching
+        for the superseded read.
+
+        So an event with no clock of its own inherits the newest clinical time
+        established on the loop **at its own point in the log**, and ties break
+        on append index. Both quantities being compared are then clinical times,
+        and the tiebreak is position in an append-only log -- which is exactly
+        what `_refuse_if_stale` already guarantees for anything this registry
+        wrote. A distrusted result that lands after a trusted one therefore
+        still wins, and a trusted correction that lands after a distrusted read
+        still wins.
+
+        The residual, stated rather than glossed: an event carrying no clock
+        cannot be ranked *ahead* of a stamped event whose clinical time is later
+        than anything established when it arrived, because nothing about it says
+        it is newer. In particular, an unstamped event appearing before any
+        trusted stamp on the loop has no clinical time at all and loses to every
+        stamped event, whatever it claims. That is the direction that fails
+        toward a human looking: the loop stays RESULTED and on the queue.
 
         `unmatched` is deliberately NOT a result event, even though it is what a
         detachment writes. Its timestamp is a human's clock and every other key
@@ -1419,13 +1453,18 @@ class Registry:
         """
         best_key = None
         best: LoopEvent | None = None
+        # The newest clinical time established anywhere on the loop so far, in
+        # append order. Taken over every event, not only result events: a
+        # `created` or `scheduled` carries an MSH-7 and dates what follows it.
+        established: datetime | None = None
         for index, event in enumerate(self.store.events_for(loop_id)):
+            stamped = self._message_time(event)
+            if stamped is not None:
+                established = stamped if established is None else max(established, stamped)
             if event.event_type not in _RESULT_EVENTS:
                 continue
-            # Leading flag, so a distrusted clock loses to any trusted one
-            # before the times are compared at all. False sorts below True.
-            trusted = not event.detail.get(_MESSAGE_AT_UNTRUSTED)
-            key = (trusted, self._message_time(event) or _as_utc(event.occurred_at), index)
+            clinical = stamped if stamped is not None else established
+            key = (clinical is not None, clinical or _NO_CLINICAL_TIME, index)
             if best_key is None or key > best_key:
                 best_key = key
                 best = event

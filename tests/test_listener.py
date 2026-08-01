@@ -968,8 +968,17 @@ def _skewed_msh7(days: int) -> str:
 
 @pytest.mark.parametrize(
     "poison_at",
-    ["99991231235959", _skewed_msh7(30), _skewed_msh7(2)],
-    ids=["year_9999", "a_month_ahead", "two_days_ahead"],
+    [
+        "99991231235959",
+        _skewed_msh7(300),
+        _skewed_msh7(30),
+        _skewed_msh7(2),
+        # Just past MAX_CLOCK_SKEW: the "RIS running 25 hours fast" the whole
+        # apply-don't-trust-count decision was argued on. The unit boundary is
+        # exact to the second; this is the same case reaching the wire.
+        (datetime.now(timezone.utc) + timedelta(hours=25)).strftime("%Y%m%d%H%M%S"),
+    ],
+    ids=["year_9999", "ten_months_ahead", "a_month_ahead", "two_days_ahead", "just_past_the_bound"],
 )
 def test_a_future_dated_result_cannot_deafen_a_loop_to_its_own_correction(handler, poison_at):
     """H1 on the wire, the clinically severe version, across the whole band.
