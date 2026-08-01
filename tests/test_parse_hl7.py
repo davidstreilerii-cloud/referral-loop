@@ -113,7 +113,8 @@ def test_prefix_colliding_segment_id_is_not_allowlisted():
         "OBXTRA|1|TX|CODE||SENTINEL_LEAK||||||F\r"
     )
     assert msg.segments.get("OBX") is None
-    import dataclasses, json
+    import dataclasses
+    import json
     assert "SENTINEL_LEAK" not in json.dumps(dataclasses.asdict(msg), default=str)
 
 

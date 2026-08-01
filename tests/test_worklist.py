@@ -1176,7 +1176,7 @@ def test_the_refusal_echoes_nothing_the_caller_sent(http, registry, caplog):
     with caplog.at_level(logging.INFO):
         response = _raw(http).get(f"http://{MRN_SENTINEL}.evil.com/worklist/?format=json")
         forged = _raw(http).post(
-            f"http://127.0.0.1:5057/worklist/L-000000000000/dismiss",
+            "http://127.0.0.1:5057/worklist/L-000000000000/dismiss",
             json={"actor": "a", "role": "r", "reason": "x"},
             headers={"Origin": f"http://{MRN_SENTINEL}.evil.com"},
         )

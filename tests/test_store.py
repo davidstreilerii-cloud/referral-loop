@@ -4,7 +4,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import textwrap
 import time
 from contextlib import closing
 from datetime import datetime, timezone

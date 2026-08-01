@@ -45,15 +45,20 @@ source = ["referral_loop"]
 omit = ["tests/*", "scripts/*"]
 
 [tool.coverage.report]
-# Measured at 88% and set five points under. Do not ship the parent's 40; that floor
-# is sized for a repo of loosely-tested analysis modules and this package would meet
-# it by accident.
+# Measured and set five points under. Do not ship the parent's 40; that floor is
+# sized for a repo of loosely-tested analysis modules and this package would meet it
+# by accident.
 #
-# 88 is a conservative reading: it was measured with Tasks 7 and 8 outstanding, so 79
-# tests errored and contributed nothing. Coverage only rises as those are fixed -- the
-# denominator is fixed by `source` above -- so the true figure is at or above 88 and
-# this floor cannot be too high. Task 10 should re-measure and raise it.
-fail_under = 83
+# Re-measured in Task 10 with the whole suite green: 95.24% on the CI invocation
+# (`-m "not docker"`), against the 88% recorded when Tasks 7 and 8 were still
+# outstanding and 79 tests errored without contributing. Floor raised 83 -> 90.
+#
+# The five points are not slack for regressions, they are platform margin: this was
+# measured on win32, and encryption_check.py reads 51% there because its OS-detection
+# branches are per-platform by construction. A Linux runner executes a different
+# subset of that file. If CI ever lands between 90 and 95 the honest reading is that
+# difference, not a regression -- check which lines moved before touching this number.
+fail_under = 90
 show_missing = true
 
 [tool.ruff]

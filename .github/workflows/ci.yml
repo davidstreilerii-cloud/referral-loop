@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+
+      # -m "not docker" because the install-closure tests need a built image; the
+      # `image` job below covers them. Running them here would skip silently and
+      # look like coverage that is not there.
+      #
+      # --timeout=120 is a per-test limit, and one test is exempted from it by a
+      # marker rather than by raising it for everyone:
+      # test_spec_12_and_13_the_whole_suite_runs_under_both_guards re-runs the
+      # entire suite in a guarded subprocess, so it takes minutes by design.
+      #
+      # No --cov-fail-under here on purpose. The floor lives in pyproject.toml
+      # ([tool.coverage.report] fail_under), and passing the flag as well would
+      # mean the looser of the two silently wins -- which is what happens when a
+      # workflow says 80 and the file says 83.
+      - run: python -m pytest tests/ -q -m "not docker" --timeout=120 --cov=referral_loop --cov-report=term-missing
+        env:
+          REFERRAL_THRESHOLDS_ACCEPTED: "1"
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff
+      - run: ruff check src/ tests/
+
+      # There is deliberately no mypy step yet, and this comment is here so that
+      # absence is a decision on the record rather than an oversight.
+      #
+      # `mypy src/referral_loop/ --ignore-missing-imports --check-untyped-defs`
+      # reports six pre-existing errors, all of them in code this extraction
+      # copied unchanged:
+      #   audit.py:571      assigning a str to a RefusalCode | None field
+      #   retention.py:186-192  from_env(env: dict | None) is handed os.environ,
+      #                     which is _Environ[str], not dict -- four errors from
+      #                     the one annotation
+      #   eval.py:895       dict.get() handed an Any | None key
+      #
+      # None is a bug; all are annotations that are narrower than the values the
+      # code actually passes. Fixing them means editing src/, and the extraction
+      # this repository came out of is under a zero-behaviour-change rule -- so
+      # the choice was between a job that is red on every push and no job. A
+      # permanently-red required check trains people to ignore CI, which costs
+      # more than the type coverage is worth. Add this step in the same change
+      # that fixes the six; do not add it before.
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+
+      # Built here as its own step so a build failure is reported as a build
+      # failure. The pytest fixture below builds the same tag again, which the
+      # layer cache makes near-free, and that second build is what guarantees the
+      # image under test is the one this commit describes.
+      - run: docker build -t referral-loop:test .
+      - run: python -m pytest tests/test_install_closure.py -v

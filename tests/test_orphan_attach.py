@@ -38,7 +38,6 @@ from referral_loop.events import (
     LABEL_OUTCOME,
     LabelOutcome,
     LabelType,
-    LoopEvent,
     LoopState,
 )
 from referral_loop.registry import Registry
@@ -345,7 +344,7 @@ def test_an_attached_orphan_is_not_a_match_candidate_or_a_dismissal_candidate(st
 
     assert LoopState.ATTACHED not in MATCHABLE_STATES
     assert store.loops_in_states(MATCHABLE_STATES) != []
-    assert orphan_id not in [l.loop_id for l in store.loops_in_states(MATCHABLE_STATES)]
+    assert orphan_id not in [loop.loop_id for loop in store.loops_in_states(MATCHABLE_STATES)]
     with pytest.raises(ReferralLoopError, match="Only an orphan can be dismissed"):
         registry.dismiss_orphan(orphan_id, actor="a", role="r", reason="x")
     assert _labels(store, LabelType.ORPHAN_DISMISSED) == []
@@ -399,7 +398,7 @@ def test_undoing_a_match_returns_the_result_to_the_orphan_queue(store, registry)
 
     orphan = registry.get(detached)
     assert orphan.state is LoopState.ORPHAN
-    assert [l.loop_id for l in store.loops_in_states([LoopState.ORPHAN])] == [detached]
+    assert [loop.loop_id for loop in store.loops_in_states([LoopState.ORPHAN])] == [detached]
     detail = store.events_for(detached)[0].detail
     assert detail["detached_from"] == loop_id
     assert detail["result_status"] == "F"
@@ -560,7 +559,7 @@ def test_the_tier_on_a_false_match_label_comes_from_the_matcher_not_the_caller(t
     handler = MessageHandler(store=store, registry=reg, pack=PACK)
     for message in (_E2E_ORDER, _E2E_RESULT):
         assert "|AA|" in handler.handle(message)
-    loop_id = next(l.loop_id for l in store.all_loops() if l.state is LoopState.RESULTED)
+    loop_id = next(loop.loop_id for loop in store.all_loops() if loop.state is LoopState.RESULTED)
 
     detached = reg.undo_match(loop_id, actor="a", role="r", reason="wrong order")
 
@@ -813,8 +812,8 @@ def _drive_every_labelling_action(tmp_path, sentinels):
     for message in (_E2E_ORDER, _E2E_RESULT, _E2E_UNMATCHED):
         assert "|AA|" in handler.handle(message)
 
-    matched = [l for l in store.all_loops() if l.state is LoopState.RESULTED]
-    orphans = [l for l in store.all_loops() if l.state is LoopState.ORPHAN]
+    matched = [loop for loop in store.all_loops() if loop.state is LoopState.RESULTED]
+    orphans = [loop for loop in store.all_loops() if loop.state is LoopState.ORPHAN]
     assert matched and orphans, "the fixtures did not exercise both paths"
 
     reason = f"belongs to {sentinels['PID_NAME']}, kin {sentinels['NK1_NAME']}, {REASON_SENTINEL}"
@@ -989,7 +988,7 @@ def test_a_refused_attachment_is_a_409_and_a_missing_loop_is_a_404(http, registr
     for body in ({"target_loop_id": "L-000000000000", "actor": "c", "role": "r"},):
         missing = http.post(f"/worklist/{orphan_id}/attach", json=body)
         assert missing.status_code == 404
-    assert http.post(f"/worklist/L-000000000000/undo_match",
+    assert http.post("/worklist/L-000000000000/undo_match",
                      json={"actor": "c", "role": "r", "reason": "w"}).status_code == 404
     assert http.post(f"/worklist/{orphan_id}/undo_match",
                      json={"actor": "c", "role": "r", "reason": "w"}).status_code == 409
@@ -1005,7 +1004,7 @@ def test_no_refusal_body_echoes_an_id_this_system_never_minted(http):
                   json={"target_loop_id": MRN_SENTINEL, "actor": "a", "role": "r"}),
         http.post(f"/worklist/{MRN_SENTINEL}/attach",
                   json={"target_loop_id": "L-000000000000", "actor": "a", "role": "r"}),
-        http.post(f"/worklist/L-000000000000/attach",
+        http.post("/worklist/L-000000000000/attach",
                   json={"target_loop_id": MRN_SENTINEL, "actor": "a", "role": "r"}),
         http.post(f"/worklist/{MRN_SENTINEL}/undo_match",
                   json={"actor": "a", "role": "r", "reason": REASON_SENTINEL}),

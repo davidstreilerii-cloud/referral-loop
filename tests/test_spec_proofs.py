@@ -899,7 +899,6 @@ def test_spec_10_acknowledgement_is_reversible_over_http(system):
 def test_spec_10_can_fail(system, monkeypatch):
     """Undo by rewriting the acknowledgement instead of appending a reversal --
     the shape any 'just fix the row' implementation takes."""
-    real = Registry.reverse_acknowledgement
 
     def mutate_instead(self, loop_id, actor, role, reason, control_id, **kwargs):
         import sqlite3
@@ -956,6 +955,7 @@ def test_spec_11_can_fail(system, monkeypatch):
 # =========================== 12 & 13. no egress, no model calls -- the WHOLE suite
 
 
+@pytest.mark.timeout(3600)
 def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
     """Spec tests 12 and 13 as written: block non-loopback `socket.connect`,
     monkeypatch `anthropic` and `claude_cli` to raise, and the **full suite**
@@ -988,6 +988,14 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
     Those tests still run in a normal invocation, where success criterion 6 is
     verified against the built image -- that is the only real proof of it, and
     nothing here weakens it.
+
+    The `timeout(3600)` marker matches the `subprocess.run` budget below and
+    exists because CI passes `--timeout=120`, which is the right per-test limit
+    for every test but this one: this one *is* the suite, so a limit sized for a
+    single test kills it every time and the failure looks like a hang rather than
+    a misconfiguration. Exempting the one test that runs the others is narrower
+    than raising the limit for all of them, which would be giving up the guard
+    everywhere to accommodate one case.
     """
     if os.environ.get(spec_guards.ARMED_ENV):
         pytest.skip("already inside the guarded run; not recursing")

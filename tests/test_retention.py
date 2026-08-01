@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from referral_loop import audit, retention
+from referral_loop import store as store_module
 from referral_loop.errors import ReferralLoopError, StoreUnavailableError
 from referral_loop.events import LabelType, LoopEvent, LoopState
 from referral_loop.registry import Registry
@@ -27,7 +28,6 @@ from referral_loop.retention import (
     RetentionPolicy,
     purge,
 )
-from referral_loop import store as store_module
 from referral_loop.store import LoopStore
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)

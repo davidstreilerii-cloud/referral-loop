@@ -34,8 +34,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from referral_loop import audit as referral_audit
 from referral_loop.cli import PUBKEY_ENV, main
 from referral_loop.errors import ReferralLoopError
-from referral_loop.eval import _order as _eval_order
-from referral_loop.eval import _result as _eval_result
 from referral_loop.eval import (
     EvalError,
     EvalResult,
@@ -48,6 +46,8 @@ from referral_loop.eval import (
     replay,
     synthetic_corpus,
 )
+from referral_loop.eval import _order as _eval_order
+from referral_loop.eval import _result as _eval_result
 from referral_loop.events import LoopState
 from referral_loop.listener import MessageHandler
 from referral_loop.pack import RulePack, load_pack
