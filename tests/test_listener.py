@@ -41,8 +41,11 @@ from healthcare_rag.referral_loop import listener as listener_module
 from healthcare_rag.referral_loop.errors import StoreUnavailableError
 from healthcare_rag.referral_loop.events import LoopState
 from healthcare_rag.referral_loop.listener import (
+    _ARCHIVE_BYTES_PER_WINDOW,
     _MALFORMED_ARCHIVE_BYTES,
+    _MALFORMED_PREFIX,
     _MRN_RESOLUTION_ATTEMPTS,
+    _TRUNCATED_MARKER,
     FileDropSource,
     MessageHandler,
     ack_code,
@@ -51,9 +54,18 @@ from healthcare_rag.referral_loop.listener import (
 )
 from healthcare_rag.referral_loop.matcher import field_value
 from healthcare_rag.referral_loop.mllp import CR, FS, VT, frame
-from healthcare_rag.referral_loop.mllp_server import DESYNC_GRACE_SECONDS
+from healthcare_rag.referral_loop.mllp_server import (
+    DESYNC_GRACE_SECONDS,
+    FIRST_FRAME_SECONDS,
+    MAX_FRAME_BYTES,
+)
 from healthcare_rag.referral_loop.parse_hl7 import parse_hl7_text
-from healthcare_rag.referral_loop.peers import PeerRegistry
+from healthcare_rag.referral_loop.peers import (
+    AUTHORITIES,
+    TRANSPORT_PLAINTEXT,
+    PeerIdentity,
+    PeerRegistry,
+)
 from healthcare_rag.referral_loop.registry import Registry
 from healthcare_rag.referral_loop.staleness import is_stale, staleness_ratio
 from healthcare_rag.referral_loop.store import LoopStore
@@ -1728,17 +1740,43 @@ def test_an_unmeasurable_volume_still_gets_the_evidence_archived(handler, monkey
     assert handler.store.raw_count() == 1
 
 
-def test_a_peer_that_keeps_being_rejected_stops_being_read_at_all(handler):
+def test_a_peer_over_its_rejection_budget_stops_having_its_garbage_archived(handler):
     """Closing the connection per rejection is not a rate limit on its own --
     reconnecting costs an attacker nothing. Rejections are counted per peer
-    across connections, and a peer over its budget is refused at accept."""
+    across connections, and past the budget the archive write is what stops.
+
+    The budget gates the *write*, not the accept. Refusing the connection was
+    the first spelling of this and it was too blunt: every rejection is charged
+    to a source address, and behind a hospital NAT or an engine's shared egress
+    that address is shared with clinical traffic, so one misconfigured sender
+    took the whole feed off the air for the rest of the window. Gating the write
+    bounds exactly the resource the budget exists to bound and costs a
+    well-formed message nothing.
+    """
     with running_server(handler, max_rejections_per_peer=2) as address:
         for index in range(5):
             with socket.create_connection(address, timeout=10) as sock:
                 sock.sendall(b"garbage %d" % index + FS + CR)
-                peer_closed(sock)
-    assert handler.framing_error_count == 2, "the budget is per peer, not per connection"
-    assert handler.store.raw_count() == 2, "and nothing from that peer is archived after it"
+                assert "|AR|" in read_until_closed(sock), "every frame is still answered"
+    assert handler.framing_error_count == 5, "every rejection is still counted and logged"
+    assert handler.store.raw_count() == 2, "but only the budgeted ones are archived"
+
+
+def test_a_peer_over_its_rejection_budget_can_still_deliver_a_clinical_message(handler):
+    """The blast radius of the budget. An address that has drawn its rejections
+    is not thereby untrusted for everything else -- it is one hop, shared by
+    however many senders sit behind it, and a refused ORU is a lost result."""
+    with running_server(handler, max_rejections_per_peer=1) as address:
+        for index in range(3):
+            with socket.create_connection(address, timeout=10) as sock:
+                sock.sendall(b"garbage %d" % index + FS + CR)
+                read_until_closed(sock)
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(frame(order()))
+            assert "|AA|" in read_ack(sock), (
+                "a peer over its rejection budget must still be able to deliver a result"
+            )
+    assert len(loops(handler)) == 1
 
 
 def test_a_frame_that_was_not_accepted_is_not_named_by_a_later_truncation_flag(handler):
@@ -1803,6 +1841,249 @@ def test_the_suspect_truncation_counter_moves_only_under_the_lock(handler):
         assert handler.suspect_truncation_count == 0, "the counter moved without the lock"
     thread.join(timeout=10)
     assert handler.suspect_truncation_count == 1
+
+
+# ---------------------------------- the archive is a resource, rejected or not
+
+
+def _engine(peer_id: str = "engine-a") -> PeerIdentity:
+    """A peer that reached us over the wire, so the archive budget applies."""
+    return PeerIdentity(peer_id=peer_id, transport=TRANSPORT_PLAINTEXT,
+                        authorities=AUTHORITIES)
+
+
+def _padded(control_id: str, size: int) -> str:
+    """A message that is accepted, archived, and mostly padding.
+
+    `ZZZ^Z01` so it is counted-and-ignored rather than applied: the archive
+    write is the cost being measured and every message type pays it, so the
+    cheapest one to build is the one that isolates it.
+    """
+    return message(msh("ZZZ^Z01", control_id), segment("NTE", {1: "1", 3: "X" * size}))
+
+
+def test_accepted_frames_are_charged_against_a_bounded_archive_budget(handler):
+    """Every bound on the archive lived on the `reject_malformed` path, so a
+    peer drawing AA walked past all three: the 64 KiB cap, the per-peer
+    rejection budget and the disk floor.
+
+    Measured before this bound existed, against this same handler: 44 MiB of
+    fsynced archive in 1.0s, 11 rows, `framing_error_count == 0`. That is the
+    H6a cost model -- a SHA-256, a decode and an fsynced INSERT per iteration --
+    reproduced end to end without ever drawing a rejection, which is the branch
+    an attacker uses once the rejection path is bounded.
+    """
+    padded = [_padded(f"PAD{index}", 4096) for index in range(6)]
+    handler.archive_bytes_per_window = 2 * len(padded[0])       # exactly two fit
+    peer = _engine()
+    codes = [ack_code(handler.handle(text, peer=peer)) for text in padded]
+
+    assert codes[:2] == ["AA", "AA"], "an ordinary message must not be throttled"
+    assert codes[2:] == ["AE"] * 4, "and an unbounded run of them must be"
+    assert sum(len(payload) for payload in handler.store.raw_payloads()) == 2 * len(padded[0])
+    assert handler.archive_throttled_count == 4
+
+
+def test_a_throttled_message_is_deferred_rather_than_lost(handler):
+    """AE, not AR: being over a *window* is transient by construction, and this
+    is the one thing AE is for. The engine queues, the window passes, and the
+    redelivery is applied -- H7's lesson is that AE must never be the answer to
+    a permanent condition, not that it is never the answer."""
+    handler.archive_bytes_per_window = 1
+    peer = _engine()
+    assert ack_code(handler.handle(order(), peer=peer)) == "AE"
+    assert loops(handler) == [], "and nothing was applied from a message we did not store"
+
+    handler.archive_bytes_per_window = 1 << 30      # the window passes
+    assert ack_code(handler.handle(order(), peer=peer)) == "AA"
+    assert len(loops(handler)) == 1, "the redelivery must not be swallowed as a duplicate"
+
+
+def test_the_archive_budget_is_charged_per_peer(handler):
+    """One peer exhausting the archive must not answer AE to another's results.
+    A shared budget is one sender's misbehaviour becoming every sender's
+    outage -- the same failure the per-peer connection cap exists to prevent."""
+    noisy, quiet = _engine("engine-a"), _engine("engine-b")
+    handler.archive_bytes_per_window = len(_padded("NOISY0", 4096))     # exactly one fits
+    assert ack_code(handler.handle(_padded("NOISY0", 4096), peer=noisy)) == "AA"
+    assert ack_code(handler.handle(_padded("NOISY1", 4096), peer=noisy)) == "AE"
+
+    assert ack_code(handler.handle(order(), peer=quiet)) == "AA"
+    assert len(loops(handler)) == 1
+
+
+def test_the_archive_budget_refills_when_its_window_passes(handler):
+    """A budget that never refills is a permanent refusal wearing a window's
+    clothing, and AE against a permanent condition is defect H7."""
+    handler.archive_bytes_per_window = len(order())        # exactly one fits
+    handler.archive_window_seconds = 0.2
+    peer = _engine()
+    assert ack_code(handler.handle(order(), peer=peer)) == "AA"
+    assert ack_code(handler.handle(order("ORM_2"), peer=peer)) == "AE"
+    time.sleep(0.3)
+    assert ack_code(handler.handle(order("ORM_2"), peer=peer)) == "AA"
+
+
+def test_a_malformed_frame_is_charged_against_the_same_budget(handler):
+    """One budget over both paths, or an attacker just picks the uncharged one.
+    Over budget the answer is still AR -- the bytes are no more acceptable for
+    being unarchivable -- and it is the write that stops."""
+    handler.archive_bytes_per_window = 16
+    peer = _engine()
+    assert ack_code(handler.reject_malformed(b"a" * 4096, "reason", peer=peer)) == "AR"
+    assert handler.store.raw_count() == 0
+    assert handler.framing_error_count == 1, "still counted; the rejection happened"
+    assert handler.archive_throttled_count == 1
+
+
+def test_the_throttle_alerts_once_per_window_rather_than_once_per_message(handler, caplog):
+    """A peer looping small messages would otherwise draw a ~300-byte ERROR line
+    per ~200-byte message -- the archive amplification moved into the log
+    volume, which sits on a disk this module has just spent four constants
+    protecting. The counter carries the rest."""
+    handler.archive_bytes_per_window = 1
+    peer = _engine()
+    with caplog.at_level(logging.ERROR, logger="healthcare_rag.referral_loop.listener"):
+        for index in range(6):
+            handler.handle(order(f"ORM_{index}"), peer=peer)
+    alerts = [r for r in caplog.records if "archive budget" in r.getMessage()]
+    assert len(alerts) == 1, f"{len(alerts)} alerts for 6 deferred messages"
+    assert handler.archive_throttled_count == 6, "and every one of them is still counted"
+
+
+def test_an_in_process_caller_is_not_throttled(handler):
+    """Replaying the archive and draining the file drop both run through
+    `handle()` as in-process identities, and a replay of a large archive must
+    not answer itself AE. The boundary this budget defends is the transport:
+    code holding a `MessageHandler` can write to the store directly, so a
+    budget it can step around by calling a different method is not a control --
+    the same argument `peers.LOCAL_PEER` already makes about authorities.
+    """
+    handler.archive_bytes_per_window = 1
+    assert ack_code(handler.handle(order())) == "AA"
+    assert ack_code(handler.handle(order(control_id="ORM_2", placer="P2", filler="F2"))) == "AA"
+    assert len(loops(handler)) == 2
+
+
+def test_the_frame_cap_and_the_frame_timer_imply_a_rate_a_slow_link_can_meet():
+    """The two constants are a line rate whether anybody wrote one down or not.
+
+    16 MiB within a 60-second incomplete-frame timer demanded 2.2 Mbit/s
+    sustained, so a genuine ORU carrying an embedded report over a slow WAN was
+    closed mid-transfer -- and, being unacknowledged, redelivered to be closed
+    again. A cap and a timer that are set independently will drift back into
+    that, so the relationship between them is what is asserted here.
+    """
+    floor_bytes_per_second = MAX_FRAME_BYTES / FIRST_FRAME_SECONDS
+    assert floor_bytes_per_second <= 16_000, (
+        f"the frame cap and the frame timer together demand "
+        f"{floor_bytes_per_second * 8 / 1000:.0f} kbit/s sustained from every sender"
+    )
+
+
+def test_one_whole_frame_always_fits_inside_the_archive_budget():
+    """The budget's own H7 guard. A single message larger than the whole window
+    budget could never be archived, so it would be answered AE forever -- a
+    permanent condition wearing a transient answer, which is exactly the defect
+    H7 was. The frame cap is what bounds one message, so the relationship
+    between the two constants is what prevents it, and it is asserted rather
+    than assumed."""
+    assert _ARCHIVE_BYTES_PER_WINDOW >= MAX_FRAME_BYTES
+
+
+def test_a_sender_cannot_take_the_archive_key_a_malformed_frame_would_use(handler):
+    """The malformed archive key is `MALFORMED-<digest>`, and `handle()` archives
+    under MSH-10 exactly as it arrived. A peer could therefore send a well-formed
+    message whose control id *is* the key its next malformed frame would use,
+    take the row, and the evidence would silently never be stored -- while the
+    alert went on naming the key an operator would then fail to find.
+
+    Malformed frames are archived in a scope of their own, which no `MSH-10` can
+    reach because a peer id may not contain `/` (`peers._PEER_ID_RE`). Squatting
+    the key is then arithmetic that does not connect to anything.
+    """
+    garbage = b"MSH|this frame is unframeable"
+    squatted = _MALFORMED_PREFIX + hashlib.sha256(garbage).hexdigest()[:32]
+    peer = _engine()
+
+    assert ack_code(handler.handle(message(msh("ORM^O01", squatted), pid(), obr()),
+                                   peer=peer)) == "AA"
+    handler.reject_malformed(garbage, "unframeable", peer=peer)
+
+    assert any("unframeable" in payload for payload in handler.store.raw_payloads()), (
+        "the evidence of the malformed frame was never stored"
+    )
+
+
+def test_the_alert_reports_a_pre_existing_row_rather_than_a_fresh_write(handler, caplog):
+    """`record_raw` answers False when the row is already there, and
+    `reject_malformed` ignored that -- so an identical retransmit, which is
+    exactly what content addressing is for, was reported as a write that had
+    just happened. Three outcomes, three sentences."""
+    with caplog.at_level(logging.ERROR, logger="healthcare_rag.referral_loop.listener"):
+        handler.reject_malformed(b"identical garbage", "reason")
+        handler.reject_malformed(b"identical garbage", "reason")
+    lines = [r.getMessage() for r in caplog.records if "Malformed framing" in r.getMessage()]
+    assert len(lines) == 2
+    assert "archived as" in lines[0] and "already archived" not in lines[0]
+    assert "already archived as" in lines[1]
+
+
+def test_the_store_failure_counter_moves_only_under_the_lock(handler):
+    """L2, the counter the brief did not name. `store_failure_count` is
+    incremented from the socket thread on both AE paths, and it is the number
+    that separates "the disk is failing" from "somebody is attacking" -- so it
+    undercounts under exactly the concurrency that makes the question worth
+    asking."""
+    db_path = Path(handler.store.db_path)
+    db_path.unlink()
+    db_path.mkdir()
+    entered = threading.Event()
+
+    def deliver():
+        entered.set()
+        handler.handle(order())
+
+    thread = threading.Thread(target=deliver, daemon=True)
+    with handler._lock:
+        thread.start()
+        assert entered.wait(10)
+        time.sleep(0.1)
+        assert handler.store_failure_count == 0, "the counter moved without holding the lock"
+    thread.join(timeout=10)
+    assert handler.store_failure_count == 1
+
+
+def test_an_undecodable_oversized_frame_is_archived_within_the_cap(handler):
+    """base64 is 4/3 of what it encodes, so capping the *bytes read* rather than
+    the row written put 87 KiB in the archive under a 64 KiB cap. The cap is on
+    the row, because the row is the thing being written."""
+    handler.reject_malformed(b"\xff\xfe" * (4 * _MALFORMED_ARCHIVE_BYTES), "binary")
+    archived = handler.store.raw_payloads()[0]
+    assert archived.startswith("BASE64:"), "the base64 branch is the one under test"
+    assert len(archived) <= _MALFORMED_ARCHIVE_BYTES + 512, (
+        f"{len(archived)} bytes archived against a {_MALFORMED_ARCHIVE_BYTES}-byte cap"
+    )
+
+
+def test_a_complete_malformed_row_re_derives_the_digest_it_is_keyed_on(handler):
+    """A sender can write `TRUNCATED: ...` into its own malformed frame, so the
+    marker cannot be trusted to mean the row is short. The key can: it is
+    `sha256` of what actually arrived, so a row whose payload hashes to its own
+    key is complete and one that does not is not, whatever the payload claims
+    about itself. Pinned in both directions."""
+    planted = (b"MSH|junk\r" + _TRUNCATED_MARKER.encode()
+               + b": 999999999 bytes received, 65536 archived, sha256=deadbeef\r")
+    handler.reject_malformed(planted, "reason")
+    archived = handler.store.raw_payloads()[0]
+    assert hashlib.sha256(archived.encode("utf-8")).hexdigest() == \
+        hashlib.sha256(planted).hexdigest(), "a complete row must re-derive its own key"
+
+    truly_long = b"Y" * (2 * _MALFORMED_ARCHIVE_BYTES)
+    handler.reject_malformed(truly_long, "reason")
+    truncated = [p for p in handler.store.raw_payloads() if p.startswith("YYYY")][0]
+    assert hashlib.sha256(truncated.encode("utf-8")).hexdigest() != \
+        hashlib.sha256(truly_long).hexdigest(), "a truncated row must not"
 
 
 # ------------------------------------------------ connections are bounded (H6b)

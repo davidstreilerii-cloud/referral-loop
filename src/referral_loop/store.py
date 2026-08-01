@@ -756,7 +756,14 @@ class LoopStore:
             # SQLite permits repeated NULLs in a TEXT primary key, so a missing
             # MSH-10 would insert a fresh row every time and dedup would fail
             # silently. A message we cannot key is a message we cannot promise
-            # not to double-process; the listener must answer AE, not AA.
+            # not to double-process.
+            #
+            # Defence in depth as of the H7 fix: the listener now refuses an
+            # empty MSH-10 before it reaches here and answers AR, not AE. AE
+            # asks the engine to queue and retry, and an empty MSH-10 is a
+            # permanent property of those bytes, so the engine retried them at
+            # the head of its outbound queue forever and the feed behind them
+            # stopped. Reaching this line means a caller skipped that check.
             raise StoreUnavailableError(
                 "Refusing to store a message with an empty control id (MSH-10): "
                 "idempotency cannot be guaranteed without it"

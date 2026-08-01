@@ -89,7 +89,7 @@ byte apiece is ten thousand threads and an fd each, at a cost to the sender of
 about thirty-five bytes a second. `RECV_TIMEOUT_SECONDS` does not catch that:
 `settimeout` bounds each `recv` call, not the connection, and a peer that speaks
 once per window never trips it while never approaching the buffer cap either --
-one byte per 290 seconds reaches 16 MiB in roughly 150 years. So there are four
+one byte per 290 seconds reaches the frame cap in decades. So there are four
 bounds, and each one is a different way of holding a resource:
 
   * a semaphore over accepted connections, and a per-source-address cap so one
@@ -100,7 +100,13 @@ bounds, and each one is a different way of holding a resource:
   * a timer on an *incomplete* frame, restarted by each completed one, which is
     what the dribbler above actually defeats;
   * a per-peer rejection budget over a window, so reconnecting to draw another
-    rejection stops being free.
+    rejection stops being free. It is spent on the archive write rather than on
+    the accept: the write is the resource, and refusing the accept punished
+    whatever clinical traffic shared the address.
+
+None of them bounds the archive on the *accepted* path -- a peer that keeps
+drawing `AA` pays none of these -- which is `listener._ARCHIVE_BYTES_PER_WINDOW`
+and belongs there, because the resource is the store rather than the socket.
 
 Those four budgets stay keyed on the **source address**, and that is a decision
 rather than an omission now that connections have identities. They exist to
@@ -150,9 +156,16 @@ logger = logging.getLogger(__name__)
 
 # An unbounded read buffer is a denial of service: a sender that never emits an
 # end block would grow it until the process dies, taking every other connection
-# with it. 16 MiB is far beyond any real HL7 v2 message, including one carrying
-# an embedded report.
-MAX_FRAME_BYTES = 16 * 1024 * 1024
+# with it. 4 MiB is far beyond any real HL7 v2 message, including one carrying a
+# base64 embedded report -- that is roughly 3 MB of binary in one OBX-5.
+#
+# It was 16 MiB, which is a size no message needs and which put this constant in
+# conflict with two others. With FIRST_FRAME_SECONDS it implied a 2.2 Mbit/s
+# floor on every sender (see below), and it is also the bound on a single
+# archive write, which has to fit inside `listener._ARCHIVE_BYTES_PER_WINDOW` or
+# one large message would be deferred forever. Both relationships are asserted
+# by tests, because two constants that only agree by coincidence will not.
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 RECV_BYTES = 8192
 
 # A connection an engine has forgotten about otherwise holds a thread forever.
@@ -181,18 +194,33 @@ CONNECTION_DEADLINE_SECONDS = 3600.0
 
 # How long a frame may stay incomplete. Timed from the first byte of a frame and
 # restarted by each completed one, so a sender pausing between whole messages is
-# unaffected and one dribbling bytes inside a frame forever is not. A real
-# message is written in a single call and lands within a network hop; a minute
-# covers a pathologically fragmented sender by three orders of magnitude.
-FIRST_FRAME_SECONDS = 60.0
+# unaffected and one dribbling bytes inside a frame forever is not.
+#
+# Read together with MAX_FRAME_BYTES this is a minimum line rate, whether or not
+# anybody wrote one down: a sender must deliver a whole frame inside it or be
+# closed, and being unacknowledged, redeliver it to be closed again. 4 MiB over
+# 300 seconds is ~112 kbit/s, which any link carrying a hospital interface can
+# hold. It was 60 seconds against a 16 MiB cap, which demanded 2.2 Mbit/s
+# sustained and would have closed a genuine ORU with an embedded report over a
+# slow WAN, forever.
+FIRST_FRAME_SECONDS = 300.0
 
-# Rejections one peer may draw inside REJECTION_WINDOW_SECONDS before it stops
-# being read at all. Closing the connection per rejection is not a rate limit on
-# its own, because reconnecting costs an attacker nothing. A conformant sender
-# draws zero; a misconfigured one draws them at the rate its outbound queue
-# retries, and no engine retries eight times inside a minute. Over budget, the
-# peer is refused at accept until the window passes -- brief, and a feed drawing
-# eight rejections a minute is already not working.
+# Rejections one peer may draw inside REJECTION_WINDOW_SECONDS before its
+# malformed frames stop being archived. Closing the connection per rejection is
+# not a rate limit on its own, because reconnecting costs an attacker nothing --
+# so the budget spans connections, and what it spends is the archive write,
+# which is the resource. A conformant sender draws zero; a misconfigured one
+# draws them at the rate its outbound queue retries, and no engine retries eight
+# times inside a minute.
+#
+# This gated the *accept* first, and that was too blunt to keep. Rejections are
+# charged to a source address, and behind a hospital NAT or an engine's shared
+# egress that address is shared with clinical traffic -- so one misconfigured
+# sender took the whole feed off the air for the rest of the window, repeatedly,
+# and some engines do retry an AR with backoff, which makes eight in a minute
+# reachable without malice. Gating the write bounds precisely what the budget
+# exists to bound and costs a well-formed message nothing. Every frame is still
+# answered, still counted, and still logged.
 MAX_REJECTIONS_PER_PEER = 8
 REJECTION_WINDOW_SECONDS = 60.0
 
@@ -238,17 +266,39 @@ class _PeerLedger:
 
     def admit(self, peer: str) -> bool:
         """Take a slot for `peer`, or refuse. Never blocks: a refused connection
-        must be closed, not queued behind the ones already being abused."""
+        must be closed, not queued behind the ones already being abused.
+
+        Deliberately not consulted about rejections. An address over its
+        rejection budget is still admitted, because the address is one hop and
+        may be shared with clinical traffic; what its budget buys is archive
+        writes, and that is where it is spent. See MAX_REJECTIONS_PER_PEER.
+        """
         with self._lock:
-            self._prune(time.monotonic())
-            if len(self._rejections.get(peer, ())) >= self._max_rejections:
-                return False
             if self._open.get(peer, 0) >= self._max_per_peer:
                 return False
+            # Last, so a refusal on either count above takes nothing.
             if not self._slots.acquire(blocking=False):
                 return False
             self._open[peer] = self._open.get(peer, 0) + 1
             return True
+
+    def charge_rejection(self, peer: str) -> tuple[bool, int]:
+        """Charge a rejection to `peer`. Returns (may it be archived, count).
+
+        Checking and charging in one lock acquisition, deliberately. Split into
+        `may_archive()` then `note_rejection()`, N connections could each read
+        the count before any of them wrote one, so the real ceiling was
+        `max_rejections + max_connections_per_peer` while this constant claimed
+        `max_rejections` -- measured at 8 archived against a budget of 3 with 8
+        concurrent connections. A budget that a peer can exceed by opening more
+        connections is not the budget it says it is.
+        """
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            drawn = self._rejections.setdefault(peer, [])
+            drawn.append(now)
+            return len(drawn) <= self._max_rejections, len(drawn)
 
     def release(self, peer: str) -> None:
         with self._lock:
@@ -258,14 +308,6 @@ class _PeerLedger:
             else:
                 self._open.pop(peer, None)
             self._slots.release()
-
-    def note_rejection(self, peer: str) -> int:
-        """Charge a rejection to `peer`; returns how many it has in the window."""
-        with self._lock:
-            now = time.monotonic()
-            self._prune(now)
-            self._rejections.setdefault(peer, []).append(now)
-            return len(self._rejections[peer])
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._window
@@ -354,9 +396,9 @@ class MLLPServer(socketserver.ThreadingTCPServer):
         if self.peers.admit(peer):
             return True
         logger.warning(
-            "Refusing a connection from %s: it is over its connection or its recent "
-            "rejection budget. A peer that keeps drawing this is either misconfigured "
-            "or not an interface engine.", peer,
+            "Refusing a connection from %s: it is at its connection cap, or the listener "
+            "is. A peer that keeps drawing this is either misconfigured or not an "
+            "interface engine.", peer,
         )
         return False
 
@@ -462,10 +504,9 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             if frame_started is None:
                 frame_started = time.monotonic()
             if len(buffer) > server.max_frame_bytes:
-                self._reject(server, peer, handler.reject_malformed(
-                    buffer[: server.max_frame_bytes],
+                self._send(self._refuse(
+                    server, handler, peer, buffer[: server.max_frame_bytes],
                     f"no end block within {server.max_frame_bytes} bytes",
-                    peer=peer,
                 ))
                 return
 
@@ -490,13 +531,13 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                     # this now runs before the ACK, the truncated half is
                     # refused rather than flagged after the fact.
                     self._flag(handler, last_accepted)
-                    self._reject(server, peer, handler.reject_malformed(
-                        buffer, "bytes after an end block do not begin a new frame",
-                        peer=peer,
+                    self._send(self._refuse(
+                        server, handler, peer, buffer,
+                        "bytes after an end block do not begin a new frame",
                     ))
                     return
                 buffer = remainder
-                ack, intact = self._ack_for(handler, candidate, peer)
+                ack, intact = self._ack_for(server, handler, candidate, peer)
                 if not intact:
                     # ANY framing rejection immediately after an accepted frame
                     # is the same evidence, not just check 4's. The `CR FS CR`
@@ -505,7 +546,7 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                     # apparent frame and fails check 2. Flagging only on check 4
                     # missed exactly the case the flag exists for.
                     self._flag(handler, last_accepted)
-                    self._reject(server, peer, ack)
+                    self._send(ack)
                     return
                 self._send(ack)
                 # Only a frame the store actually took. The truncation alert
@@ -553,33 +594,6 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             "enough to keep one fresh would hold a thread indefinitely.",
             self.client_address[0], reason, len(buffer),
         )
-
-    def _reject(self, server: MLLPServer, peer: PeerIdentity, ack: str) -> None:
-        """Answer a rejection and charge it to the source address.
-
-        Every caller returns immediately afterwards, so the connection ends
-        here whether the rejection was a framing one or an application-level
-        one. The charge is what makes reconnecting to draw another cost
-        something; `verify_request` is where it is spent.
-
-        Charged to the address, not to `peer.peer_id`, for the reason the module
-        docstring gives: the budget bounds what an unauthenticated client can
-        consume, and an unauthenticated client has no identity to charge. The
-        identity is named in the alert, because an operator reading "eight
-        rejections from 10.2.0.7" and an operator reading "eight rejections from
-        example-lab" are looking for different things.
-        """
-        address = self.client_address[0]
-        count = server.peers.note_rejection(address)
-        self._send(ack)
-        if count >= server.max_rejections_per_peer:
-            logger.error(
-                "%s (peer %s) has drawn %d rejection(s) within %ss and is over budget; "
-                "further connections from that address are refused until the window passes. "
-                "Alert: this is either a badly misconfigured sender or a peer probing the "
-                "listener.",
-                address, peer.peer_id, count, server.rejection_window,
-            )
 
     def _lookahead(self, server: MLLPServer) -> bytes:
         """Bytes already behind a completed frame, waiting at most `desync_grace`.
@@ -630,26 +644,57 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
         if last_accepted:
             handler.flag_possible_truncation(last_accepted)
 
-    @staticmethod
-    def _ack_for(handler, candidate: bytes, peer: PeerIdentity) -> tuple[str, bool]:
+    def _refuse(self, server: MLLPServer, handler, peer: PeerIdentity,
+                raw: bytes, reason: str) -> str:
+        """Build a rejection, charging it to the source address as it goes.
+
+        Charged here rather than inside `reject_malformed` because the budget is
+        kept per source address, and the address is a fact about the connection
+        rather than about the message. See MAX_REJECTIONS_PER_PEER.
+
+        Charged to the address, not to `peer.peer_id`, for the reason the module
+        docstring gives: the budget bounds what an unauthenticated client can
+        consume, and an unauthenticated client has no identity to charge. The
+        identity is named in the alert, because an operator reading "eight
+        rejections from 10.2.0.7" and an operator reading "eight rejections from
+        example-lab" are looking for different things.
+
+        The alert fires on the frame that exhausts the budget and not on the
+        ones after it: a peer looping malformed frames would otherwise write a
+        line per frame, which is the archive amplification one file over.
+        """
+        address = self.client_address[0]
+        may_archive, count = server.peers.charge_rejection(address)
+        if count == server.max_rejections_per_peer:
+            logger.error(
+                "%s (peer %s) has drawn %d rejection(s) within %ss and is now over budget; "
+                "malformed frames from that address are still answered and counted but no "
+                "longer archived until the window passes. Alert: this is either a badly "
+                "misconfigured sender or a peer probing the listener.",
+                address, peer.peer_id, count, server.rejection_window,
+            )
+        return handler.reject_malformed(raw, reason, peer=peer, archive=may_archive)
+
+    def _ack_for(self, server: MLLPServer, handler, candidate: bytes,
+                 peer: PeerIdentity) -> tuple[str, bool]:
         """(ACK to send, whether the stream may be read on)."""
         body = candidate[len(VT):-2] if candidate.startswith(VT) else b""
         if VT in body:
-            return handler.reject_malformed(
-                candidate, "a start block appears inside the message body", peer=peer,
+            return self._refuse(
+                server, handler, peer, candidate,
+                "a start block appears inside the message body",
             ), False
         if not body.endswith(CR):
-            return handler.reject_malformed(
-                candidate,
+            return self._refuse(
+                server, handler, peer, candidate,
                 "the last segment is not CR-terminated, so this frame ends somewhere the "
                 "sender did not put an end block -- most likely an embedded FS CR splitting "
                 "one message into two",
-                peer=peer,
             ), False
         try:
             text = deframe(candidate)
         except FramingError as exc:
-            return handler.reject_malformed(candidate, str(exc), peer=peer), False
+            return self._refuse(server, handler, peer, candidate, str(exc)), False
         ack = handler.handle(text, peer=peer)
         # An application-level AR desynchronises nothing, so this frame could
         # be followed by another -- and while it was, one connection could loop

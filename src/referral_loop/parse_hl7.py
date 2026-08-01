@@ -63,7 +63,7 @@ OBX_RESULT_STATUS = 11
 # even a large ORU^R01 -- a microbiology sensitivity panel, a genomic report --
 # runs to a few hundred OBX, so a few thousand is an order of magnitude of
 # headroom over anything conformant. A cap is needed at all because the only
-# limit upstream is mllp_server's 16 MiB frame, which bounds the bytes read
+# limit upstream is mllp_server's frame cap, which bounds the bytes read
 # and not the objects retained, and the server threads connections without a
 # cap of its own: without this, one frame of `OBX|1` retained ~1.1 GB.
 MAX_SEGMENTS = 5000
@@ -83,7 +83,8 @@ class _Fields(list):
     read. The obvious way to make that safe is to pad every segment out to a
     fixed width, which is what this module used to do, but that allocates for
     fields nobody sent: padding to 32 measured 69.7x amplification against the
-    raw bytes, so a 16 MiB frame retained ~1.1 GB. Answering "" from
+    raw bytes, so a 16 MiB frame retained ~1.1 GB (the cap has since come
+    down to 4 MiB; the amplification is what mattered). Answering "" from
     __getitem__ costs nothing and keeps exactly the same contract, including
     for the callers that index without a bounds check of their own.
 

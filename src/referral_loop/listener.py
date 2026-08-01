@@ -86,6 +86,7 @@ import json
 import logging
 import shutil
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -133,7 +134,9 @@ from .parse_hl7 import (
     peek_control_id,
     structural_fault,
 )
-from .peers import CANCEL, FILEDROP_PEER, LOCAL_PEER, MERGE, PeerIdentity
+from .peers import (
+    CANCEL, FILEDROP_PEER, LOCAL_PEER, MERGE, TRANSPORT_IN_PROCESS, PeerIdentity,
+)
 from .registry import CORRECTED, FINAL, PRELIMINARY, Registry
 from .store import Attribution, LoopStore, attributed
 
@@ -192,20 +195,32 @@ _MALFORMED_PREFIX = "MALFORMED-"
 _BASE64_PREFIX = "BASE64:"
 _TRUNCATED_MARKER = "TRUNCATED"
 
+# The scope malformed frames are archived in. Not the peer's own scope, and the
+# separator is the point: `peers._PEER_ID_RE` forbids "/", so this string can
+# never be a peer id and a malformed row can never take, or be taken by, the
+# key of a message somebody sent. It could be: `handle()` archives under MSH-10
+# exactly as it arrived, so a peer could send a well-formed message whose
+# control id *is* `MALFORMED-<digest of the garbage it is about to send>`, take
+# the row, and have the evidence silently never stored while the alert went on
+# naming a key an operator would then fail to find.
+_MALFORMED_SCOPE = "{peer_id}/malformed"
+
 # The most of a malformed frame that is archived. Content-addressing dedups
 # *identical* retransmits only, so a sender that varies one byte per frame gets
-# a new row every time, and at the frame cap each row costs a SHA-256 over
-# 16 MiB, a 16 MiB decode and a 16 MiB INSERT committed under
-# `PRAGMA synchronous = FULL` -- one fsync apiece. That is the archive
-# amplifying the attack it exists to record.
+# a new row every time, and each row costs a SHA-256, a decode and an INSERT
+# committed under `PRAGMA synchronous = FULL` -- one fsync apiece -- over the
+# whole frame. That is the archive amplifying the attack it exists to record.
 #
 # 64 KiB because the archive's purpose is showing a sender exactly what
 # arrived, and every conformant HL7 v2 message this listener will see fits
-# inside it several times over: mllp_server's 16 MiB frame cap is sized for an
-# ORU carrying an embedded report, not for a header a sender got wrong. Past
-# the cap the row still carries the full SHA-256 and the original length, so it
+# inside it several times over: mllp_server's frame cap is sized for an ORU
+# carrying an embedded report, not for a header a sender got wrong. Past the cap
+# the row still carries the full SHA-256 and the original length, so it
 # identifies the exact bytes; what is dropped is the tail of a frame nobody can
 # act on. `reject_malformed`'s "lossless" promise is now bounded, and says so.
+#
+# The cap is on the row, not on the bytes read: base64 is 4/3 of what it
+# encodes, so capping the read put 87 KiB in the archive under a 64 KiB cap.
 _MALFORMED_ARCHIVE_BYTES = 64 * 1024
 
 # Free space below which malformed frames stop being archived at all. A full
@@ -217,6 +232,34 @@ _MALFORMED_ARCHIVE_BYTES = 64 * 1024
 # result wins. `retention.py` is a scheduled purge with no default period, so
 # it is not a quota and bounds none of this.
 _ARCHIVE_DISK_FLOOR_BYTES = 64 * 1024 * 1024
+
+# Bytes one peer may add to the archive inside `_ARCHIVE_WINDOW_SECONDS`.
+#
+# The cap, the per-peer rejection budget and the disk floor all sit on the
+# `reject_malformed` path, so a peer that keeps drawing `AA` walked past every
+# one of them: an unknown message type, a fresh MSH-10 and a few MiB of padding
+# is archived in full, keeps the connection, and charges no rejection. Measured
+# on this handler before this bound existed: 44 MiB of fsynced archive in 1.0s
+# across 11 rows with `framing_error_count == 0` -- H6a's cost model exactly,
+# reached without ever being rejected, which is the branch an attacker uses once
+# the rejection path is bounded.
+#
+# So the discipline is on the archive rather than on the verdict, and it is a
+# rate rather than a size: an accepted clinical message must be archived whole,
+# because replaying the archive has to reproduce the state (spec section 7), so
+# there is nothing to truncate. A busy ORU feed running eight messages a second
+# at eight kilobytes each is about 3.8 MB/min, so 16 MiB is roughly four times
+# a peak real feed and about 1/40th of the rate measured above.
+#
+# Over budget the answer is AE: being over a window is transient by
+# construction, the engine queues and redelivers, and no clinical message is
+# lost. That is what AE is for -- H7's lesson is that AE must never answer a
+# *permanent* condition. One frame must always fit inside the budget or a single
+# large message would be answered AE forever, which is H7 again; the frame cap
+# is what bounds one message, and `mllp_server.MAX_FRAME_BYTES` is a quarter of
+# this. That relationship is asserted by a test rather than left to be noticed.
+_ARCHIVE_BYTES_PER_WINDOW = 16 * 1024 * 1024
+_ARCHIVE_WINDOW_SECONDS = 60.0
 
 # Bounded, because a resolution that keeps moving is a merge storm a human needs
 # to see rather than something to spin on. See _open_loop_retrying.
@@ -332,9 +375,18 @@ class MessageHandler:
         self.registry = registry
         self.pack = pack
         self._lock = threading.RLock()
-        # An attribute rather than the constant alone, so a deployment on a
-        # small volume can lower it and a test can raise it above any real disk.
+        # Attributes rather than the constants alone, so a deployment on a small
+        # volume or a slow feed can tune them and a test can drive them to
+        # values no real disk or clock would reach.
         self.archive_disk_floor_bytes = _ARCHIVE_DISK_FLOOR_BYTES
+        self.archive_bytes_per_window = _ARCHIVE_BYTES_PER_WINDOW
+        self.archive_window_seconds = _ARCHIVE_WINDOW_SECONDS
+        # peer_id -> [(monotonic time, bytes written)], pruned to the window on
+        # every charge, so this holds only peers that wrote inside it.
+        self._archive_spend: dict[str, list[tuple[float, int]]] = {}
+        # peer_id -> when it was last alerted about, so the alert is once per
+        # window rather than once per deferred message. See _note_throttled.
+        self._throttle_alerted: dict[str, float] = {}
 
         # Counters, not metrics plumbing. Each one is a distinct operational
         # fact somebody would act on differently.
@@ -354,6 +406,12 @@ class MessageHandler:
         self.mrn_reresolution_count = 0
         self.mrn_retired_count = 0
         self.suspect_truncation_count = 0
+        # Messages deferred because their peer had spent its archive budget for
+        # the window. Its own number, and distinct from store_failure_count: one
+        # says the disk is failing, this one says a peer is writing faster than
+        # any real feed does, and they are answered the same way for different
+        # reasons.
+        self.archive_throttled_count = 0
         # Transitions refused because the peer that sent them holds no such
         # authority. Two numbers rather than one: a results feed that has
         # started emitting cancellations and a peer attempting a patient merge
@@ -439,13 +497,29 @@ class MessageHandler:
                 peer=peer,
             )
 
+        # The archive is a resource whether or not the message is one we like,
+        # and every other bound on it sits on the rejection path. See
+        # `_ARCHIVE_BYTES_PER_WINDOW`. AE, so the engine queues and redelivers
+        # once the window has passed -- nothing is dropped, and nothing is
+        # applied from a message we have not stored.
+        payload_bytes = len(text.encode("utf-8"))
+        if not self._charge_archive(peer, payload_bytes):
+            self._note_throttled(peer, control_id, payload_bytes)
+            return build_ack(control_id, "AE")
+
         # 1. Durable write. Everything after this point may fail without losing
         #    the message: it is on disk and replayable.
         try:
             is_new_raw = self.store.record_raw(control_id, text,
                                                assertion_source=peer.peer_id)
         except StoreUnavailableError as exc:
-            self.store_failure_count += 1
+            with self._lock:
+                # Non-atomic `+=` from the socket thread, like the two counters
+                # in reject_malformed and flag_possible_truncation. This is the
+                # number that separates "the disk is failing" from "somebody is
+                # attacking", which is a question worth asking only when several
+                # connections are failing at once -- exactly when it undercounts.
+                self.store_failure_count += 1
             logger.error(
                 "Durable write failed for %r (%s); answering AE so the engine queues",
                 control_id, exc,
@@ -465,7 +539,8 @@ class MessageHandler:
             # The archive holds the message but the transition did not land.
             # AE, and because applied_messages (not raw_messages) is the dedup
             # key, the redelivery is re-applied rather than no-oped.
-            self.store_failure_count += 1
+            with self._lock:
+                self.store_failure_count += 1
             logger.error(
                 "Store failed while applying %r (%s); answering AE, message archived for retry",
                 control_id, exc,
@@ -712,18 +787,88 @@ class MessageHandler:
         showing the sender what it actually sent -- a frame cut at the cap in
         the middle of a multi-byte character takes the base64 branch, which is
         lossless for what it holds rather than approximate.
+
+        A sender can write a `TRUNCATED:` line into its own malformed frame, so
+        the marker does not prove the row is short. The *key* does: it is
+        `sha256` of what arrived, so a row whose payload re-derives its own key
+        is complete and one that does not is not, whatever the payload says
+        about itself. That is the check to make, and there is a test for both
+        directions of it.
         """
         head = raw[:_MALFORMED_ARCHIVE_BYTES]
         try:
             payload = head.decode("utf-8")
         except UnicodeDecodeError:
+            # Fewer bytes, because base64 is 4/3 of what it encodes and the cap
+            # is on the row rather than on the read.
+            head = raw[: _MALFORMED_ARCHIVE_BYTES * 3 // 4]
             payload = _BASE64_PREFIX + base64.b64encode(head).decode("ascii")
-        if len(raw) <= _MALFORMED_ARCHIVE_BYTES:
+        if len(raw) <= len(head):
             return payload
         return (
             f"{payload}\r{_TRUNCATED_MARKER}: {len(raw)} bytes received, "
-            f"{_MALFORMED_ARCHIVE_BYTES} archived, sha256={digest}\r"
+            f"{len(head)} archived, sha256={digest}\r"
         )
+
+    def _note_throttled(self, peer: PeerIdentity, control_id: str, nbytes: int) -> None:
+        """Count a deferred message and alert about it once per peer per window.
+
+        Once, not per message: a peer looping small messages would otherwise
+        draw a ~300-byte ERROR line for every ~200-byte message it sent, which
+        is the archive amplification moved into the log volume -- and the log
+        lives on a disk this module has just spent four constants protecting.
+        The counter carries the rest; that is what a counter is for.
+        """
+        with self._lock:
+            self.archive_throttled_count += 1
+            now = time.monotonic()
+            last = self._throttle_alerted.get(peer.peer_id)
+            recent = last is not None and now - last < self.archive_window_seconds
+            if not recent:
+                self._throttle_alerted[peer.peer_id] = now
+        if recent:
+            logger.debug("Peer %s still over its archive budget; deferring %r",
+                         peer.peer_id, control_id)
+            return
+        logger.error(
+            "Peer %s has written its archive budget of %d byte(s) for the last %ss; "
+            "deferring %r (%d bytes) with AE so it is redelivered, and any further ones "
+            "quietly until the window passes. Alert: this rate is well above any real "
+            "feed's, so either a sender is looping or the archive is being used to fill "
+            "the volume (%d deferred so far).",
+            peer.peer_id, self.archive_bytes_per_window, self.archive_window_seconds,
+            control_id, nbytes, self.archive_throttled_count,
+        )
+
+    def _charge_archive(self, peer: PeerIdentity, nbytes: int) -> bool:
+        """Charge `nbytes` to this peer's window, or refuse. See
+        `_ARCHIVE_BYTES_PER_WINDOW`.
+
+        An in-process identity is not charged. Replaying the archive and
+        draining the file drop both run through `handle()` as one, and a replay
+        of a large archive answering itself AE would be this bound breaking the
+        thing it is meant to protect. It is also the honest scope: the boundary
+        being defended is the transport, and code holding a `MessageHandler` can
+        write to the store directly -- a budget that can be stepped around by
+        calling a different method is not a control, which is the argument
+        `peers.LOCAL_PEER` already makes about authorities.
+        """
+        if peer.transport == TRANSPORT_IN_PROCESS:
+            return True
+        now = time.monotonic()
+        cutoff = now - self.archive_window_seconds
+        with self._lock:
+            for peer_id in list(self._archive_spend):
+                kept = [entry for entry in self._archive_spend[peer_id] if entry[0] >= cutoff]
+                if kept:
+                    self._archive_spend[peer_id] = kept
+                else:
+                    del self._archive_spend[peer_id]
+            spent = sum(written for _, written in self._archive_spend.get(peer.peer_id, ()))
+            if spent + nbytes > self.archive_bytes_per_window:
+                return False
+            self._archive_spend.setdefault(peer.peer_id, []).append((now, nbytes))
+            return True
 
     def _archive_has_room(self) -> bool:
         """Whether there is enough of the volume left to spend on evidence.
@@ -750,8 +895,37 @@ class MessageHandler:
         )
         return False
 
+    def _archive_malformed(self, control_id: str, payload: str,
+                           peer: PeerIdentity, archive: bool) -> str:
+        """Store a malformed frame if it may be stored. Returns what to say
+        about it, because the alert must not claim a write that did not happen.
+
+        The row goes in `_MALFORMED_SCOPE`, not the peer's own, so no `MSH-10`
+        can reach the key -- see that constant. Within the scope the key is
+        content-addressed, so `record_raw` answering False means these exact
+        bytes are already on file, which is the deduplication working rather
+        than a write that failed. Saying so is the difference between an
+        operator reading a retransmit and reading a new incident.
+        """
+        if not archive:
+            return f"NOT archived ({control_id}): the peer is over its rejection budget"
+        if not self._archive_has_room():
+            return f"NOT archived ({control_id}): the volume is below the archive floor"
+        if not self._charge_archive(peer, len(payload.encode("utf-8"))):
+            self._note_throttled(peer, control_id, len(payload))
+            return f"NOT archived ({control_id}): the peer is over its archive rate budget"
+        try:
+            fresh = self.store.record_raw(control_id, payload,
+                                          assertion_source=_MALFORMED_SCOPE.format(
+                                              peer_id=peer.peer_id))
+        except StoreUnavailableError as exc:
+            # Still AR. The alternative is AE, which asks for the redelivery of
+            # bytes that cannot be processed either way.
+            return f"NOT archived ({control_id}): the store refused it ({exc})"
+        return f"archived as {control_id}" if fresh else f"already archived as {control_id}"
+
     def reject_malformed(self, raw: bytes, reason: str, *,
-                         peer: PeerIdentity = LOCAL_PEER) -> str:
+                         peer: PeerIdentity = LOCAL_PEER, archive: bool = True) -> str:
         """Failure matrix: `AR`, archive raw, alert.
 
         `AR` rather than `AE` because these bytes will never become acceptable
@@ -759,10 +933,14 @@ class MessageHandler:
         interface behind a message that cannot be processed.
 
         The archive is lossless up to `_MALFORMED_ARCHIVE_BYTES` and identifies
-        the bytes exactly beyond it; see `_archivable`. It is skipped entirely
-        when the volume is nearly full; see `_archive_has_room`. Both bound what
-        an unauthenticated peer can make this path write, and neither changes
-        the answer: it is `AR` either way.
+        the bytes exactly beyond it; see `_archivable`. Four things can stop the
+        write: the caller's own rejection budget (`archive=False`, decided by
+        the stream reader, which is where a peer's rejection count is kept), a
+        nearly full volume, the peer's archive rate budget, and the store
+        itself failing. None of them changes the answer -- it is `AR` in every
+        case -- and every one of them is reported in the alert, because an
+        operator sent to look for a row that was never written is being misled
+        by the very line that is supposed to be telling them what happened.
         """
         with self._lock:
             # Non-atomic `+=` called straight from a socket thread; see
@@ -773,23 +951,10 @@ class MessageHandler:
         digest = hashlib.sha256(raw).hexdigest()
         control_id = _MALFORMED_PREFIX + digest[:32]
         payload = self._archivable(raw, digest)
-        archived = False
-        if self._archive_has_room():
-            try:
-                self.store.record_raw(control_id, payload, assertion_source=peer.peer_id)
-                archived = True
-            except StoreUnavailableError as exc:
-                # Still AR. The alternative is AE, which asks for the redelivery
-                # of bytes that cannot be processed either way.
-                logger.error("Could not archive a malformed frame (%s): %s", control_id, exc)
+        outcome = self._archive_malformed(control_id, payload, peer, archive)
         logger.error(
-            # "archived as" is a claim about a write that has two ways of not
-            # happening, and an operator who goes looking for a row this line
-            # promised is being sent to the archive by its own alert.
             "Malformed framing (%s); %s and answering AR. Alert: a sender is "
-            "emitting frames this listener cannot trust.",
-            reason,
-            f"archived as {control_id}" if archived else f"NOT archived ({control_id})",
+            "emitting frames this listener cannot trust.", reason, outcome,
         )
         # Echo whatever control id is legible, so the engine can correlate the
         # rejection with what it sent. build_ack sanitizes it: the value is
