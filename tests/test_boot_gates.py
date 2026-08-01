@@ -161,11 +161,19 @@ def _free_port() -> int:
 # ------------------------------------------------------- the plan's two tests
 
 
+def test_the_boot_gate_does_not_reach_outside_this_package():
+    """cli.py imported the encryption gate from the monorepo. A standalone repo that
+    imports a package it does not ship fails at runtime, not at test time, and only on
+    the machine that lacks it."""
+    source = (Path(__file__).resolve().parents[1] / "src" / "referral_loop" / "cli.py").read_text(encoding="utf-8")
+    assert "healthcare_rag" not in source, "cli.py still imports from the monorepo"
+
+
 def test_refuses_to_boot_when_encryption_at_rest_is_unverified(tmp_path, monkeypatch):
     monkeypatch.setenv("PHI_MODE", "full")
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
     monkeypatch.setattr(
-        "healthcare_rag.encryption_check._detect_os_encryption", lambda: None
+        "referral_loop.encryption_check._detect_os_encryption", lambda: None
     )
     with pytest.raises(RuntimeError, match="encryption at rest"):
         boot(db_path=tmp_path / "loops.db", pack_dir=tmp_path, public_key_hex="00" * 32)
@@ -195,7 +203,7 @@ def test_the_control_case_boots(booted):
 def test_encryption_gate_fires_alone(tmp_path, good_env, monkeypatch):
     """Pack valid, thresholds accepted, encryption unattested."""
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
     with pytest.raises(RuntimeError, match="encryption at rest"):
         boot(db_path=tmp_path / "loops.db", pack_dir=SHIPPED_PACK_DIR,
              public_key_hex=SHIPPED_PUBKEY)
@@ -243,7 +251,7 @@ def test_no_database_file_is_created_when_a_gate_refuses(tmp_path, good_env, mon
     """
     db = tmp_path / "nested" / "loops.db"
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
     with pytest.raises(RuntimeError):
         boot(db_path=db, pack_dir=SHIPPED_PACK_DIR, public_key_hex=SHIPPED_PUBKEY)
     assert not db.exists()
@@ -327,7 +335,7 @@ def test_a_missing_pack_names_the_directory_it_looked_in(tmp_path, good_env, cap
 def test_encryption_refusal_names_the_attestation_variable(tmp_path, good_env,
                                                            monkeypatch, capsys):
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
     code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db"),
                  "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
@@ -374,7 +382,7 @@ def test_purge_refuses_an_unattested_volume_even_with_a_stated_policy(
     monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
     monkeypatch.setenv("PHI_MODE", "full")
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
 
     code = main(["purge", "--db", str(tmp_path / "loops.db")])
 
@@ -451,7 +459,7 @@ def test_stats_refuses_an_unattested_volume(tmp_path, monkeypatch, capsys):
     LoopStore(tmp_path / "loops.db")
     monkeypatch.setenv("PHI_MODE", "full")
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
 
     code = main(["stats", "--db", str(tmp_path / "loops.db")])
 

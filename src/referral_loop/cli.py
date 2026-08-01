@@ -54,9 +54,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-from healthcare_rag.encryption_check import verify_encryption_at_rest
-
 from . import eval as eval_harness
+from .encryption_check import verify_encryption_at_rest
 from .errors import PackVerificationError, ReferralLoopError, StoreUnavailableError
 from .listener import FileDropSource, MessageHandler
 from .mllp_server import make_mllp_server
