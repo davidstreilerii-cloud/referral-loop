@@ -1,4 +1,4 @@
-"""Referral audit: a typed, allowlisted wrapper over guardrails/immutable_audit.
+"""Referral audit: a typed, allowlisted wrapper over `immutable_audit.py`.
 
 Spec section 3 routes referral audit through `guardrails/immutable_audit.py` and
 nothing else. It owns its own append-only database and blocks UPDATE and DELETE
@@ -69,21 +69,25 @@ and durably (`raw_messages`, spec section 6), so copying them here would double
 the PHI footprint for no added assurance -- and this module's whole claim is
 that the audit database holds no message-derived value at all.
 
-Why the guardrail module is loaded by path rather than imported
-----------------------------------------------------------------
-`from healthcare_rag.guardrails.immutable_audit import ...` executes
-`healthcare_rag/guardrails/__init__.py`, which re-exports the whole stack --
-including `tenant_isolation`, which spec section 3 says is deliberately **not**
-imported, because "importing an unexercised isolation control would suggest a
-guarantee the build does not test". A package's convenience re-exports would
-otherwise settle an architectural question the spec settled the other way, and
-`tests/referral_loop/test_import_closure.py` lists that module as forbidden.
+Why the audit store used to be loaded by file path, and is not any more
+------------------------------------------------------------------------
+In the monorepo this module reached the audit store with
+`importlib.util.spec_from_file_location`, not an import, and the reason was the
+package around it: `from healthcare_rag.guardrails.immutable_audit import ...`
+executes `healthcare_rag/guardrails/__init__.py`, which re-exports the whole
+stack -- including `tenant_isolation`, which spec section 3 says is deliberately
+**not** imported, because "importing an unexercised isolation control would
+suggest a guarantee the build does not test". A package's convenience re-exports
+would otherwise have settled an architectural question the spec settled the
+other way, and `test_import_closure.py` lists that module as forbidden.
 
-So the one permitted module is loaded from its file. It is registered under its
-canonical name first, so a process that also imports the guardrail package
-normally binds to the same module object and therefore the same `_db_lock`:
-two module objects would mean two locks over one file, which is worse than the
-problem being avoided. Both orderings are asserted by test rather than assumed.
+That package is not in this repo. `immutable_audit.py` is vendored here as an
+ordinary sibling, so `from . import immutable_audit` pulls in the audit store
+and nothing else, and the file-path load -- along with the `sys.modules`
+registration that kept it and a normal package import bound to one module object
+and therefore one `_db_lock` -- is gone. `_module()` remains as a function
+because `set_audit_db` and the test fixtures rebind `_module().AUDIT_DB`; it is
+now a one-line import and not an indirection.
 
 Failure policy: an audit failure never blocks the clinical action
 ------------------------------------------------------------------
@@ -115,11 +119,9 @@ are an artifact spec test 14 greps.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
 import re
-import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -285,10 +287,6 @@ _EVENT_TYPE = {
 
 # --------------------------------------------------------------------- loading
 
-_MODULE_NAME = "healthcare_rag.guardrails.immutable_audit"
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "guardrails" / "immutable_audit.py"
-
-_load_lock = threading.Lock()
 _init_lock = threading.Lock()
 _initialised_for: str | None = None
 
@@ -297,33 +295,16 @@ _write_failures = 0
 
 
 def _module():
-    """The guardrail audit module, loaded without executing its package.
+    """The append-only audit store.
 
-    Checked against `sys.modules` first and registered there on load, so this
-    and a normal `import healthcare_rag.guardrails` bind to one module object
-    and therefore one `_db_lock`, in either order.
+    This was loaded by file path in the monorepo, to import one module out of a package
+    whose ``__init__`` pulled in the whole guardrails stack. Vendored here, it is an
+    ordinary sibling and the indirection is gone -- but ``_module()`` is kept as the seam
+    because the tests patch ``_module().AUDIT_DB`` to redirect the database.
     """
-    existing = sys.modules.get(_MODULE_NAME)
-    if existing is not None:
-        return existing
-    with _load_lock:
-        existing = sys.modules.get(_MODULE_NAME)
-        if existing is not None:
-            return existing
-        spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
-        if spec is None or spec.loader is None:  # pragma: no cover - packaging fault
-            raise ImportError(f"No loadable module at {_MODULE_PATH}")
-        module = importlib.util.module_from_spec(spec)
-        # Registered before exec, as the import system does, so a re-entrant
-        # import during exec sees the partially initialised module rather than
-        # starting a second one.
-        sys.modules[_MODULE_NAME] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            del sys.modules[_MODULE_NAME]
-            raise
-        return module
+    from . import immutable_audit
+
+    return immutable_audit
 
 
 def audit_db_path() -> str:

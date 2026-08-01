@@ -19,6 +19,7 @@ artifact rather than an intermediate:
 """
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -777,6 +778,17 @@ def test_two_coordinators_acting_at_once_produce_two_rows(registry):
 
 
 # ------------------------------------------------- how the module is loaded
+
+def test_the_audit_database_path_is_not_computed_from_a_parent_repo_layout():
+    """The vendored module inherited a path built by walking up two directories from
+    healthcare_rag/guardrails/. In this repo that walk lands outside the package, so the
+    path must come from configuration or a package-relative default, never from ``..``."""
+    from referral_loop import immutable_audit
+
+    source = Path(immutable_audit.__file__).read_text(encoding="utf-8")
+    assert '".."' not in source, "the audit DB path still walks up out of the package"
+    assert os.path.isabs(immutable_audit.AUDIT_DB), immutable_audit.AUDIT_DB
+
 
 _PROBE = r"""
 import json, sys
