@@ -2,13 +2,17 @@
 
 The referral container must not contain the ML stack. **An import-closure test
 cannot show this.** chromadb can be installed and simply never imported, which
-is exactly what `pip install ".[referral]"` produces -- chromadb,
+is exactly what the monorepo's `pip install ".[referral]"` produced -- chromadb,
 sentence-transformers, lightrag-hku, raganything[all], mcp, ollama, biopython
-and three tree-sitter packages are unconditional core dependencies of
-healthcare-rag, so the extra installs all of them and torch besides.
-`test_import_closure.py` would pass against that image, unchanged, while a
+and three tree-sitter packages were unconditional core dependencies of
+healthcare-rag, so the extra installed all of them and torch besides.
+An import-closure test would pass against that image, unchanged, while a
 security team reviewing it counted several gigabytes of machine learning in a
 build whose entire claim is that it contains none.
+
+The extraction is what fixed that -- this package's dependency list is one line
+long -- but the assertion stays, because "the dependency list is short today" is
+a fact about a file anyone can edit, and the test is what notices.
 
 So the assertion moves from what gets imported to what gets installed, and its
 subject is the built image.
@@ -50,30 +54,37 @@ FORBIDDEN_DISTRIBUTIONS = [
     "numpy", "tree-sitter", "anthropic", "healthcare-rag",
 ]
 
-# Files that must not be in the image even though they sit beside ones that are.
-# tenant_isolation is the pointed one: spec section 3 keeps it out because
-# shipping an unexercised isolation control suggests a guarantee v1 does not
-# test, and a `COPY healthcare_rag/guardrails/` would ship it without a word.
+# Paths that must not be in the image. These are no longer the monorepo's
+# unwanted siblings -- `healthcare_rag` does not exist in this repository at all,
+# so asserting its modules are absent would be asserting that a file nobody could
+# copy was not copied. What can still go wrong is the opposite mistake: replacing
+# the two narrow COPY lines with `COPY . .`, which is the natural simplification
+# and ships the tests, the docs, the virtualenv and -- the one that matters --
+# `data/`, where cli.py defaults the loop and audit databases. A developer's
+# `data/` holds PHI, and baking it into a layer puts PHI in every registry the
+# image is pushed to, where deleting it is not a delete.
 FORBIDDEN_PATHS = [
-    "/app/healthcare_rag/db.py",
-    "/app/healthcare_rag/audit_trail.py",
-    "/app/healthcare_rag/claude_cli.py",
-    "/app/healthcare_rag/api.py",
-    "/app/healthcare_rag/guardrails/tenant_isolation.py",
-    "/app/healthcare_rag/guardrails/middleware.py",
-    "/app/healthcare_rag/guardrails/phi_redactor.py",
-    "/app/healthcare_rag/revenue_integrity",
-    "/app/healthcare_rag/denial_rca",
+    "/app/src",
+    "/app/pyproject.toml",
+    "/app/tests",
+    "/app/docs",
+    "/app/scripts",
+    "/app/.venv",
+    "/app/.git",
+    "/app/data/referral_loops.db",
 ]
 
-REQUIRED_PATHS = [
-    "/app/healthcare_rag/__init__.py",
-    "/app/healthcare_rag/encryption_check.py",
-    "/app/healthcare_rag/guardrails/immutable_audit.py",
-    "/app/healthcare_rag/referral_loop/cli.py",
-    "/app/healthcare_rag/referral_loop/rules/pack.json",
-    "/app/healthcare_rag/referral_loop/rules/pack.sig",
-]
+# The anti-vacuity half of the probe above: /app/data is created by the
+# Dockerfile and must exist, or the probe is reporting "absent" about an image it
+# never actually looked inside.
+REQUIRED_PATHS = ["/app/data"]
+
+# The package is installed into site-packages, not copied to /app, so asserting a
+# path under /app no longer proves it is there. Assert what the old path check
+# was standing in for: the modules import, and the signed pack the loader needs
+# shipped with them.
+REQUIRED_IMPORTS = ("referral_loop.cli", "referral_loop.store", "referral_loop.pack")
+REQUIRED_PACKAGE_DATA = ("pack.json", "pack.sig")
 
 # site-packages in the built image measures about 29 MB (flask, cryptography and
 # their transitive dependencies). The ceiling is not a tuning target -- it is a
@@ -171,8 +182,9 @@ def test_referral_image_has_no_model_client_installed(referral_image):
 
     Spec test 13 proves "no model calls" in the dev environment by making
     `anthropic` raise. This proves production cannot make one, because no client
-    is present to call. `healthcare_rag/__init__.py` wraps `install_shim()` in
-    try/except, so the package imports cleanly without it.
+    is present to call: nothing in this package's dependency closure pulls a
+    model client, so "no model calls" holds in the image by construction rather
+    than by a runtime guard that could be removed.
     """
     assert "anthropic" not in _installed(referral_image)
     listing = _in_image(referral_image, "pip", "list", "--format=freeze").stdout.lower()
@@ -183,8 +195,9 @@ def test_referral_image_has_no_model_client_installed(referral_image):
 def test_the_entry_point_runs_inside_the_image(referral_image):
     """An image that cannot import its own CLI would pass every negative above.
 
-    Also the only proof that the Dockerfile's file-by-file COPY set is complete:
-    a missing module surfaces here as an ImportError and nowhere else.
+    Run as `python -m` rather than through the `referral-loop` console script, so
+    a failure here is the package's and not the script wrapper's; the console
+    script is what CMD uses and is covered by the boot-refusal test below.
     """
     proc = _in_image(referral_image, "python", "-m", "referral_loop.cli", "--help")
     assert proc.returncode == 0, proc.stderr
@@ -194,16 +207,21 @@ def test_the_entry_point_runs_inside_the_image(referral_image):
 
 @requires_docker
 def test_the_image_refuses_to_boot_without_the_public_key(referral_image):
-    """The boot gates hold in the image, not only under pytest."""
-    proc = _in_image(referral_image, "python", "-m", "referral_loop.cli",
-                     "filedrop")
+    """The boot gates hold in the image, not only under pytest.
+
+    Invoked as `referral-loop`, the console script pyproject declares and the one
+    thing CMD actually runs. Nothing else in this file would notice if the
+    `[project.scripts]` entry point were wrong, and a broken CMD is a container
+    that exits at start for a reason no test explained.
+    """
+    proc = _in_image(referral_image, "referral-loop", "filedrop")
     assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
     assert "REFERRAL_PACK_PUBKEY" in proc.stderr
     assert "Traceback" not in proc.stderr
 
 
 @requires_docker
-def test_the_image_carries_only_the_modules_referral_loop_reaches(referral_image):
+def test_the_image_carries_nothing_but_the_installed_package_and_its_volume(referral_image):
     probe = (
         "import os,sys;"
         "print('\\n'.join(p for p in sys.argv[1:] if os.path.exists(p)))"
@@ -216,6 +234,32 @@ def test_the_image_carries_only_the_modules_referral_loop_reaches(referral_image
     assert sorted(proc.stdout.split()) == sorted(REQUIRED_PATHS), (
         "the anti-vacuity half: these must exist, or the probe above is checking nothing"
     )
+
+
+@requires_docker
+def test_the_image_can_import_every_module_the_entry_point_needs(referral_image):
+    """`pip install` succeeding is not the same as the package being importable:
+    a missing package directory, a bad entry point or an uninstalled runtime
+    dependency all surface here and nowhere else in this file."""
+    for module in REQUIRED_IMPORTS:
+        proc = _in_image(referral_image, "python", "-c", f"import {module}; print('ok')")
+        assert proc.returncode == 0, f"{module}: {proc.stderr}"
+        assert proc.stdout.strip() == "ok", f"{module}: {proc.stdout}"
+
+
+@requires_docker
+def test_the_signed_rule_pack_shipped_inside_the_image(referral_image):
+    """pip install ships package data only if pyproject declares it, and the
+    declaration is a glob in a file nothing else reads. A pack that is not in the
+    image is a boot failure at a customer site rather than in CI."""
+    probe = (
+        "import importlib.resources as r;"
+        "print(sorted(p.name for p in r.files('referral_loop').joinpath('rules').iterdir()))"
+    )
+    proc = _in_image(referral_image, "python", "-c", probe)
+    assert proc.returncode == 0, proc.stderr
+    for required in REQUIRED_PACKAGE_DATA:
+        assert required in proc.stdout, f"{required} missing from image: {proc.stdout}"
 
 
 @requires_docker
@@ -296,14 +340,33 @@ def test_the_dockerfile_does_not_install_the_parent_package():
         assert "-r " not in line, f"requirements file would reintroduce the parent's deps: {line}"
 
 
-def test_the_dockerfile_copies_files_not_the_guardrails_directory():
-    """`COPY healthcare_rag/guardrails/` would ship tenant_isolation.py, which
-    spec section 3 keeps out deliberately, and phi_redactor and middleware with
-    it."""
+def test_the_dockerfile_does_not_copy_the_whole_build_context():
+    """Replaces a check that `COPY healthcare_rag/guardrails/` was not used.
+
+    That check could no longer fail. It guarded tenant_isolation.py, middleware.py
+    and phi_redactor.py -- files that do not exist anywhere in this repository
+    after the extraction, so no COPY line could ship them and the assertion held
+    for a reason that had nothing to do with the Dockerfile. A test that cannot
+    fail is worse than no test, because the suite reports it as cover.
+
+    What can still fail is the mistake one simplification away: collapsing the two
+    narrow COPY lines into `COPY . .`. That ships tests/, docs/, .venv/ and
+    `data/` -- the directory cli.py defaults both databases into, so on a
+    developer's machine it holds PHI, and a layer is not somewhere PHI can be
+    deleted from. The image-side probe in FORBIDDEN_PATHS catches this too; this
+    is the half that runs on a machine with no daemon.
+    """
     text = DOCKERFILE.read_text(encoding="utf-8")
-    copies = [line for line in text.splitlines()
-              if line.strip().startswith("COPY")]
-    assert copies
-    assert not any(re.search(r"COPY\s+healthcare_rag/guardrails/\s", line) for line in copies), copies
-    assert any("immutable_audit.py" in line for line in copies)
-    assert not any("tenant_isolation" in line for line in copies)
+    copies = [line for line in text.splitlines() if line.strip().startswith("COPY")]
+    assert copies, "the Dockerfile copies nothing at all"
+    for line in copies:
+        # Skip flags (`COPY --chown=referral:referral . .`), or the check reads the
+        # flag as the source and waves the whole context through.
+        sources = [tok for tok in line.split()[1:-1] if not tok.startswith("--")]
+        assert sources, f"COPY with no source: {line}"
+        for source in sources:
+            assert source not in (".", "./", "*"), f"copies the whole build context: {line}"
+    # Anti-vacuity: the loop above is a no-op unless the sources are the two the
+    # build actually needs, so name them.
+    assert any(re.search(r"COPY\s+pyproject\.toml\s", line) for line in copies), copies
+    assert any(re.search(r"COPY\s+src/\s", line) for line in copies), copies

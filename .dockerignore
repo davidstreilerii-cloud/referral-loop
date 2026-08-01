@@ -1,0 +1,35 @@
+# Docker's .dockerignore is not .gitignore, and the difference has bitten this
+# image before: a bare `__pycache__/` matches only at the *root* of the build
+# context, so every nested one was copied anyway and sixteen .pyc files from the
+# build machine shipped in the first image built here. A stale .pyc whose source
+# has since changed is what actually executes when its embedded size and mtime
+# still match, which means the image can run code that is not visible in it. The
+# leading `**/` is the whole fix. tests/test_install_closure.py asserts the
+# result against the built image.
+**/__pycache__/
+**/*.py[cod]
+
+# Never in the build context, let alone the image. `data/` is where cli.py
+# defaults the loop and audit databases, so on a developer's machine it holds
+# PHI; baking it into a layer would put PHI in every registry the image is
+# pushed to, where deleting it is not a delete.
+data/
+.venv/
+.git/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Not needed to build the wheel, and each is a thing a reviewer would then have
+# to account for in the image.
+tests/
+docs/
+scripts/
+.github/
+Dockerfile
+.dockerignore
