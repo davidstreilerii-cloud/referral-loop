@@ -35,6 +35,11 @@ KNOWN_MESSAGE_TYPES = frozenset(
 # Named field positions, so callers never spell an index literal. HL7 fields are
 # 1-indexed and (for non-MSH segments) land at the same index in our split, so
 # these read the same as the spec does.
+# MSH-3 and MSH-4 are what a message says about who sent it. Named here, and
+# read by the listener as *claims* to be checked against the peer the transport
+# authenticated -- never as an identity of their own.
+MSH_SENDING_APPLICATION = 3
+MSH_SENDING_FACILITY = 4
 MSH_DATETIME = 7
 MSH_MESSAGE_TYPE = 9
 MSH_CONTROL_ID = 10

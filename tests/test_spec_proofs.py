@@ -61,6 +61,7 @@ from healthcare_rag.referral_loop.events import Loop, LoopEvent, LoopState
 from healthcare_rag.referral_loop.listener import MessageHandler, make_mllp_server
 from healthcare_rag.referral_loop.mllp import CR, FS, frame
 from healthcare_rag.referral_loop.pack import RulePack, load_pack
+from healthcare_rag.referral_loop.peers import PeerRegistry
 from healthcare_rag.referral_loop.registry import Registry
 from healthcare_rag.referral_loop.store import LoopStore
 from healthcare_rag.referral_loop.worklist import create_app
@@ -213,7 +214,8 @@ class System:
 
     @contextmanager
     def _serving(self):
-        server = make_mllp_server(self.handler, port=0)
+        server = make_mllp_server(self.handler, port=0,
+                                  peers=PeerRegistry.plaintext_loopback())
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -1235,11 +1237,11 @@ def _proof_15(system: System, monkeypatch) -> None:
     real_process = MessageHandler._process
     exploded = {"count": 0}
 
-    def die_after_the_write(self, control_id, text):
+    def die_after_the_write(self, control_id, text, peer):
         if "ORU^R01" in text:
             exploded["count"] += 1
             raise store_module.StoreUnavailableError("killed mid-parse")
-        return real_process(self, control_id, text)
+        return real_process(self, control_id, text, peer)
 
     monkeypatch.setattr(MessageHandler, "_process", die_after_the_write)
     acks = system.over_the_wire(result("RES-1", placer="PL1", filler="ACC1"))

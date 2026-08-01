@@ -87,7 +87,8 @@ def test_payload_bytes_reflect_the_stored_column_lengths(tmp_path):
     control_id = "CTRL-EXACT-1"
     content_key = "k" * 40
     message_type = "ORU^R01"
-    store.record_applied(control_id, content_key, message_type)
+    peer_id = "example-ris"
+    store.record_applied(control_id, content_key, message_type, peer_id=peer_id)
 
     report = store.stats()
 
@@ -96,7 +97,8 @@ def test_payload_bytes_reflect_the_stored_column_lengths(tmp_path):
             "SELECT applied_at FROM applied_messages WHERE control_id = ?", (control_id,)
         ).fetchone()[0]
     expected = (
-        len(control_id) + len(content_key) + len(message_type) + len(applied_at)
+        len(control_id) + len(peer_id) + len(content_key) + len(message_type)
+        + len(applied_at)
     )
     assert report["tables"]["applied_messages"]["payload_bytes"] == expected
 
@@ -113,7 +115,8 @@ def test_a_null_content_key_does_not_zero_out_the_whole_row(tmp_path):
     store = fresh(tmp_path)
     control_id = "CTRL_NULL"
     message_type = "ADT^A08"
-    store.record_applied(control_id, None, message_type)
+    peer_id = "example-ris"
+    store.record_applied(control_id, None, message_type, peer_id=peer_id)
 
     report = store.stats()
 
@@ -121,7 +124,9 @@ def test_a_null_content_key_does_not_zero_out_the_whole_row(tmp_path):
         applied_at = conn.execute(
             "SELECT applied_at FROM applied_messages WHERE control_id = ?", (control_id,)
         ).fetchone()[0]
-    expected = len(control_id) + len(message_type) + len(applied_at)  # content_key: 0
+    expected = (
+        len(control_id) + len(peer_id) + len(message_type) + len(applied_at)
+    )  # content_key: 0
     assert report["tables"]["applied_messages"]["rows"] == 1
     assert report["tables"]["applied_messages"]["payload_bytes"] == expected
 

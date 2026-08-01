@@ -289,7 +289,7 @@ def test_whitespace_around_the_key_is_tolerated(tmp_path, good_env):
 def test_a_gate_failure_prints_one_legible_line_and_exits_2(tmp_path, good_env,
                                                             monkeypatch, capsys):
     monkeypatch.delenv("REFERRAL_THRESHOLDS_ACCEPTED", raising=False)
-    code = main(["listen", "--db", str(tmp_path / "loops.db"),
+    code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db"),
                  "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
     assert code == 2
@@ -300,7 +300,7 @@ def test_a_gate_failure_prints_one_legible_line_and_exits_2(tmp_path, good_env,
 
 def test_a_missing_public_key_names_the_variable(tmp_path, good_env, monkeypatch, capsys):
     monkeypatch.delenv(PUBKEY_ENV, raising=False)
-    code = main(["listen", "--db", str(tmp_path / "loops.db")])
+    code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db")])
     err = capsys.readouterr().err
     assert code == 2
     assert PUBKEY_ENV in err
@@ -310,13 +310,13 @@ def test_a_missing_public_key_names_the_variable(tmp_path, good_env, monkeypatch
 def test_an_empty_public_key_is_treated_as_missing(tmp_path, good_env, monkeypatch, capsys):
     """`REFERRAL_PACK_PUBKEY=` in a compose file sets it to the empty string."""
     monkeypatch.setenv(PUBKEY_ENV, "   ")
-    code = main(["listen", "--db", str(tmp_path / "loops.db")])
+    code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db")])
     assert code == 2
     assert PUBKEY_ENV in capsys.readouterr().err
 
 
 def test_a_missing_pack_names_the_directory_it_looked_in(tmp_path, good_env, capsys):
-    code = main(["listen", "--db", str(tmp_path / "loops.db"),
+    code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db"),
                  "--pack-dir", str(tmp_path / "no-pack-here")])
     err = capsys.readouterr().err
     assert code == 2
@@ -328,7 +328,7 @@ def test_encryption_refusal_names_the_attestation_variable(tmp_path, good_env,
                                                            monkeypatch, capsys):
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
     monkeypatch.setattr("healthcare_rag.encryption_check._detect_os_encryption", lambda: None)
-    code = main(["listen", "--db", str(tmp_path / "loops.db"),
+    code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db"),
                  "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
     assert code == 2
@@ -592,7 +592,7 @@ def test_listen_mode_carries_message_at_from_msh7_to_the_registry(tmp_path, good
     not against a handler the test built.
     """
     port = _free_port()
-    argv = ["listen", "--port", str(port),
+    argv = ["listen", "--allow-plaintext", "--port", str(port),
             "--db", str(tmp_path / "loops.db"),
             "--pack-dir", str(SHIPPED_PACK_DIR)]
 
@@ -614,7 +614,7 @@ def test_listen_mode_carries_message_at_from_msh7_to_the_registry(tmp_path, good
 
 def test_listen_mode_binds_the_host_it_was_given(tmp_path, good_env):
     port = _free_port()
-    argv = ["listen", "--port", str(port), "--db", str(tmp_path / "loops.db"),
+    argv = ["listen", "--allow-plaintext", "--port", str(port), "--db", str(tmp_path / "loops.db"),
             "--pack-dir", str(SHIPPED_PACK_DIR)]
     with _serving(argv) as server:
         assert server.server_address[1] == port
@@ -660,7 +660,7 @@ def test_an_occupied_mllp_port_is_a_legible_refusal_not_a_traceback(tmp_path, go
         held.bind(("127.0.0.1", 0))
         held.listen(1)
         occupied = held.getsockname()[1]
-        code = main(["listen", "--port", str(occupied),
+        code = main(["listen", "--allow-plaintext", "--port", str(occupied),
                      "--db", str(tmp_path / "loops.db"),
                      "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
@@ -768,7 +768,7 @@ def test_a_partially_initialised_database_is_a_legible_refusal(tmp_path, good_en
 def test_a_database_path_that_is_a_directory_is_a_legible_refusal(tmp_path, good_env, capsys):
     directory = tmp_path / "loops.db"
     directory.mkdir()
-    code = main(["listen", "--db", str(directory), "--pack-dir", str(SHIPPED_PACK_DIR)])
+    code = main(["listen", "--allow-plaintext", "--db", str(directory), "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
     assert code == 2
     assert "Traceback" not in err
@@ -800,7 +800,7 @@ def test_an_uncreatable_database_directory_is_a_legible_refusal(tmp_path, good_e
     platform and prove nothing."""
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
-    code = main(["listen", "--db", str(blocker / "sub" / "loops.db"),
+    code = main(["listen", "--allow-plaintext", "--db", str(blocker / "sub" / "loops.db"),
                  "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
     assert code == 2
@@ -841,7 +841,7 @@ def test_no_phi_reaches_stderr_or_the_log_on_any_boot_failure(tmp_path, good_env
     sentinel = "ZZSENTINELMRN9999"
     db = tmp_path / sentinel / "loops.db"
     monkeypatch.delenv("REFERRAL_THRESHOLDS_ACCEPTED", raising=False)
-    code = main(["listen", "--db", str(db), "--pack-dir", str(SHIPPED_PACK_DIR)])
+    code = main(["listen", "--allow-plaintext", "--db", str(db), "--pack-dir", str(SHIPPED_PACK_DIR)])
     assert code == 2
     captured = capsys.readouterr()
     assert sentinel not in captured.err + captured.out + caplog.text, (

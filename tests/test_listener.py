@@ -53,6 +53,7 @@ from healthcare_rag.referral_loop.matcher import field_value
 from healthcare_rag.referral_loop.mllp import CR, FS, VT, frame
 from healthcare_rag.referral_loop.mllp_server import DESYNC_GRACE_SECONDS
 from healthcare_rag.referral_loop.parse_hl7 import parse_hl7_text
+from healthcare_rag.referral_loop.peers import PeerRegistry
 from healthcare_rag.referral_loop.registry import Registry
 from healthcare_rag.referral_loop.staleness import is_stale, staleness_ratio
 from healthcare_rag.referral_loop.store import LoopStore
@@ -1145,6 +1146,10 @@ def test_a_year_2099_order_still_ages_and_can_turn_stale(handler, monkeypatch):
 
 @contextmanager
 def running_server(handler, **kwargs):
+    # The plaintext opt-in, by name. These tests are about framing and the wire,
+    # not about who is on the far end of it; `test_peer_identity.py` is where
+    # the transport's identity is exercised, over real mutual TLS.
+    kwargs.setdefault("peers", PeerRegistry.plaintext_loopback())
     server = make_mllp_server(handler, host="127.0.0.1", port=0, **kwargs)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1213,7 +1218,7 @@ def test_server_binds_loopback_by_default(handler):
     and a PHI-bearing port on every interface is the ingress half of that -- so
     the default is what has to be exercised. port=0 only, host omitted.
     """
-    server = make_mllp_server(handler, port=0)
+    server = make_mllp_server(handler, port=0, peers=PeerRegistry.plaintext_loopback())
     try:
         assert server.server_address[0] == "127.0.0.1"
     finally:

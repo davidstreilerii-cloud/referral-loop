@@ -54,6 +54,29 @@ Two properties that key must have, both asserted in the tests:
 
 Only the digest is ever stored. The `OBX` values that go into it are clinical
 content and never reach the database, the logs, or an audit row.
+
+**Every message is handled on behalf of a peer.** `handle` takes a
+`PeerIdentity` and the wire path always supplies the one the transport
+authenticated; the default is the in-process identity, which is what a direct
+caller is. Three things follow from it and none of them is optional:
+
+  1. **Idempotency is scoped to the peer.** Both dedup reads and both dedup
+     writes carry `peer.peer_id`, so a control id or a content key one peer
+     spends is spent in its own namespace. Before this, `MSH-10` was a global
+     primary key and anyone who could deliver a message could claim the id a
+     real feed was about to use, which answered the genuine result `AA` and
+     dropped it.
+  2. **Destructive transitions need an authority.** `ADT^A40` relinks two
+     charts; `SIU^S15` removes a clinically open loop from every worklist. Both
+     are refused unless the registry granted the peer that authority by name,
+     and the refusal is `AA` -- the message is well formed and will never become
+     acceptable from this peer, so asking the engine to retry it forever helps
+     nobody -- plus a counter, an ERROR line and a row in the immutable audit
+     trail.
+  3. **`MSH-3`/`MSH-4` are claims, not identity.** They are recorded on the
+     event beside `assertion_source`, and where the registry says what a peer
+     sends, a message contradicting it produces no transition. A self-asserted
+     facility never overrides the transport.
 """
 from __future__ import annotations
 
@@ -66,6 +89,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from . import audit
 from .clock import MAX_CLOCK_SKEW, is_future_dated
 from .errors import (
     CircularMergeError,
@@ -98,6 +122,8 @@ from .pack import RulePack
 from .parse_hl7 import (
     MRG_PRIOR_PATIENT_ID,
     MSH_DATETIME,
+    MSH_SENDING_APPLICATION,
+    MSH_SENDING_FACILITY,
     OBX_OBSERVATION_IDENTIFIER,
     OBX_OBSERVATION_VALUE,
     OBX_RESULT_STATUS,
@@ -107,8 +133,9 @@ from .parse_hl7 import (
     peek_control_id,
     structural_fault,
 )
+from .peers import CANCEL, FILEDROP_PEER, LOCAL_PEER, MERGE, PeerIdentity
 from .registry import CORRECTED, FINAL, PRELIMINARY, Registry
-from .store import LoopStore
+from .store import Attribution, LoopStore, attributed
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +162,22 @@ _DEFAULT_PRIOR_MRN_REF = f"MRG-{MRG_PRIOR_PATIENT_ID}.1"
 
 _MSH_DATETIME_REF = f"MSH-{MSH_DATETIME}"
 _ORDER_CONTROL_REF = f"ORC-{ORC_ORDER_CONTROL}"
+
+# What the message says about who sent it. Read on the first component: both
+# fields are commonly `NAME^1.2.3^ISO`, and whether a site's engine appends an
+# assigning authority is an encoding choice rather than a change of identity.
+# Fixed field numbers rather than pack-mapped placements, like OBX-11: MSH-3 and
+# MSH-4 are pinned by the HL7 standard, and the field map exists for the
+# placements that vary between hospitals.
+_SENDING_APPLICATION_REF = f"MSH-{MSH_SENDING_APPLICATION}.1"
+_SENDING_FACILITY_REF = f"MSH-{MSH_SENDING_FACILITY}.1"
+
+# The message types whose refusal costs a peer an authority it was not granted.
+# Both make a record leave every coordinator queue -- one by re-pointing it at
+# another chart, one by retiring it while it is still clinically open. Orders,
+# schedules and results are additive and recoverable from the worklist, so they
+# carry no authority of their own; see peers.py for the full argument.
+_AUTHORITY_REQUIRED = {MERGE_TYPE: MERGE, CANCEL_TYPE: CANCEL}
 
 # Version tag inside the content key. A change to what the key hashes over must
 # not silently make every message in flight look new *or* look like a duplicate
@@ -311,6 +354,16 @@ class MessageHandler:
         self.mrn_reresolution_count = 0
         self.mrn_retired_count = 0
         self.suspect_truncation_count = 0
+        # Transitions refused because the peer that sent them holds no such
+        # authority. Two numbers rather than one: a results feed that has
+        # started emitting cancellations and a peer attempting a patient merge
+        # are different incidents and go to different people.
+        self.unauthorized_merge_count = 0
+        self.unauthorized_cancel_count = 0
+        # Messages whose MSH-3/MSH-4 contradicted the peer that delivered them.
+        # Either a feed is misrouted or a peer is reaching past its own scope,
+        # and both need somebody to look at the registry.
+        self.peer_claim_mismatch_count = 0
         # Results that matched an exact order number and named no patient, so
         # the matcher declined them into the queue rather than attaching them
         # (matcher._unattributable). A subset of orphan_count and worth its own
@@ -328,8 +381,15 @@ class MessageHandler:
 
     # --------------------------------------------------------------- entry point
 
-    def handle(self, text: str) -> str:
-        """Persist, then parse, then apply. Never the other way round."""
+    def handle(self, text: str, *, peer: PeerIdentity = LOCAL_PEER) -> str:
+        """Persist, then parse, then apply. Never the other way round.
+
+        `peer` is the identity the *transport* resolved, and everything this
+        message is allowed to do is decided from it. It defaults to the
+        in-process identity because a direct caller is one; the socket path
+        never takes the default, and `MLLPRequestHandler` closes a connection it
+        cannot resolve to a peer before a byte of HL7 is read.
+        """
         control_id = peek_control_id(text)
 
         # Before the archive, because none of this is a message we could act
@@ -345,7 +405,8 @@ class MessageHandler:
         # somebody debugging the sender that emitted it.
         fault = structural_fault(text)
         if fault:
-            return self.reject_malformed(text.encode("utf-8", errors="replace"), fault)
+            return self.reject_malformed(text.encode("utf-8", errors="replace"), fault,
+                                         peer=peer)
 
         # Zero MSH segments is not HL7, and more than one is two messages
         # inside a single frame. Either way the control id we would key the
@@ -356,6 +417,7 @@ class MessageHandler:
             return self.reject_malformed(
                 text.encode("utf-8", errors="replace"),
                 f"expected exactly one MSH segment, found {count}",
+                peer=peer,
             )
 
         # Also before the archive, and for the same reason. `record_raw`
@@ -374,12 +436,14 @@ class MessageHandler:
                 text.encode("utf-8", errors="replace"),
                 "MSH-10 is empty, so this message cannot be keyed and no promise can be "
                 "made about processing it exactly once",
+                peer=peer,
             )
 
         # 1. Durable write. Everything after this point may fail without losing
         #    the message: it is on disk and replayable.
         try:
-            is_new_raw = self.store.record_raw(control_id, text)
+            is_new_raw = self.store.record_raw(control_id, text,
+                                               assertion_source=peer.peer_id)
         except StoreUnavailableError as exc:
             self.store_failure_count += 1
             logger.error(
@@ -396,7 +460,7 @@ class MessageHandler:
         #    something when two connections race.
         try:
             with self._lock:
-                return self._process(control_id, text)
+                return self._process(control_id, text, peer)
         except StoreUnavailableError as exc:
             # The archive holds the message but the transition did not land.
             # AE, and because applied_messages (not raw_messages) is the dedup
@@ -408,10 +472,16 @@ class MessageHandler:
             )
             return build_ack(control_id, "AE")
 
-    def _process(self, control_id: str, text: str) -> str:
-        if self.store.control_id_applied(control_id):
+    def _process(self, control_id: str, text: str, peer: PeerIdentity) -> str:
+        # Scoped to the peer, both here and in the database index behind it.
+        # Globally keyed, this check was the pre-claim: a peer that spent a
+        # control id a real feed was about to use made the genuine message
+        # arrive as a duplicate, answered AA, applied to nothing, and visible
+        # only as an INFO line indistinguishable from an engine replaying its
+        # outbound queue.
+        if self.store.control_id_applied(control_id, peer_id=peer.peer_id):
             self.duplicate_control_id_count += 1
-            logger.info("Duplicate MSH-10 %r: no-op", control_id)
+            logger.info("Duplicate MSH-10 %r from %s: no-op", control_id, peer.peer_id)
             return build_ack(control_id, "AA")
 
         try:
@@ -430,8 +500,17 @@ class MessageHandler:
             # message we do understand would then collide with.
             self.unknown_type_count += 1
             logger.info("Unknown message type %r: counted, ignored", message.message_type)
-            self.store.record_applied(control_id, None, message.message_type)
+            self.store.record_applied(control_id, None, message.message_type,
+                                      peer_id=peer.peer_id)
             return build_ack(control_id, "AA")
+
+        # Before anything is resolved or hashed. A message contradicting what
+        # the registry says this peer sends is not a message we are going to
+        # act on, and running the identity resolution first would put a
+        # rejected message's MRN through the alias table for nothing.
+        refusal = self._refuse_peer_claims(message, peer, control_id)
+        if refusal is not None:
+            return refusal
 
         if message.flags_for_review:
             logger.warning(
@@ -450,7 +529,7 @@ class MessageHandler:
 
         key = content_key(message, self.pack, mrn=mrn)
         if key is not None:
-            owner = self.store.content_key_owner(key)
+            owner = self.store.content_key_owner(key, peer_id=peer.peer_id)
             if owner is not None:
                 self.duplicate_content_key_count += 1
                 logger.warning(
@@ -459,11 +538,18 @@ class MessageHandler:
                     "retry configuration re-stamping control ids, not ordinary chatter.",
                     control_id, owner,
                 )
-                self.store.record_applied(control_id, None, message.message_type)
+                self.store.record_applied(control_id, None, message.message_type,
+                                          peer_id=peer.peer_id)
                 return build_ack(control_id, "AA")
 
         try:
-            self._apply(message, mrn=mrn, submitted_mrn=submitted_mrn)
+            # Every event appended inside this block carries who asserted it.
+            # Set here rather than passed down through the registry: `_apply`
+            # reaches six transition methods that each compose their own detail
+            # dict, and an attribution one of them forgot would be a silently
+            # unattributed row. See store.attributed.
+            with attributed(self._attribution(message, peer)):
+                self._apply(message, mrn=mrn, submitted_mrn=submitted_mrn)
         except StoreUnavailableError:
             raise                      # handle() answers AE
         except MrnRetiredError as exc:
@@ -502,8 +588,89 @@ class MessageHandler:
             logger.exception("Unexpected failure applying %r; raw archived for replay", control_id)
             return build_ack(control_id, "AA")
 
-        self.store.record_applied(control_id, key, message.message_type)
+        self.store.record_applied(control_id, key, message.message_type,
+                                  peer_id=peer.peer_id)
         return build_ack(control_id, "AA")
+
+    # ------------------------------------------------------------ peer authority
+
+    @staticmethod
+    def _claims(message: ParsedMessage) -> tuple[str, str]:
+        """(MSH-3, MSH-4) as the message states them. Never trusted, always kept."""
+        return (
+            field_value(message, _SENDING_APPLICATION_REF),
+            field_value(message, _SENDING_FACILITY_REF),
+        )
+
+    def _attribution(self, message: ParsedMessage, peer: PeerIdentity) -> Attribution:
+        application, facility = self._claims(message)
+        return Attribution(
+            assertion_source=peer.peer_id,
+            sending_application_claim=application,
+            sending_facility_claim=facility,
+        )
+
+    def _refuse_peer_claims(
+        self, message: ParsedMessage, peer: PeerIdentity, control_id: str
+    ) -> str | None:
+        """Refuse a message that contradicts the peer that delivered it, or None.
+
+        Two checks and they fail the same way, because they are the same
+        mistake in two spellings: this peer is asserting something it was not
+        given. `AA`, deliberately -- the message is well formed, so `AR` would
+        say "these bytes are unacceptable" when the bytes are fine and the
+        sender is not, and `AE` would ask an engine to redeliver forever a
+        message no redelivery can fix. Nothing is marked applied, so a
+        redelivery after the registry is corrected is processed rather than
+        swallowed.
+
+        The refusal is loud in three places at once: a counter an operator can
+        graph, an ERROR line naming the peer and the control id, and a row in
+        the immutable audit trail, which is the only one of the three that
+        survives the process.
+        """
+        application, facility = self._claims(message)
+        mismatch = peer.claim_mismatch(application, facility)
+        if mismatch:
+            self.peer_claim_mismatch_count += 1
+            self._audit_refusal(peer, "sending_identity_mismatch")
+            logger.error(
+                "Message %r from %s claims a %s this peer does not send; no transition. "
+                "Alert: either a feed is misrouted or a peer is asserting another site's "
+                "identity, and a self-asserted facility never overrides the transport.",
+                control_id, peer.peer_id, mismatch,
+            )
+            return build_ack(control_id, "AA")
+
+        authority = _AUTHORITY_REQUIRED.get(message.message_type)
+        if authority is not None and not peer.holds(authority):
+            if authority == MERGE:
+                self.unauthorized_merge_count += 1
+            else:
+                self.unauthorized_cancel_count += 1
+            self._audit_refusal(peer, f"missing_{authority}_authority")
+            logger.error(
+                "Message %r from %s is a %s and this peer holds no %r authority; no "
+                "transition. Alert: %s changes which chart a record belongs to or removes a "
+                "clinically open loop from every worklist, and this peer was not granted it.",
+                control_id, peer.peer_id, message.message_type, authority,
+                message.message_type,
+            )
+            return build_ack(control_id, "AA")
+        return None
+
+    @staticmethod
+    def _audit_refusal(peer: PeerIdentity, refusal: str) -> None:
+        """One durable row per refused assertion.
+
+        `loop_events` is the wrong home for these: nothing was merged or
+        cancelled, so there is no loop to hang the row on, and the audit
+        database is the one governed by a longer retention policy that this
+        subsystem cannot delete from. `record_peer_refusal` never raises, for
+        the reason the rest of audit.py never does -- a failed audit write must
+        not turn a refusal into an exception on the ingest path.
+        """
+        audit.record_peer_refusal(peer.peer_id, refusal)
 
     def flag_possible_truncation(self, control_id: str) -> None:
         """Retroactively flag a message that may have been half of one.
@@ -583,7 +750,8 @@ class MessageHandler:
         )
         return False
 
-    def reject_malformed(self, raw: bytes, reason: str) -> str:
+    def reject_malformed(self, raw: bytes, reason: str, *,
+                         peer: PeerIdentity = LOCAL_PEER) -> str:
         """Failure matrix: `AR`, archive raw, alert.
 
         `AR` rather than `AE` because these bytes will never become acceptable
@@ -608,7 +776,7 @@ class MessageHandler:
         archived = False
         if self._archive_has_room():
             try:
-                self.store.record_raw(control_id, payload)
+                self.store.record_raw(control_id, payload, assertion_source=peer.peer_id)
                 archived = True
             except StoreUnavailableError as exc:
                 # Still AR. The alternative is AE, which asks for the redelivery
@@ -1004,12 +1172,12 @@ class FileDropSource:
         try:
             text = deframe(raw) if raw.startswith(VT) else raw.decode("utf-8")
         except (FramingError, UnicodeDecodeError) as exc:
-            self.handler.reject_malformed(raw, f"{path.name}: {exc}")
+            self.handler.reject_malformed(raw, f"{path.name}: {exc}", peer=FILEDROP_PEER)
             self._quarantine(path)
             self.rejected_count += 1
             return False
 
-        code = ack_code(self.handler.handle(text))
+        code = ack_code(self.handler.handle(text, peer=FILEDROP_PEER))
         if code == "AA":
             self.accepted_count += 1
             if self.delete_on_accept:

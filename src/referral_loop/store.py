@@ -30,14 +30,44 @@ file is tamper-proof:
     trigger unless recursive_triggers is on, and that pragma is per-connection.
     _connect() sets it, so every path through LoopStore is covered; a foreign
     connection that does not set it is not.
+
+Who asserted a row, and why it is part of the key
+-------------------------------------------------
+`raw_messages` and `applied_messages` are both keyed on **(peer, control id)**
+rather than on the control id alone, and `raw_messages` carries the peer as
+`assertion_source` on every row. That is not bookkeeping.
+
+`MSH-10` is twenty characters the sender chose, and interface engines number
+them sequentially or from a template. With a global key, anybody who could
+deliver a message could spend the control id a real feed was about to use: the
+archive then refused the genuine message as already-seen, and the idempotency
+table reported it as already-applied, so the result was answered `AA` and never
+processed. A destroyed clinical result, an engine told it was delivered, and one
+INFO line indistinguishable from ordinary chatter. Scoping the key by the
+authenticated peer is what makes that attack cost the attacker its own
+namespace instead of somebody else's -- and it holds under the plaintext opt-in
+too, where the peer is only an allowlisted source address.
+
+`loop_events` carries the same fact in its `detail`, written by `append_event`
+from `attributed()` rather than passed in by each caller, so a transition
+recorded by a code path nobody has written yet is still attributed.
+
+Databases written before this existed are migrated in place on open: the two
+tables are rebuilt with the wider key and their existing rows land in the
+reserved `unattributed` scope. Reads consult that scope alongside the caller's
+own, so a message applied before the upgrade is not applied a second time after
+it; nothing ever writes there again, so it cannot become a way back in.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import re
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +85,7 @@ from .events import (
     LoopEvent,
     LoopState,
 )
+from .peers import LOCAL, UNATTRIBUTED
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +94,30 @@ logger = logging.getLogger(__name__)
 # stale literal silently matching nothing.
 _OPEN_STATES = (LoopState.OPEN, LoopState.SCHEDULED)
 
-_SCHEMA = """
+# The archive, keyed by who delivered the bytes as well as by what they called
+# them. See the module docstring: a control id alone is a value the sender chose,
+# so a global key let one peer pre-empt the archival of another's message -- and
+# `record_raw` returning "already seen" for a message that was never stored is
+# persist-before-ACK quietly ceasing to hold for it.
+#
+# `assertion_source` is declared before the payload rather than appended, because
+# the key it belongs to is the first thing anybody reading this table needs. It
+# defaults to the reserved `unattributed` scope, which is what a writer that does
+# not know about the column -- a restore script, a foreign connection, a
+# migration from an older file -- honestly is: a row whose origin nothing
+# recorded. Refusing such a row instead would turn an unknown provenance into a
+# lost message, which is the wrong direction for an archive.
+_RAW_MESSAGES_DDL = """
 CREATE TABLE IF NOT EXISTS raw_messages (
-    control_id  TEXT PRIMARY KEY,
-    payload     TEXT NOT NULL,
-    received_at TEXT NOT NULL
-);
+    control_id       TEXT NOT NULL,
+    assertion_source TEXT NOT NULL DEFAULT 'unattributed',
+    payload          TEXT NOT NULL,
+    received_at      TEXT NOT NULL,
+    PRIMARY KEY (assertion_source, control_id)
+)
+"""
+
+_SCHEMA_REST = """
 CREATE TABLE IF NOT EXISTS loop_events (
     event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     loop_id     TEXT NOT NULL,
@@ -104,14 +153,15 @@ CREATE INDEX IF NOT EXISTS idx_events_loop ON loop_events(loop_id);
 -- one row on any database engine treating NULLs as equal, and relying on
 -- SQLite not doing so is a portability trap for a table whose whole job is not
 -- losing messages.
-CREATE TABLE IF NOT EXISTS applied_messages (
-    control_id   TEXT PRIMARY KEY,
-    content_key  TEXT,
-    message_type TEXT NOT NULL DEFAULT '',
-    applied_at   TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_applied_content_key
-    ON applied_messages(content_key) WHERE content_key IS NOT NULL;
+--
+-- Both keys are scoped by `peer_id`, and the scoping reaches the index rather
+-- than stopping at the listener's in-process check. An in-process check that
+-- disagreed with the database would still lose the race the index exists to
+-- settle -- and it is the index, not the check, that an attacker was really
+-- attacking: a pre-claimed control id was a *row*, and it outlived the process.
+-- The table and its index are built from _APPLIED_MESSAGES_DDL below, so the
+-- migration that widens an existing database and the schema a fresh one gets
+-- are the same two statements rather than two definitions that can drift.
 CREATE TABLE IF NOT EXISTS loops (
     loop_id           TEXT PRIMARY KEY,
     mrn               TEXT NOT NULL,
@@ -234,6 +284,47 @@ CREATE TRIGGER IF NOT EXISTS labels_no_update BEFORE UPDATE ON labels
 BEGIN SELECT RAISE(ABORT, 'labels is append-only'); END;
 """
 
+_APPLIED_MESSAGES_DDL = """
+CREATE TABLE IF NOT EXISTS applied_messages (
+    control_id   TEXT NOT NULL,
+    peer_id      TEXT NOT NULL DEFAULT 'unattributed',
+    content_key  TEXT,
+    message_type TEXT NOT NULL DEFAULT '',
+    applied_at   TEXT NOT NULL,
+    PRIMARY KEY (peer_id, control_id)
+)
+"""
+
+_APPLIED_CONTENT_INDEX_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applied_content_key
+    ON applied_messages(peer_id, content_key) WHERE content_key IS NOT NULL
+"""
+
+# Assembled rather than written out once, so the two rebuilt tables have exactly
+# one definition each: the migration below creates them from the same strings a
+# fresh database is created from, and a schema that drifted between the two
+# would be a difference nobody sees until a site upgrades.
+_SCHEMA = (
+    _RAW_MESSAGES_DDL + ";\n"
+    + _APPLIED_MESSAGES_DDL + ";\n"
+    + _APPLIED_CONTENT_INDEX_DDL + ";\n"
+    + _SCHEMA_REST
+)
+
+# The rebuilt tables, their canonical DDL, the triggers that have to come off
+# before the table can be renamed out from under them, and the column that
+# carries the peer. Data-driven because the two migrations are the same
+# migration twice, and two hand-written copies of it are two chances to write
+# the copy step wrong on a table nothing can restore.
+_PEER_SCOPED_TABLES = (
+    ("raw_messages", "assertion_source", _RAW_MESSAGES_DDL,
+     ("raw_messages_no_delete", "raw_messages_no_update"),
+     ("control_id", "payload", "received_at")),
+    ("applied_messages", "peer_id", _APPLIED_MESSAGES_DDL,
+     ("applied_no_delete", "applied_no_update"),
+     ("control_id", "content_key", "message_type", "applied_at")),
+)
+
 _ALIAS_ESTABLISHED = "established"
 _ALIAS_REVERSED = "reversed"
 
@@ -296,8 +387,8 @@ _PURGE_CHUNK = 400
 # there. A TEXT PRIMARY KEY (control_id, loop_id, retired_mrn) is not a rowid
 # alias and every one of those stays in its table's list.
 STATS_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("raw_messages", ("control_id", "payload", "received_at")),
-    ("applied_messages", ("control_id", "content_key", "message_type", "applied_at")),
+    ("raw_messages", ("control_id", "assertion_source", "payload", "received_at")),
+    ("applied_messages", ("control_id", "peer_id", "content_key", "message_type", "applied_at")),
     ("loops", ("loop_id", "mrn", "state", "placer_order_number", "filler_order_number",
                "service_code", "modality", "ordering_provider", "ordered_at",
                "ack_by", "ack_role", "ack_at")),
@@ -465,6 +556,140 @@ def _authorizer(action_code: int, arg1, arg2, *_args):
     return sqlite3.SQLITE_OK
 
 
+# ------------------------------------------------------------------ attribution
+
+
+@dataclass(frozen=True)
+class Attribution:
+    """Who asserted the message currently being applied, and what it claimed.
+
+    `assertion_source` comes from the transport: the peer whose client
+    certificate this connection presented, or -- under the plaintext opt-in --
+    the allowlisted source address it arrived from. The two `_claim` fields are
+    what the *message* said about itself in `MSH-3` and `MSH-4`. Both are
+    recorded, and they are recorded as different things: the first is what we
+    know, the second is what we were told, and an event that carried only the
+    second is the defect this class exists to close.
+    """
+
+    assertion_source: str
+    sending_application_claim: str = ""
+    sending_facility_claim: str = ""
+
+    def as_detail(self) -> dict:
+        detail: dict[str, object] = {"assertion_source": self.assertion_source}
+        if self.sending_application_claim:
+            detail["sending_application_claim"] = self.sending_application_claim
+        if self.sending_facility_claim:
+            detail["sending_facility_claim"] = self.sending_facility_claim
+        return detail
+
+
+# The attribution in force on this thread, or None outside the ingest path.
+#
+# A context variable rather than a parameter threaded through `Registry`, and
+# the choice is deliberate. Every one of the registry's transition methods
+# composes its own `detail` dict, so a parameter would be six signatures and six
+# places to remember -- and a seventh added later would silently write an
+# unattributed event, which is exactly the state this fix exists to leave. Read
+# in one place (`append_event`, the choke point every event already passes
+# through) and written in one place (`MessageHandler.handle`), so a transition
+# recorded by a path nobody has written yet is attributed anyway.
+#
+# A ContextVar and not a threading.local because it reads the same either way
+# here -- `threading.Thread` starts with a fresh context, so nothing leaks
+# between connections -- and because the token-based reset below cannot be got
+# wrong by nesting.
+_attribution: contextvars.ContextVar[Attribution | None] = contextvars.ContextVar(
+    "referral_loop_attribution", default=None
+)
+
+
+@contextlib.contextmanager
+def attributed(attribution: Attribution | None):
+    """Attribute every event appended inside this block to one peer."""
+    token = _attribution.set(attribution)
+    try:
+        yield
+    finally:
+        _attribution.reset(token)
+
+
+def current_attribution() -> Attribution | None:
+    return _attribution.get()
+
+
+# ------------------------------------------------------------------- migration
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _widen_key(conn: sqlite3.Connection, table: str, peer_column: str, ddl: str,
+               triggers: tuple[str, ...], carried: tuple[str, ...]) -> None:
+    """Rebuild one table around (peer, control_id), keeping every row.
+
+    SQLite cannot alter a primary key, so this is the twelve-step dance: take
+    the append-only triggers off, move the table aside, build the new one from
+    the same DDL a fresh database gets, copy every row into the reserved
+    `unattributed` scope, drop the old table. The triggers are recreated by the
+    `_SCHEMA` script that runs immediately afterwards, and
+    `test_an_upgraded_database_keeps_its_append_only_triggers` is what stops
+    that last step being a promise.
+
+    `DROP TABLE` is what removes the old rows, and it does not fire a
+    `BEFORE DELETE` trigger -- which is why the triggers come off first anyway:
+    `ALTER TABLE ... RENAME` moves them with the table, and a trigger left
+    attached to the aside copy owns the name the new table needs.
+
+    Existing rows land in `unattributed` rather than being guessed at. They were
+    written when the transport had no identity, so there is no peer to attribute
+    them to, and inventing one would be a false provenance record in an
+    append-only archive.
+    """
+    legacy = f"{table}__legacy"
+    for trigger in triggers:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+    conn.execute(ddl)
+    # A column the old table did not have is carried as an empty string rather
+    # than failing the migration: `message_type` was added after the table
+    # shipped, so a database old enough to predate it must still upgrade.
+    present = _column_names(conn, legacy)
+    selected = ", ".join(name if name in present else "''" for name in carried)
+    columns = ", ".join((*carried, peer_column))
+    conn.execute(
+        f"INSERT INTO {table} ({columns}) SELECT {selected}, ? FROM {legacy}",
+        (UNATTRIBUTED,),
+    )
+    conn.execute(f"DROP TABLE {legacy}")
+    logger.warning(
+        "Migrated %s to a peer-scoped key; existing rows were attributed to %r because the "
+        "transport carried no identity when they were written.", table, UNATTRIBUTED,
+    )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the peer-scoped schema, or do nothing.
+
+    Runs before `_SCHEMA`, not after: the script creates a unique index over
+    `applied_messages(peer_id, content_key)`, and that column has to exist by
+    then. A database that does not have the tables at all is left alone -- the
+    script is about to create them in their current shape.
+    """
+    for table, peer_column, ddl, triggers, carried in _PEER_SCOPED_TABLES:
+        if _table_exists(conn, table) and peer_column not in _column_names(conn, table):
+            _widen_key(conn, table, peer_column, ddl, triggers, carried)
+    conn.commit()
+
+
 class LoopStore:
     def __init__(self, db_path: Path | str):
         self.db_path = str(db_path)
@@ -472,6 +697,7 @@ class LoopStore:
         conn = None
         try:
             conn = self._connect()
+            _migrate(conn)
             conn.executescript(_SCHEMA)
             conn.commit()
         except sqlite3.Error as exc:
@@ -512,11 +738,19 @@ class LoopStore:
         conn.set_authorizer(_authorizer)
         return conn
 
-    def record_raw(self, control_id: str, payload: str) -> bool:
+    def record_raw(self, control_id: str, payload: str, *,
+                   assertion_source: str = LOCAL) -> bool:
         """Durably persist the raw message. Returns False if already seen.
 
         This must complete before any ACK. Acknowledging then crashing during
         parse means the engine considers the message delivered and it is gone.
+
+        "Already seen" is per peer. A control id is a value the sender chose, so
+        a global archive key let one peer's message stop another's from ever
+        being written -- and this method answering False for a message it did
+        not store is persist-before-ACK failing silently for exactly that
+        message. `assertion_source` defaults to the in-process identity, which
+        is what a direct caller is; the wire path always names its peer.
         """
         if not control_id:
             # SQLite permits repeated NULLs in a TEXT primary key, so a missing
@@ -531,8 +765,10 @@ class LoopStore:
             conn = self._connect()
             try:
                 conn.execute(
-                    "INSERT INTO raw_messages (control_id, payload, received_at) VALUES (?, ?, ?)",
-                    (control_id, payload, datetime.now(timezone.utc).isoformat()),
+                    "INSERT INTO raw_messages (control_id, assertion_source, payload, "
+                    "received_at) VALUES (?, ?, ?, ?)",
+                    (control_id, assertion_source, payload,
+                     datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
                 return True
@@ -543,7 +779,8 @@ class LoopStore:
                 # does not exist. Confirm the row is really there before we
                 # claim "already seen".
                 seen = conn.execute(
-                    "SELECT 1 FROM raw_messages WHERE control_id = ?", (control_id,)
+                    "SELECT 1 FROM raw_messages WHERE control_id = ? AND assertion_source = ?",
+                    (control_id, assertion_source),
                 ).fetchone()
                 if seen is None:
                     raise StoreUnavailableError(f"Durable write failed: {exc}") from exc
@@ -584,25 +821,65 @@ class LoopStore:
 
     # ---------------------------------------------------------- applied messages
 
-    def control_id_applied(self, control_id: str) -> bool:
-        """Has this MSH-10 already been acted on (not merely archived)?"""
+    def assertion_sources(self) -> list[str]:
+        """Every peer that has put something in the archive, sorted.
+
+        An operator-facing read as much as a test one: "who has been sending"
+        used to have no answer at all, because nothing recorded it.
+        """
+        return [
+            row["assertion_source"]
+            for row in self._read(
+                "SELECT DISTINCT assertion_source FROM raw_messages ORDER BY assertion_source"
+            )
+        ]
+
+    @staticmethod
+    def _dedup_scopes(peer_id: str) -> tuple[str, str]:
+        """The scopes a dedup read consults: this peer's, and the legacy one.
+
+        Reads look at both; writes only ever land in the first. A row migrated
+        from a database written before the transport had an identity still
+        suppresses a redelivery of the message it recorded, so an upgrade cannot
+        cause an already-applied message to be applied a second time -- and
+        because nothing writes to `unattributed` again, no peer can reach into
+        it to claim a key on the past's behalf.
+        """
+        return (peer_id, UNATTRIBUTED)
+
+    def control_id_applied(self, control_id: str, *, peer_id: str = LOCAL) -> bool:
+        """Has this peer's MSH-10 already been acted on (not merely archived)?"""
         if not control_id:
             return False
         return bool(
-            self._read("SELECT 1 FROM applied_messages WHERE control_id = ?", (control_id,))
+            self._read(
+                "SELECT 1 FROM applied_messages WHERE control_id = ? AND peer_id IN (?, ?)",
+                (control_id, *self._dedup_scopes(peer_id)),
+            )
         )
 
-    def content_key_owner(self, content_key: str) -> str | None:
-        """The control id that already applied this content, if any."""
+    def content_key_owner(self, content_key: str, *, peer_id: str = LOCAL) -> str | None:
+        """The control id that already applied this content for this peer, if any.
+
+        Peer-scoped like the control id, and the same reasoning: a global
+        content key let one peer spend the hash of a result that had not
+        arrived. The cost is that two feeds legitimately carrying the same
+        result each produce a transition -- visible in the event log, and
+        recoverable from the worklist -- where before the second was silently
+        dropped. Losing a result is the failure this subsystem exists to
+        prevent; counting one twice is not.
+        """
         if not content_key:
             return None
         rows = self._read(
-            "SELECT control_id FROM applied_messages WHERE content_key = ?", (content_key,)
+            "SELECT control_id FROM applied_messages WHERE content_key = ? AND peer_id IN (?, ?)",
+            (content_key, *self._dedup_scopes(peer_id)),
         )
         return rows[0]["control_id"] if rows else None
 
     def record_applied(
-        self, control_id: str, content_key: str | None, message_type: str = ""
+        self, control_id: str, content_key: str | None, message_type: str = "",
+        *, peer_id: str = LOCAL,
     ) -> bool:
         """Mark a message applied. False if this control id or content was already.
 
@@ -623,22 +900,23 @@ class LoopStore:
             conn = self._connect()
             try:
                 conn.execute(
-                    "INSERT INTO applied_messages (control_id, content_key, message_type, "
-                    "applied_at) VALUES (?, ?, ?, ?)",
-                    (control_id, content_key or None, message_type,
+                    "INSERT INTO applied_messages (control_id, peer_id, content_key, "
+                    "message_type, applied_at) VALUES (?, ?, ?, ?, ?)",
+                    (control_id, peer_id, content_key or None, message_type,
                      datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
-                # Either this control id or this content key is already on file.
-                # Both mean "somebody else got here first", which is the whole
-                # point of the constraint -- including when the somebody else is
-                # a second process this lock does not cover.
+                # Either this control id or this content key is already on file
+                # *for this peer*. Both mean "somebody else got here first",
+                # which is the whole point of the constraint -- including when
+                # the somebody else is a second process this lock does not
+                # cover.
                 conn.rollback()
                 logger.info(
-                    "Message %s was already marked applied (content key present: %s)",
-                    control_id, content_key is not None,
+                    "Message %s from %s was already marked applied (content key present: %s)",
+                    control_id, peer_id, content_key is not None,
                 )
                 return False
             except sqlite3.Error as exc:
@@ -764,7 +1042,7 @@ class LoopStore:
                         event.event_type,
                         event.occurred_at.isoformat(),
                         event.control_id,
-                        json.dumps(event.detail, sort_keys=True),
+                        json.dumps(self._attributed_detail(event.detail), sort_keys=True),
                     ),
                 )
                 # Same connection, so this joins the transaction the INSERT
@@ -781,6 +1059,26 @@ class LoopStore:
                 conn.close()
 
     _EVENTS_SQL = "SELECT * FROM loop_events WHERE loop_id = ? ORDER BY event_id"
+
+    @staticmethod
+    def _attributed_detail(detail: dict) -> dict:
+        """Stamp the event with who asserted it, if anything is asserting.
+
+        Written last, so the attribution wins over any key of the same name in
+        a detail a caller composed. The listener builds those from allowlisted
+        values rather than from message fields, so nothing on the wire can reach
+        here -- and "the transport's answer overrides the message's" is the rule
+        this whole change is about, so it is the rule the merge follows too.
+
+        Absent outside the ingest path. A coordinator's acknowledgement is
+        attributed by `audit.py`'s actor and by the `ack_by` on the loop; there
+        is no peer behind it, and writing one would be a claim about a transport
+        that was not involved.
+        """
+        attribution = _attribution.get()
+        if attribution is None:
+            return detail
+        return {**detail, **attribution.as_detail()}
 
     @staticmethod
     def _rows_to_events(rows) -> list[LoopEvent]:
@@ -1414,23 +1712,29 @@ class LoopStore:
         is holding the doomed control ids in memory for the length of one
         transaction; for a single-site archive that is the cheaper mistake to
         avoid making.
+
+        Selected and deleted by `rowid`, not by control id. The archive is keyed
+        on (assertion_source, control_id), so two peers may hold the same
+        control id -- and a delete naming only the control id would take the
+        other peer's row with it, ageing out a message that is still inside the
+        window because a different sender happened to reuse a string.
         """
-        doomed: list[str] = []
+        doomed: list[int] = []
         for row in conn.execute(
-            "SELECT control_id, received_at FROM raw_messages"
+            "SELECT rowid, received_at FROM raw_messages"
         ).fetchall():
             older = self._older_than(row["received_at"], cutoff)
             if older is None:
                 report["raw_retained_unreadable"] += 1
             elif older:
-                doomed.append(row["control_id"])
+                doomed.append(row["rowid"])
         report["raw_deleted"] = len(doomed)
         if dry_run:
             return
         for start in range(0, len(doomed), _PURGE_CHUNK):
             chunk = doomed[start:start + _PURGE_CHUNK]
             conn.execute(
-                f"DELETE FROM raw_messages WHERE control_id IN ({','.join('?' * len(chunk))})",
+                f"DELETE FROM raw_messages WHERE rowid IN ({','.join('?' * len(chunk))})",
                 chunk,
             )
 

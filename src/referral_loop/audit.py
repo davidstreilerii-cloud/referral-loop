@@ -190,6 +190,15 @@ class AuditAction(str, Enum):
     MATCH_UNDONE = "referral.match_undone"
     PATIENT_MERGED = "referral.patient_merged"
     MERGE_REVERSED = "referral.merge_reversed"
+    # An authenticated peer asserting something it was not granted: an ADT^A40
+    # from a feed holding no merge authority, an SIU^S15 from one holding no
+    # cancel authority, or a message whose MSH-3/MSH-4 contradict the identity
+    # its certificate resolved to. Audited rather than only counted because
+    # nothing was changed -- there is no loop to hang the refusal on, and a
+    # counter dies with the process. An auditor asking "did anybody try to
+    # merge two charts they had no business merging" needs an answer that
+    # outlived the listener that refused it.
+    PEER_REFUSED = "referral.peer_refused"
     PACK_LOADED = "referral.pack_loaded"
     # The one operation in this subsystem that destroys clinical records. It is
     # audited for the reason the others are not enough on their own: after a
@@ -250,6 +259,7 @@ _RESOURCE_TYPE = {
     AuditAction.MERGE_REVERSED: "referral_patient_merge",
     AuditAction.PACK_LOADED: "referral_rule_pack",
     AuditAction.RETENTION_PURGED: "referral_retention",
+    AuditAction.PEER_REFUSED: "referral_peer",
 }
 
 # A merge touches a set of loops rather than one, and the identifiers that would
@@ -399,6 +409,21 @@ def _refusal(value: object) -> str:
     return "unspecified"
 
 
+def _peer_ref(value: object) -> str:
+    """A peer id, or `unminted` when it is not one this subsystem would issue.
+
+    Same shape as `_loop_ref`: the resource id is normalised here rather than
+    trusted, so an audit row can never carry a string a caller composed. The
+    predicate is `peers.is_peer_id`, asked rather than restated so the two
+    cannot drift into disagreeing about what a peer id is. Imported inside the
+    function because this module is loaded by `peers`' own importers and the
+    dependency runs the other way everywhere else.
+    """
+    from .peers import is_peer_id
+
+    return f"peer:{value}" if is_peer_id(value) else UNMINTED
+
+
 def _person(value: object, limit: int) -> str:
     """One line, bounded. See the module note on why this is not filtered further."""
     if not isinstance(value, str):
@@ -446,6 +471,7 @@ def _emit(
     reason_required: bool,
     scope: AuditScope,
     refusal: object = None,
+    peer_id: str = "",
 ) -> bool:
     """Append one row. Returns whether it landed. Never raises -- see the module
     note on why an audit failure must not block a coordinator."""
@@ -459,6 +485,8 @@ def _emit(
             resource_id = _RETENTION_RESOURCE_ID
         elif action is AuditAction.PACK_LOADED:
             resource_id = _pack_version(scope.pack_version)
+        elif action is AuditAction.PEER_REFUSED:
+            resource_id = _peer_ref(peer_id)
         else:
             resource_id = _loop_ref(loop_id)
 
@@ -541,6 +569,37 @@ def audited(
           reason_required=reason_required, scope=scope)
 
 
+def record_peer_refusal(peer_id: str, refusal: str) -> bool:
+    """One `denied` row naming the peer whose assertion was refused.
+
+    Not a use of `audited`, and deliberately: nothing is being wrapped. The
+    refusal is a decision the listener has already made and returned an ACK for,
+    so there is no body to observe and no exception to classify -- inventing one
+    to satisfy the context manager would be ceremony that obscures what happened.
+
+    The row carries the peer id and a refusal code and nothing else. No control
+    id, no message type, no identifier: an auditor asking "did anybody try to
+    merge charts they had no authority to merge" is answered by the peer and the
+    code, and the message itself is in the archive under that peer's own scope.
+
+    Never raises, like everything else here. An audit database that cannot be
+    written must not turn a refusal into an exception on the ingest path, where
+    it would be caught as an apply failure and reported as something else.
+    """
+    scope = AuditScope()
+    scope.refusal = refusal
+    return _emit(
+        AuditAction.PEER_REFUSED,
+        Outcome.DENIED,
+        loop_id="",
+        actor=ENGINE_ACTOR,
+        role=SYSTEM_ROLE,
+        reason_required=False,
+        scope=scope,
+        peer_id=peer_id,
+    )
+
+
 def referral_audit_entries() -> list[dict]:
     """Every referral row, oldest first. The export an auditor reads.
 
@@ -570,6 +629,7 @@ __all__ = [
     "RefusalCode",
     "audited",
     "audit_db_path",
+    "record_peer_refusal",
     "referral_audit_entries",
     "set_audit_db",
     "write_failures",

@@ -61,6 +61,7 @@ from .errors import PackVerificationError, ReferralLoopError, StoreUnavailableEr
 from .listener import FileDropSource, MessageHandler
 from .mllp_server import make_mllp_server
 from .pack import RulePack, load_pack
+from .peers import PeerRegistry, load_peer_registry
 from .registry import Registry
 from .retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV, RetentionPolicy
 from .retention import purge as run_purge
@@ -172,9 +173,33 @@ def _prepared_db_path(db_path: Path | str) -> Path:
 # --------------------------------------------------------------------- modes
 
 
-def _run_listen(stack: BootedStack, host: str, port: int) -> int:
+def _peer_registry(args) -> PeerRegistry:
+    """The transport policy for listen mode, or a refusal naming what is missing.
+
+    Three states and no fourth. `--peers` names a registry file, which decides
+    for itself whether it is mutual TLS or an explicit plaintext opt-in.
+    `--allow-plaintext` with no file is the demo and development posture:
+    loopback only, one named identity, and a WARNING on every start. Neither is
+    a refused boot, because a listener with no transport policy would otherwise
+    be the thing this whole change exists to stop shipping.
+    """
+    if args.peers:
+        return load_peer_registry(Path(args.peers))
+    if args.allow_plaintext:
+        return PeerRegistry.plaintext_loopback()
+    raise ReferralLoopError(
+        "listen mode needs a transport policy. Pass --peers FILE with the client "
+        "certificate fingerprint and authorities of each interface engine, or "
+        "--allow-plaintext to run an unauthenticated loopback-only listener for a demo "
+        "or for local development. There is no default: PHI crosses this port, and a "
+        "listener that authenticates nothing must be asked for out loud."
+    )
+
+
+def _run_listen(stack: BootedStack, args, host: str, port: int) -> int:
+    peers = _peer_registry(args)
     server = _bound(
-        lambda: make_mllp_server(stack.handler, host=host, port=port),
+        lambda: make_mllp_server(stack.handler, host=host, port=port, peers=peers),
         what=f"MLLP listener on {host}:{port}",
     )
     try:
@@ -476,6 +501,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="listen mode: MLLP bind address (default: %(default)s)")
     parser.add_argument("--port", type=int, default=2575,
                         help="listen mode: MLLP port (default: %(default)s)")
+    parser.add_argument("--peers", default="",
+                        help="listen mode: JSON peer registry mapping each interface "
+                             "engine's client certificate (SHA-256 fingerprint) to an "
+                             "identity and the authorities it holds. Also carries the TLS "
+                             "certificate, key and client CA. Required unless "
+                             "--allow-plaintext")
+    parser.add_argument("--allow-plaintext", action="store_true",
+                        help="listen mode: run WITHOUT mutual TLS. Loopback only, one "
+                             "identity, and a warning on every start. PHI crosses this "
+                             "port unauthenticated and unencrypted; this exists so a demo "
+                             "and local development stay workable, not for a deployment. "
+                             "Ignored when --peers is given, which states its own transport")
     parser.add_argument("--worklist-host", default="127.0.0.1",
                         help="worklist mode: bind address. Non-loopback is refused -- the "
                              "page has no authentication (default: %(default)s)")
@@ -549,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.mode == "listen":
-            return _run_listen(stack, args.host, args.port)
+            return _run_listen(stack, args, args.host, args.port)
         if args.mode == "filedrop":
             return _run_filedrop(stack, args.drop_dir)
         if args.mode == "eval":

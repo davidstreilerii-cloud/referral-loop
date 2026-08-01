@@ -102,10 +102,34 @@ bounds, and each one is a different way of holding a resource:
   * a per-peer rejection budget over a window, so reconnecting to draw another
     rejection stops being free.
 
-Peers are identified by source address, which is not an identity: v1 does not
-authenticate the transport, so a NAT shares one budget between senders and a
-peer with several addresses gets several. Both are limits of counting what can
-be seen, not reasons to count nothing.
+Those four budgets stay keyed on the **source address**, and that is a decision
+rather than an omission now that connections have identities. They exist to
+bound what a peer can consume *before* it is anybody, and the two ends of the
+handshake make the argument in opposite directions: a client that fails
+authentication has no identity to charge, so an identity-keyed budget would
+share one bucket between every failing attacker and every failing
+misconfiguration; and a client that succeeds has already spent the accept, the
+handshake and the thread that the budget exists to protect. Address is the only
+thing available at the moment the answer is needed. Its limits are real -- a NAT
+shares one budget between senders and a multi-homed peer gets several -- and
+they are limits of counting what can be seen, not reasons to count nothing. The
+peer id, once resolved, is logged alongside the address wherever a budget is
+spent, so an operator reading the alert is not left with only a number.
+
+**The transport authenticates before it reads.** `get_request` wraps every
+accepted socket in a TLS context requiring a client certificate signed by the
+site's own CA, and `MLLPRequestHandler.handle` resolves that certificate to a
+`PeerIdentity` through the peer registry and closes the connection if it cannot.
+Nothing reaches `MessageHandler` unattributed. A site may opt out -- see
+`peers.PeerRegistry` -- and then an allowlisted source address is the identity,
+enforced in `verify_request` before a thread exists, with the opt-out logged at
+WARNING on every start.
+
+The handshake happens on the accept thread, before `verify_request` can charge
+anything for it, which is where `TLS_HANDSHAKE_SECONDS` comes in: a client that
+opens a connection and then stalls mid-handshake would otherwise hold up every
+other accept. That is the same resource argument the budgets make, applied at
+the one point that runs before they can see anything.
 """
 from __future__ import annotations
 
@@ -113,12 +137,14 @@ import logging
 import select
 import socket
 import socketserver
+import ssl
 import threading
 import time
 
 from .errors import FramingError
 from .mllp import CR, FS, VT, ack_code, deframe, frame
 from .parse_hl7 import peek_control_id
+from .peers import TLS_HANDSHAKE_SECONDS, PeerIdentity, PeerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +292,40 @@ class MLLPServer(socketserver.ThreadingTCPServer):
     max_rejections_per_peer: int
     rejection_window: float
     peers: _PeerLedger
+    peer_registry: PeerRegistry
+    tls_context: ssl.SSLContext | None
+    tls_handshake_timeout: float
+
+    def get_request(self):
+        """Accept, and authenticate the transport before anything else sees it.
+
+        socketserver calls this on the accept thread and catches `OSError` from
+        it, treating the connection as never having happened -- which is exactly
+        the disposal a failed handshake wants, and `ssl.SSLError` is an
+        `OSError`. A client with no certificate, or one signed by a CA the site
+        did not name, never becomes a request.
+
+        The timeout is set before the wrap and cleared after it. A handshake is
+        the one thing this class does on the accept thread, so an unbounded one
+        is a single stalled client holding up every other accept; the connection
+        deadline and the idle allowance take over from here.
+        """
+        request, client_address = super().get_request()
+        if self.tls_context is None:
+            return request, client_address
+        request.settimeout(self.tls_handshake_timeout)
+        try:
+            secured = self.tls_context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError) as exc:
+            logger.warning(
+                "TLS handshake with %s failed (%s); the connection is dropped unread. A "
+                "peer drawing this repeatedly is either misconfigured or has no certificate "
+                "this listener accepts.", client_address[0], exc,
+            )
+            request.close()
+            raise
+        secured.settimeout(None)
+        return secured, client_address
 
     def verify_request(self, request, client_address) -> bool:
         """Refuse a connection before it costs a thread.
@@ -274,8 +334,23 @@ class MLLPServer(socketserver.ThreadingTCPServer):
         runs only if this returns True, so this is the one place a connection
         can be refused without first paying for the resource it was opened to
         consume. The slot taken here is returned in `MLLPRequestHandler.handle`.
+
+        Under the plaintext opt-in this is also where the source-address
+        allowlist is enforced, and it is enforced *first*: a source this
+        listener will never serve must not be able to spend a connection slot,
+        which is the whole difference between an allowlist and a log line.
+        Under mTLS the certificate has already been checked by `get_request`;
+        which peer it *is* is settled on the connection thread.
         """
         peer = client_address[0]
+        if not self.peer_registry.requires_tls and not self.peer_registry.allows_address(peer):
+            logger.error(
+                "Refusing a plaintext connection from %s: it is not on the source-address "
+                "allowlist. Alert: this listener is running without transport "
+                "authentication and something outside the allowlist is speaking to it.",
+                peer,
+            )
+            return False
         if self.peers.admit(peer):
             return True
         logger.warning(
@@ -292,7 +367,10 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         server: MLLPServer = self.server  # type: ignore[assignment]
         try:
-            self._serve(server)
+            peer = self._resolve(server)
+            if peer is None:
+                return
+            self._serve(server, peer)
         finally:
             # Pairs with the slot taken in verify_request, which is the only
             # path that reaches here. A cap whose slots are not returned shrinks
@@ -300,7 +378,38 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             # arriving by way of the fix for one.
             server.peers.release(self.client_address[0])
 
-    def _serve(self, server: MLLPServer) -> None:
+    def _resolve(self, server: MLLPServer) -> PeerIdentity | None:
+        """Which peer this connection is, or None and it is closed unread.
+
+        Chaining to the site's CA got the client this far; it does not say which
+        peer it is. That is the registry's answer, and it is a different
+        question deliberately -- a CA that can be persuaded to sign one more
+        certificate would otherwise be a CA that can mint interface engines.
+
+        Nothing is acknowledged on the way out. A refused connection has read
+        nothing, so a legitimate sender whose certificate was rotated without
+        the registry being updated still holds its message and redelivers it
+        once somebody fixes the configuration.
+        """
+        address = self.client_address[0]
+        registry = server.peer_registry
+        if registry.requires_tls:
+            certificate = self.request.getpeercert(binary_form=True)
+            peer = registry.resolve_certificate(certificate)
+        else:
+            peer = registry.resolve_address(address)
+        if peer is None:
+            logger.error(
+                "Closing a connection from %s: it presented no credential this registry "
+                "maps to a peer. Alert: the certificate is trusted by the configured CA but "
+                "is not one of the pinned interface engines, or its peer entry has been "
+                "removed. Nothing was read and nothing was acknowledged.", address,
+            )
+            return None
+        logger.info("Connection from %s authenticated as %s", address, peer.peer_id)
+        return peer
+
+    def _serve(self, server: MLLPServer, peer: PeerIdentity) -> None:
         handler = server.message_handler
         buffer = b""
         # The frame accepted most recently on this connection. If the stream
@@ -353,9 +462,10 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             if frame_started is None:
                 frame_started = time.monotonic()
             if len(buffer) > server.max_frame_bytes:
-                self._reject(server, handler.reject_malformed(
+                self._reject(server, peer, handler.reject_malformed(
                     buffer[: server.max_frame_bytes],
                     f"no end block within {server.max_frame_bytes} bytes",
+                    peer=peer,
                 ))
                 return
 
@@ -380,12 +490,13 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                     # this now runs before the ACK, the truncated half is
                     # refused rather than flagged after the fact.
                     self._flag(handler, last_accepted)
-                    self._reject(server, handler.reject_malformed(
-                        buffer, "bytes after an end block do not begin a new frame"
+                    self._reject(server, peer, handler.reject_malformed(
+                        buffer, "bytes after an end block do not begin a new frame",
+                        peer=peer,
                     ))
                     return
                 buffer = remainder
-                ack, intact = self._ack_for(handler, candidate)
+                ack, intact = self._ack_for(handler, candidate, peer)
                 if not intact:
                     # ANY framing rejection immediately after an accepted frame
                     # is the same evidence, not just check 4's. The `CR FS CR`
@@ -394,7 +505,7 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                     # apparent frame and fails check 2. Flagging only on check 4
                     # missed exactly the case the flag exists for.
                     self._flag(handler, last_accepted)
-                    self._reject(server, ack)
+                    self._reject(server, peer, ack)
                     return
                 self._send(ack)
                 # Only a frame the store actually took. The truncation alert
@@ -443,23 +554,31 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             self.client_address[0], reason, len(buffer),
         )
 
-    def _reject(self, server: MLLPServer, ack: str) -> None:
-        """Answer a rejection and charge it to the peer.
+    def _reject(self, server: MLLPServer, peer: PeerIdentity, ack: str) -> None:
+        """Answer a rejection and charge it to the source address.
 
         Every caller returns immediately afterwards, so the connection ends
         here whether the rejection was a framing one or an application-level
         one. The charge is what makes reconnecting to draw another cost
         something; `verify_request` is where it is spent.
+
+        Charged to the address, not to `peer.peer_id`, for the reason the module
+        docstring gives: the budget bounds what an unauthenticated client can
+        consume, and an unauthenticated client has no identity to charge. The
+        identity is named in the alert, because an operator reading "eight
+        rejections from 10.2.0.7" and an operator reading "eight rejections from
+        example-lab" are looking for different things.
         """
-        peer = self.client_address[0]
-        count = server.peers.note_rejection(peer)
+        address = self.client_address[0]
+        count = server.peers.note_rejection(address)
         self._send(ack)
         if count >= server.max_rejections_per_peer:
             logger.error(
-                "%s has drawn %d rejection(s) within %ss and is over budget; further "
-                "connections from it are refused until the window passes. Alert: this is "
-                "either a badly misconfigured sender or a peer probing the listener.",
-                peer, count, server.rejection_window,
+                "%s (peer %s) has drawn %d rejection(s) within %ss and is over budget; "
+                "further connections from that address are refused until the window passes. "
+                "Alert: this is either a badly misconfigured sender or a peer probing the "
+                "listener.",
+                address, peer.peer_id, count, server.rejection_window,
             )
 
     def _lookahead(self, server: MLLPServer) -> bytes:
@@ -512,12 +631,12 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             handler.flag_possible_truncation(last_accepted)
 
     @staticmethod
-    def _ack_for(handler, candidate: bytes) -> tuple[str, bool]:
+    def _ack_for(handler, candidate: bytes, peer: PeerIdentity) -> tuple[str, bool]:
         """(ACK to send, whether the stream may be read on)."""
         body = candidate[len(VT):-2] if candidate.startswith(VT) else b""
         if VT in body:
             return handler.reject_malformed(
-                candidate, "a start block appears inside the message body"
+                candidate, "a start block appears inside the message body", peer=peer,
             ), False
         if not body.endswith(CR):
             return handler.reject_malformed(
@@ -525,12 +644,13 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                 "the last segment is not CR-terminated, so this frame ends somewhere the "
                 "sender did not put an end block -- most likely an embedded FS CR splitting "
                 "one message into two",
+                peer=peer,
             ), False
         try:
             text = deframe(candidate)
         except FramingError as exc:
-            return handler.reject_malformed(candidate, str(exc)), False
-        ack = handler.handle(text)
+            return handler.reject_malformed(candidate, str(exc), peer=peer), False
+        ack = handler.handle(text, peer=peer)
         # An application-level AR desynchronises nothing, so this frame could
         # be followed by another -- and while it was, one connection could loop
         # malformed frames indefinitely, each one costing a SHA-256, a decode
@@ -551,6 +671,8 @@ def make_mllp_server(
     host: str = "127.0.0.1",
     port: int = 2575,
     *,
+    peers: PeerRegistry,
+    tls_handshake_timeout: float = TLS_HANDSHAKE_SECONDS,
     recv_timeout: float = RECV_TIMEOUT_SECONDS,
     max_frame_bytes: int = MAX_FRAME_BYTES,
     desync_grace: float = DESYNC_GRACE_SECONDS,
@@ -567,13 +689,30 @@ def make_mllp_server(
     not egress, and a real interface engine lives on another host -- but a v1
     pilot that did not mean to expose a PHI-bearing port should hear about it in
     its own log rather than find out from someone else's scan.
+
+    `peers` is **required**, and that is the shape of "mutual TLS by default":
+    there is no default, so a listener that authenticates nothing cannot be
+    reached by leaving an argument out. A caller that wants one asks for
+    `PeerRegistry.plaintext_loopback()` by name, or writes `allow_plaintext`
+    into a registry file, and either way `describe()` says so at WARNING here on
+    every start -- the log line an operator sees is the one they can act on
+    months after the configuration decision was made.
     """
     if host not in _LOOPBACK:
         logger.warning(
             "MLLP listener binding non-loopback address %r. v1 is specified as a local "
             "listener; make sure this port is deliberately reachable and firewalled.", host,
         )
+    # Built before the bind: TLS material that cannot be loaded should refuse
+    # the listener rather than leave a port open that fails every handshake.
+    tls_context = peers.tls_context()
+    logger.log(
+        logging.INFO if peers.requires_tls else logging.WARNING, "%s", peers.describe()
+    )
     server = MLLPServer((host, port), MLLPRequestHandler)
+    server.peer_registry = peers
+    server.tls_context = tls_context
+    server.tls_handshake_timeout = tls_handshake_timeout
     server.message_handler = handler
     server.recv_timeout = recv_timeout
     server.max_frame_bytes = max_frame_bytes
