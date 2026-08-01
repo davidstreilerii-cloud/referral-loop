@@ -875,6 +875,11 @@ def make_worklist_server(
     registry: Registry,
     pack: RulePack,
     host: str = "127.0.0.1",
+    # 5057 here, but cli.py defaults --worklist-port to 5055 and passes it
+    # through, so a container or a command line reaches this function with 5055
+    # and this default only applies to an in-process caller that omits the
+    # argument. The disagreement is as old as both files. Recorded rather than
+    # reconciled: picking one is a code change. See the matching note in cli.py.
     port: int = 5057,
 ):
     """A bound WSGI server for the worklist. Loopback by default and by refusal.

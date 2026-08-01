@@ -515,6 +515,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worklist-host", default="127.0.0.1",
                         help="worklist mode: bind address. Non-loopback is refused -- the "
                              "page has no authentication (default: %(default)s)")
+    # 5055 here, but `make_worklist_server`'s own signature defaults to 5057 and
+    # the worklist tests use 5057 throughout. The two have disagreed since both
+    # were written, and this path wins in practice: _run_worklist passes
+    # args.worklist_port through, so the library default is only ever reached by
+    # an in-process caller that omits the argument. Recorded rather than
+    # reconciled -- picking one is a code change, and the extraction that found
+    # this makes none. See the matching note in worklist.py.
     parser.add_argument("--worklist-port", type=int, default=5055,
                         help="worklist mode: port (default: %(default)s)")
     parser.add_argument("--baseline-pack-dir", default="",

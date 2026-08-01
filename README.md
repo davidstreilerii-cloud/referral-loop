@@ -91,7 +91,23 @@ Each of these refuses the boot rather than assuming a value:
 | `REFERRAL_RAW_RETENTION_DAYS` | ages out the raw HL7 archive |
 | `REFERRAL_RESOLVED_RETENTION_DAYS` | ages out resolved loops |
 
-One more matters for any installed (non-checkout) deployment:
+### A known disagreement: the worklist port
+
+`cli.py` defaults `--worklist-port` to **5055** and passes it through, so that is
+what a command line or a container actually binds, and it is what the Dockerfile
+`EXPOSE`s. `make_worklist_server`'s own signature defaults to **5057**, which the
+worklist tests use throughout; that default is reached only by an in-process
+caller that omits the argument.
+
+The two have disagreed since both were written. This is recorded rather than
+reconciled — picking one is a code change and belongs to the restructure, not to
+the extraction that found it. Pass `--worklist-port` explicitly and the question
+does not arise.
+
+### Installed deployments
+
+One more variable matters once the package is installed rather than run from a
+checkout:
 
 | variable | |
 |---|---|
