@@ -352,9 +352,17 @@ def _mrn_check(loop: Loop, key: ResultKey) -> _MrnCheck:
     the tier and the rationale intact. The message keeps its evidence and loses
     only its ability to attach itself; see `_unattributable`.
 
-    This is still deliberately *not* `loop.mrn == key.mrn`. That form makes two
-    absences *agree*, which is the `"" == ""` equivalence class this module
-    refuses everywhere else.
+    **The result is tested first, and the order is the whole guarantee.** With
+    the loop tested first, two absent MRNs answer AGREES -- `loop.mrn ==
+    key.mrn` reached by another route, the `"" == ""` equivalence class this
+    module refuses everywhere else, and measured at tier 2 confidence 0.98. That
+    needs no empty `PID-3` to be *reachable*, only an empty-MRN loop in an exact
+    tier state, and `open_loop` is not the only way a loop enters the log: a
+    restore from a foreign or legacy log, a direct `append_event`, or a state
+    added to `_EXACT_TIER_STATES` later all reach it without passing that
+    refusal. Asking about the sender's half first means the defensive loop-side
+    branch can never widen anything on its own -- it is consulted only once the
+    result has already named a patient.
 
     No alias resolution happens here. Both identifiers are already the surviving
     one: resolution runs once, at ingest, before the registry or the matcher
@@ -362,10 +370,10 @@ def _mrn_check(loop: Loop, key: ResultKey) -> _MrnCheck:
     site the spec ruled out -- and this comparison therefore cannot
     false-negative on a merge.
     """
-    if not loop.mrn:
-        return _MrnCheck.AGREES
     if not key.mrn:
         return _MrnCheck.UNVERIFIED
+    if not loop.mrn:
+        return _MrnCheck.AGREES
     return _MrnCheck.AGREES if loop.mrn == key.mrn else _MrnCheck.DISAGREES
 
 
@@ -494,6 +502,21 @@ def _unattributable(hits: list[Loop], tier: int, reason: str) -> MatchResult:
       near-miss with a named cause rather than "no candidate loop", and a
       coordinator can attach it deliberately through `attach_orphan` -- which
       also records the label the flywheel reads (spec section 7).
+
+    **Scheduling messages reach this too, and for `SIU^S12` it costs recall.**
+    `listener._target_loop` matches an `SIU` on its order number through the
+    same tiers, so an appointment message carrying a valid `ORC-2` and no
+    readable `PID-3` now declines here rather than scheduling the loop it names:
+    the loop stays OPEN and `untargeted_count` rises where it previously went
+    SCHEDULED. That is a real loss on a benign shape and it is accepted rather
+    than special-cased. `S12` and `S15` arrive through one path and are the same
+    evidence -- an order number and no patient -- so a matcher that scheduled on
+    it would have to decline the cancel by some rule other than the evidence,
+    and `S15` on that evidence retires a clinically open loop into a state no
+    worklist shows. A missed schedule leaves the loop on the queue it was
+    already on, visible and still aging; it is the direction that stays safe,
+    the same asymmetry `_target_loop` argues for refusing tier-3 evidence. The
+    cost is counted and logged, never silent.
 
     Confidence 0.0, not a pack-relative demotion. Scoring it just under
     `pack.confidence_floor` would route it to review through `_resolve`'s floor

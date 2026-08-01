@@ -174,20 +174,22 @@ So the exact tiers also require the MRN to agree. This cannot false-negative on 
 
 **An absent MRN is not agreement, and the two sides are not symmetric.** The predicate above read "and MRN agrees *where both are known*" until the 2026-07-31 audit (finding H3), on the reasoning that a result carrying no `PID-3` must still match an exact accession or a real class of ORU is demoted to an orphan for carrying less data. That trade only holds if the two absences are comparable:
 
-* A **loop** with no MRN cannot occur — `open_loop` refuses one, because it would be invisible to every patient-scoped query. That branch is unreachable, and it stays open as a defensive one.
+* A **loop** with no MRN cannot occur through ingest — `open_loop` refuses one, because it would be invisible to every patient-scoped query. That branch is unreachable, and it stays open as a defensive one. It is also consulted **second**: the result's half is tested first, so two absent MRNs decline rather than agreeing. Ordered the other way they agree, which is `loop.mrn == key.mrn` reached by another route, and it reopens the finding for any empty-MRN loop that enters an exact-tier state by a path `open_loop` does not guard — a restore from a foreign log, a direct `append_event`, a state added to the set later.
 * A **result** with no MRN is ordinary, and it is the half the sender chooses. Order numbers are printed on requisitions and worklists and are frequently sequential, so omitting the PID segment and naming a guessed accession attached a result to a named patient's loop at confidence 1.0 — a loop then reported "awaiting acknowledgement" on evidence that named nobody.
 
 So a result naming no patient no longer matches at tiers 1–2. It **declines with the tier intact**: `loop_id` is None, so it reaches the orphan queue rather than a patient's loop, while `match_tier` and `match_reason` record which tier fired and why it was not acted on. A coordinator can then attach it deliberately through `attach_orphan`, which is also a labeled example (§7). Ingest counts and logs the decline (`unattributable_result_count`), by control id and never by MRN.
 
 Requiring a corroborating field (service code or modality) instead was considered and rejected: it travels in the same OBR, chosen by the same sender, and is printed on the same requisition, so it constrains a typo and not a forgery.
 
+The same decline reaches `SIU` scheduling messages, which match on their order number through these tiers: an appointment message with a valid `ORC-2` and no readable `PID-3` now leaves the loop `OPEN` and counted, where it previously went `SCHEDULED`. That is a real recall loss on a benign shape, accepted rather than special-cased — `S12` and `S15` carry the same evidence, and on that evidence `S15` retires a clinically open loop into a state no worklist shows. A missed schedule leaves the loop where it already was, visible and still aging.
+
 Tie-breakers at tiers 3–4, in order: nearest order date, same ordering provider, most specific modality. All pack-configured, none hardcoded.
+
+The **date window** at tiers 3–4 is pack-configured per modality, not a single global value — a same-day window is right for a stat study and wrong for a screening study ordered weeks ahead.
 
 ### The candidate set is scoped before matching begins
 
 Ingest asks the store for the loops that could match — this patient's, plus any loop naming an order number the message carries — rather than for every loop in the site. Every row that narrowing drops is one no tier could have returned: tiers 3–4 are keyed on the patient, tiers 1–2 on an order number the message names. The order-number half deliberately crosses patients, so that a loop carrying this result's accession under a *different* MRN is still seen and reported as a collision instead of quietly missing from the query.
-
-The **date window** at tiers 3–4 is pack-configured per modality, not a single global value — a same-day window is right for a stat study and wrong for a screening study ordered weeks ahead.
 
 ### Which HL7 field feeds each tier is pack data, not code
 

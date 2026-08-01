@@ -546,6 +546,28 @@ def test_loop_carrying_no_mrn_still_matches_an_exact_accession():
     assert result.tier == 2
 
 
+@pytest.mark.parametrize("loop_absent", ["", None], ids=["loop-blank", "loop-none"])
+@pytest.mark.parametrize("key_absent", ["", None], ids=["key-blank", "key-none"])
+def test_two_absent_mrns_do_not_agree(loop_absent, key_absent):
+    """The intersection the two one-sided tests below each miss.
+
+    `_mrn_check` answers on the result first, so the both-absent case declines.
+    Ordered the other way it returns AGREES -- `loop.mrn == key.mrn` by another
+    route, the `"" == ""` equivalence class the docstring disclaims -- and that
+    single branch ordering fully reopens H3 the moment an empty-MRN loop reaches
+    `_EXACT_TIER_STATES` by a path `open_loop` does not guard: a restore from a
+    foreign log, a direct `append_event`, a state added to the set later.
+    Unreachable today is not a reason to answer wrongly.
+    """
+    result = match_result(
+        replace(_key(filler="ACC1"), mrn=key_absent),
+        [replace(_loop("L1", filler_order_number="ACC1"), mrn=loop_absent)],
+        PACK,
+    )
+    assert result.loop_id is None, "two absences must not add up to an agreement"
+    assert result.patient_unverified is True
+
+
 @pytest.mark.parametrize("absent", ["", None])
 def test_an_absent_mrn_is_the_same_absence_however_it_is_spelled(absent):
     """`""` and `None` both mean "not known", and must not diverge.
