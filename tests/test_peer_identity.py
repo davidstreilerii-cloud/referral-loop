@@ -16,12 +16,14 @@ certificates chains to anything real.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import socket
 import ssl
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -300,6 +302,34 @@ def refused(address, text: str, context=None) -> bool:
         return "|AA|" not in deliver(address, text, context)
     except (ssl.SSLError, OSError):
         return True
+
+
+@contextmanager
+def caplog_at(handler, level):
+    """Collect log records from the server thread for the duration of a block.
+
+    A plain `caplog` fixture works, but these tests need the records from a
+    bounded window rather than from the whole test, and the server logs from
+    its own threads.
+    """
+    import logging
+
+    collected: list[str] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            collected.append(record.getMessage())
+
+    sink = _Sink(level=getattr(logging, level))
+    root = logging.getLogger("healthcare_rag.referral_loop")
+    previous = root.level
+    root.addHandler(sink)
+    root.setLevel(getattr(logging, level))
+    try:
+        yield collected
+    finally:
+        root.removeHandler(sink)
+        root.setLevel(previous)
 
 
 def loops_of(handler):
@@ -803,6 +833,193 @@ def test_the_loopback_opt_in_attributes_messages_to_one_named_peer(handler):
         deliver(address, order(control_id="ORM_1"))
 
     assert handler.store.assertion_sources() == ["plaintext-loopback"]
+
+
+def test_a_peer_repeating_a_refused_assertion_stops_being_written_down(handler, pki,
+                                                                       peers):
+    """An authenticated peer must not be able to make this listener write forever.
+
+    A contradicted MSH-4 is answered AA and produces no transition, but it did
+    produce an audit row and an ERROR line every time -- so a misconfigured or
+    hostile feed that could accomplish nothing here could still drive unbounded
+    writes into the audit database. It now draws on the same per-address budget
+    a malformed frame does.
+
+    The counter is deliberately *not* suppressed: it is how an operator sees
+    that the suppression is happening, and a signal that goes quiet under load
+    is the one that fails when it matters.
+    """
+    engine = client_context(pki, pki.ris)
+    budget = 3
+
+    with serving(handler, peers, max_rejections_per_peer=budget) as address:
+        for index in range(budget + 4):
+            forged = order(control_id=f"ORM_{index}").replace(
+                "EHR|HOSP", "EHR|SOMEWHERE_ELSE", 1
+            )
+            assert "|AA|" in deliver(address, forged, engine)
+
+    assert handler.peer_claim_mismatch_count == budget + 4, (
+        "the count must survive the suppression; it is what shows it is happening"
+    )
+    rows = [r for r in audit.referral_audit_entries() if r["resource_type"] == "referral_peer"]
+    assert len(rows) == budget, (
+        f"{len(rows)} audit rows written against a budget of {budget}; an authenticated "
+        "peer can still make this listener write without bound"
+    )
+    assert loops_of(handler) == []
+
+
+# =========================================== the handshake is not on the accept path
+
+
+def _silent_socket(address):
+    """A client that connects and then says nothing at all.
+
+    No ClientHello, no certificate, no identity -- the cheapest thing anybody
+    can do to a TLS listener, and the whole of the attack this guards.
+    """
+    sock = socket.create_connection(address, timeout=15)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return sock
+
+
+def test_a_silent_client_mid_handshake_does_not_delay_a_legitimate_delivery(handler, pki,
+                                                                            peers):
+    """The handshake must not run on the accept thread.
+
+    `socketserver`'s accept loop is single-threaded. With the wrap in
+    `get_request` -- which `socketserver` calls from that loop -- one client
+    that connected and sent nothing held every other accept for the full
+    handshake timeout. Measured at 4.75s against a 5s bound while a legitimate
+    mTLS delivery waited: a bounded serial blocker is still a serial blocker,
+    and at the 10s default an attacker cycling connections keeps the ingest
+    port off the air indefinitely.
+
+    Worse, the budgets that exist to bound exactly this could not see it.
+    `verify_request` runs *after* `get_request`, so the connection cap, the
+    per-address cap and the ledger slot were all spent after the cost they
+    were added to bound.
+
+    The timeout is injected short so the test is quick; the property is the
+    ratio between the two numbers, not either one.
+    """
+    engine = client_context(pki, pki.ris)
+
+    with serving(handler, peers, tls_handshake_timeout=4.0) as address:
+        baseline = time.monotonic()
+        assert "|AA|" in deliver(address, order(control_id="ORM_1"), engine)
+        baseline = time.monotonic() - baseline
+
+        stalled = _silent_socket(address)
+        try:
+            # Give the accept loop a moment to have taken it. Under the defect
+            # this is the point at which the loop is already wedged.
+            time.sleep(0.3)
+            started = time.monotonic()
+            # Distinct order numbers: two orders differing only in MSH-10 hash
+            # to one content key and the second is correctly deduped, which
+            # would make the loop count below assert nothing.
+            assert "|AA|" in deliver(
+                address,
+                order(control_id="ORM_2", placer="PLACER222", filler="FILLER222"),
+                engine,
+            )
+            blocked = time.monotonic() - started
+        finally:
+            stalled.close()
+
+    assert blocked < 1.0, (
+        f"a legitimate delivery took {blocked:.2f}s while one silent socket was "
+        f"mid-handshake (an unobstructed delivery takes {baseline:.2f}s); the handshake "
+        "is running on the accept thread and one client that sends nothing is an outage"
+    )
+    assert len(loops_of(handler)) == 2
+
+
+def test_a_client_over_its_connection_cap_is_refused_before_any_tls_work(handler, pki,
+                                                                        peers):
+    """The budget has to be spent before the cost it bounds, not after it.
+
+    `verify_request` runs before `process_request`, so with the handshake moved
+    off the accept path a client at its per-address cap is refused having cost
+    this listener no handshake at all. Asserted through the log rather than
+    through timing: "refused at the cap" and "refused after a handshake" are
+    the same outcome to the client and completely different resources here.
+
+    Both clients are silent sockets, deliberately: neither reaches a handshake
+    at all if the cap is doing its job, so offering a certificate would only
+    obscure which of the two refused them.
+    """
+    with serving(handler, peers, max_connections_per_peer=1) as address:
+        held = _silent_socket(address)
+        try:
+            time.sleep(0.3)
+            with caplog_at(handler, "INFO") as records:
+                second = _silent_socket(address)
+                second.close()
+                time.sleep(0.3)
+        finally:
+            held.close()
+
+    text = chr(10).join(records)
+    assert "connection cap" in text, text
+    assert "TLS handshake" not in text, (
+        "the second connection paid for a handshake before the cap that was supposed "
+        "to refuse it: " + text
+    )
+
+
+def test_an_authenticated_connection_closes_the_socket_it_wrapped(handler, pki, peers,
+                                                                  monkeypatch):
+    """`wrap_socket` detaches the socket it wraps, so nobody else can close it.
+
+    socketserver calls `shutdown_request` on the object it handed the handler.
+    Wrapping on the connection thread means that object is the plain socket, and
+    `wrap_socket` has already detached it -- fileno -1 -- so the framework's
+    close is a no-op and the descriptor now belongs to the `SSLSocket` alone.
+
+    **The reference this test holds is the experiment.** Left alone, CPython
+    refcounts the handler away the moment it returns, `socket.__del__` closes
+    the descriptor, and a process-wide handle count stays flat whether or not
+    the code ever closes anything -- measured: deleting `_close_secured` passed
+    a 25-connection handle-count test unchanged. That is not the property
+    working, it is the garbage collector hiding its absence, and a PHI-bearing
+    socket held open until a collector happens to run is not a design, it is a
+    reprieve that a reference cycle from one traceback removes.
+
+    So the socket is kept alive here and asked directly whether it was closed.
+    """
+    from healthcare_rag.referral_loop.mllp_server import MLLPRequestHandler
+
+    wrapped = []
+    original = MLLPRequestHandler._secure
+
+    def capturing(self, server):
+        secured = original(self, server)
+        # After _secure, so self.request is the SSLSocket and not the plain
+        # socket it replaced.
+        wrapped.append(self.request)
+        return secured
+
+    monkeypatch.setattr(MLLPRequestHandler, "_secure", capturing)
+
+    engine = client_context(pki, pki.ris)
+    try:
+        with serving(handler, peers) as address:
+            deliver(address, order(control_id="ORM_1"), engine)
+            time.sleep(0.3)
+
+        assert len(wrapped) == 1, wrapped
+        assert wrapped[0].fileno() == -1, (
+            "the SSLSocket the handler wrapped is still open; socketserver cannot close "
+            "it, because wrap_socket detached the object socketserver knows about, so "
+            "every authenticated connection leaks a descriptor"
+        )
+    finally:
+        for sock in wrapped:
+            with contextlib.suppress(OSError):
+                sock.close()
 
 
 # ============================================================ registry validation

@@ -122,20 +122,32 @@ they are limits of counting what can be seen, not reasons to count nothing. The
 peer id, once resolved, is logged alongside the address wherever a budget is
 spent, so an operator reading the alert is not left with only a number.
 
-**The transport authenticates before it reads.** `get_request` wraps every
-accepted socket in a TLS context requiring a client certificate signed by the
-site's own CA, and `MLLPRequestHandler.handle` resolves that certificate to a
-`PeerIdentity` through the peer registry and closes the connection if it cannot.
+**The transport authenticates before it reads.** `MLLPRequestHandler._secure`
+wraps every admitted socket in a TLS context requiring a client certificate
+signed by the site's own CA, and `_resolve` maps that certificate to a
+`PeerIdentity` through the peer registry, closing the connection if it cannot.
 Nothing reaches `MessageHandler` unattributed. A site may opt out -- see
 `peers.PeerRegistry` -- and then an allowlisted source address is the identity,
 enforced in `verify_request` before a thread exists, with the opt-out logged at
 WARNING on every start.
 
-The handshake happens on the accept thread, before `verify_request` can charge
-anything for it, which is where `TLS_HANDSHAKE_SECONDS` comes in: a client that
-opens a connection and then stalls mid-handshake would otherwise hold up every
-other accept. That is the same resource argument the budgets make, applied at
-the one point that runs before they can see anything.
+**The handshake runs on the connection thread, not the accept thread**, and the
+distinction is a denial of service. It was in `get_request`, which socketserver
+calls from its single accept loop, so one client that connected and sent nothing
+held every other accept for the full handshake timeout -- 3.76s measured against
+a 4s bound, against 0.06s unobstructed. `TLS_HANDSHAKE_SECONDS` bounds that but
+does not fix it: a bounded serial blocker is still a serial blocker, and at the
+default an attacker cycling connections keeps the port off the air. It also put
+every budget above on the wrong side of the cost it exists to bound, because
+`verify_request` runs *after* `get_request` -- so a client already at its
+per-address cap still drew a free handshake out of the accept loop.
+
+Moved down, the caps are spent first and a stalled handshake holds a thread and
+a connection slot, which is precisely what `MAX_CONNECTIONS` and
+`MAX_CONNECTIONS_PER_PEER` are for. The cost of moving it is that the handler
+now owns a descriptor nothing else will close: `wrap_socket` detaches the socket
+it wraps, so socketserver's `shutdown_request` acts on a dead object and
+`_close_secured` is what stops every authenticated connection leaking an fd.
 """
 from __future__ import annotations
 
@@ -341,51 +353,36 @@ class MLLPServer(socketserver.ThreadingTCPServer):
     tls_context: ssl.SSLContext | None
     tls_handshake_timeout: float
 
-    def get_request(self):
-        """Accept, and authenticate the transport before anything else sees it.
-
-        socketserver calls this on the accept thread and catches `OSError` from
-        it, treating the connection as never having happened -- which is exactly
-        the disposal a failed handshake wants, and `ssl.SSLError` is an
-        `OSError`. A client with no certificate, or one signed by a CA the site
-        did not name, never becomes a request.
-
-        The timeout is set before the wrap and cleared after it. A handshake is
-        the one thing this class does on the accept thread, so an unbounded one
-        is a single stalled client holding up every other accept; the connection
-        deadline and the idle allowance take over from here.
-        """
-        request, client_address = super().get_request()
-        if self.tls_context is None:
-            return request, client_address
-        request.settimeout(self.tls_handshake_timeout)
-        try:
-            secured = self.tls_context.wrap_socket(request, server_side=True)
-        except (ssl.SSLError, OSError) as exc:
-            logger.warning(
-                "TLS handshake with %s failed (%s); the connection is dropped unread. A "
-                "peer drawing this repeatedly is either misconfigured or has no certificate "
-                "this listener accepts.", client_address[0], exc,
-            )
-            request.close()
-            raise
-        secured.settimeout(None)
-        return secured, client_address
-
     def verify_request(self, request, client_address) -> bool:
-        """Refuse a connection before it costs a thread.
+        """Refuse a connection before it costs a thread, a slot or a handshake.
 
         socketserver spawns the connection thread in `process_request`, which
         runs only if this returns True, so this is the one place a connection
         can be refused without first paying for the resource it was opened to
         consume. The slot taken here is returned in `MLLPRequestHandler.handle`.
 
+        **The TLS handshake deliberately happens after this**, on the connection
+        thread, and that ordering is the whole point rather than an
+        implementation detail. Wrapping in `get_request` -- which socketserver
+        calls from its single-threaded accept loop -- meant one client that
+        connected and sent nothing held every other accept for the full
+        handshake timeout: measured at 3.76s against a 4s bound while a
+        legitimate mTLS delivery waited, where an unobstructed one took 0.06s.
+        A bounded serial blocker is still a serial blocker. It also put every
+        budget below on the wrong side of the cost it exists to bound, so a
+        client already at its per-address cap still got a free handshake out of
+        the accept loop before anything refused it.
+
+        Now the caps are spent first and the handshake is bounded by the two
+        things that own that kind of cost: `MAX_CONNECTIONS` and
+        `MAX_CONNECTIONS_PER_PEER`. A stalled handshake holds a thread and a
+        slot, which is what those numbers are for, instead of holding the
+        listener.
+
         Under the plaintext opt-in this is also where the source-address
         allowlist is enforced, and it is enforced *first*: a source this
         listener will never serve must not be able to spend a connection slot,
         which is the whole difference between an allowlist and a log line.
-        Under mTLS the certificate has already been checked by `get_request`;
-        which peer it *is* is settled on the connection thread.
         """
         peer = client_address[0]
         if not self.peer_registry.requires_tls and not self.peer_registry.allows_address(peer):
@@ -412,16 +409,74 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         server: MLLPServer = self.server  # type: ignore[assignment]
         try:
+            if not self._secure(server):
+                return
             peer = self._resolve(server)
             if peer is None:
                 return
             self._serve(server, peer)
         finally:
+            self._close_secured()
             # Pairs with the slot taken in verify_request, which is the only
             # path that reaches here. A cap whose slots are not returned shrinks
             # to zero over an afternoon of ordinary traffic -- an outage
             # arriving by way of the fix for one.
             server.peers.release(self.client_address[0])
+
+    def _secure(self, server: MLLPServer) -> bool:
+        """Complete the TLS handshake, on this connection's own thread.
+
+        Here rather than in `MLLPServer.get_request` because socketserver calls
+        that from its single accept loop, and a handshake there is a serial
+        blocker -- see `MLLPServer.verify_request` for the measurement. By the
+        time this runs the connection has already been admitted against both
+        caps, so a stalled handshake costs a thread and a slot that are already
+        bounded rather than costing every other client its accept.
+
+        The timeout is set before the wrap and cleared after it, so an idle
+        handshake is closed while a slow *sender* is left to the connection
+        deadline and the idle allowance, which are the bounds for that.
+        """
+        if server.tls_context is None:
+            return True
+        self.request.settimeout(server.tls_handshake_timeout)
+        try:
+            # Rebinding self.request is what makes the rest of this class
+            # transport-agnostic: _serve, _send and _resolve all read it and
+            # none of them needs to know whether there is TLS underneath.
+            self.request = server.tls_context.wrap_socket(self.request, server_side=True)
+        except (ssl.SSLError, OSError) as exc:
+            logger.warning(
+                "TLS handshake with %s failed (%s); the connection is dropped unread. A "
+                "peer drawing this repeatedly is either misconfigured or has no certificate "
+                "this listener accepts.", self.client_address[0], exc,
+            )
+            return False
+        self.request.settimeout(None)
+        return True
+
+    def _close_secured(self) -> None:
+        """Close the socket the handshake left us holding.
+
+        `wrap_socket` **detaches** the socket it wraps: the `SSLSocket` takes
+        the descriptor and the original object is left at fileno -1. socketserver
+        calls `shutdown_request` on the object *it* handed us, which is that
+        detached original, so its close is a no-op and the descriptor the
+        `SSLSocket` owns is never released. Every authenticated connection would
+        leak one -- a slow-motion version of the denial of service the handshake
+        move above is fixing, and the reason
+        `test_an_authenticated_connection_does_not_leak_its_socket` counts real
+        process handles rather than trusting this comment.
+
+        Only when we did the wrapping. Under the plaintext opt-in `self.request`
+        is socketserver's own socket and closing it here would be closing
+        somebody else's.
+        """
+        if isinstance(self.request, ssl.SSLSocket):
+            try:
+                self.request.close()
+            except OSError:  # pragma: no cover - peer-dependent
+                pass
 
     def _resolve(self, server: MLLPServer) -> PeerIdentity | None:
         """Which peer this connection is, or None and it is closed unread.
@@ -678,6 +733,30 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             )
         return handler.reject_malformed(raw, reason, peer=peer, archive=may_archive)
 
+    def _charge_assertion(self, server: MLLPServer, peer: PeerIdentity) -> bool:
+        """Charge a refused assertion; returns whether it may still be recorded.
+
+        Same ledger, same window and same source-address key as a malformed
+        frame draws on, for the same reason: this bounds what a peer can make
+        this listener *write*, and the connection is what the peer has. Unlike a
+        framing rejection it does not end the connection -- the message was well
+        formed and the stream is still synchronised, so there is nothing to
+        resynchronise by hanging up, and a feed whose registry entry is wrong
+        should not also lose the traffic it is entitled to send.
+        """
+        address = self.client_address[0]
+        may_record, count = server.peers.charge_rejection(address)
+        if count == server.max_rejections_per_peer:
+            logger.error(
+                "%s (peer %s) has drawn %d refusal(s) within %ss and is now over budget; "
+                "further refused assertions from that address are still answered and "
+                "counted but no longer written to the audit trail until the window passes. "
+                "Alert: this peer is asserting something its registry entry does not "
+                "grant, repeatedly.",
+                address, peer.peer_id, count, server.rejection_window,
+            )
+        return may_record
+
     def _ack_for(self, server: MLLPServer, handler, candidate: bytes,
                  peer: PeerIdentity) -> tuple[str, bool]:
         """(ACK to send, whether the stream may be read on)."""
@@ -698,7 +777,15 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
             text = deframe(candidate)
         except FramingError as exc:
             return self._refuse(server, handler, peer, candidate, str(exc)), False
-        ack = handler.handle(text, peer=peer)
+        # The callback is invoked only if the listener refuses an assertion --
+        # a contradicted MSH-4, a message type this peer holds no authority for.
+        # Those cost an audit row and a log line each and are otherwise
+        # unbounded from an authenticated peer, so they draw on the same
+        # per-address budget a malformed frame does.
+        ack = handler.handle(
+            text, peer=peer,
+            charge_refusal=lambda: self._charge_assertion(server, peer),
+        )
         # An application-level AR desynchronises nothing, so this frame could
         # be followed by another -- and while it was, one connection could loop
         # malformed frames indefinitely, each one costing a SHA-256, a decode

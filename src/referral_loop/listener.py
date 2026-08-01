@@ -454,7 +454,8 @@ class MessageHandler:
 
     # --------------------------------------------------------------- entry point
 
-    def handle(self, text: str, *, peer: PeerIdentity = LOCAL_PEER) -> str:
+    def handle(self, text: str, *, peer: PeerIdentity = LOCAL_PEER,
+               charge_refusal=None) -> str:
         """Persist, then parse, then apply. Never the other way round.
 
         `peer` is the identity the *transport* resolved, and everything this
@@ -462,6 +463,13 @@ class MessageHandler:
         in-process identity because a direct caller is one; the socket path
         never takes the default, and `MLLPRequestHandler` closes a connection it
         cannot resolve to a peer before a byte of HL7 is read.
+
+        `charge_refusal` is how a refused *assertion* -- a contradicted MSH-4, a
+        message type this peer holds no authority for -- reaches the same
+        per-address budget a malformed frame draws on. It is a callable
+        returning whether the refusal may still be written down, invoked only
+        when there is a refusal, and supplied by the wire path alone: an
+        in-process caller has no budget and needs none.
         """
         control_id = peek_control_id(text)
 
@@ -549,7 +557,7 @@ class MessageHandler:
         #    something when two connections race.
         try:
             with self._lock:
-                return self._process(control_id, text, peer)
+                return self._process(control_id, text, peer, charge_refusal)
         except StoreUnavailableError as exc:
             # The archive holds the message but the transition did not land.
             # AE, and because applied_messages (not raw_messages) is the dedup
@@ -562,7 +570,8 @@ class MessageHandler:
             )
             return build_ack(control_id, "AE")
 
-    def _process(self, control_id: str, text: str, peer: PeerIdentity) -> str:
+    def _process(self, control_id: str, text: str, peer: PeerIdentity,
+                 charge_refusal=None) -> str:
         # Scoped to the peer, both here and in the database index behind it.
         # Globally keyed, this check was the pre-claim: a peer that spent a
         # control id a real feed was about to use made the genuine message
@@ -598,7 +607,7 @@ class MessageHandler:
         # the registry says this peer sends is not a message we are going to
         # act on, and running the identity resolution first would put a
         # rejected message's MRN through the alias table for nothing.
-        refusal = self._refuse_peer_claims(message, peer, control_id)
+        refusal = self._refuse_peer_claims(message, peer, control_id, charge_refusal)
         if refusal is not None:
             return refusal
 
@@ -701,7 +710,8 @@ class MessageHandler:
         )
 
     def _refuse_peer_claims(
-        self, message: ParsedMessage, peer: PeerIdentity, control_id: str
+        self, message: ParsedMessage, peer: PeerIdentity, control_id: str,
+        charge_refusal=None,
     ) -> str | None:
         """Refuse a message that contradicts the peer that delivered it, or None.
 
@@ -718,13 +728,23 @@ class MessageHandler:
         graph, an ERROR line naming the peer and the control id, and a row in
         the immutable audit trail, which is the only one of the three that
         survives the process.
+
+        Two of those three are charged against the peer's rejection budget, and
+        the counter is not. An authenticated but misconfigured feed can produce
+        one of these per message indefinitely, and each one wrote an audit row
+        and a log line -- so a peer that could not do anything with this
+        listener could still make it write, without bound, which is the same
+        amplification a malformed frame used to have one file over. Over
+        budget, the message is still refused, still answered and still counted;
+        what stops is the writing. The count is what an operator graphs and it
+        must never be the thing that gets suppressed.
         """
         application, facility = self._claims(message)
         mismatch = peer.claim_mismatch(application, facility)
         if mismatch:
             self.peer_claim_mismatch_count += 1
-            self._audit_refusal(peer, "sending_identity_mismatch")
-            logger.error(
+            self._record_refusal(
+                peer, "sending_identity_mismatch", charge_refusal,
                 "Message %r from %s claims a %s this peer does not send; no transition. "
                 "Alert: either a feed is misrouted or a peer is asserting another site's "
                 "identity, and a self-asserted facility never overrides the transport.",
@@ -736,8 +756,8 @@ class MessageHandler:
         if authority is not None and not peer.holds(authority):
             counter = _AUTHORITY_COUNTER[authority]
             setattr(self, counter, getattr(self, counter) + 1)
-            self._audit_refusal(peer, f"missing_{authority}_authority")
-            logger.error(
+            self._record_refusal(
+                peer, f"missing_{authority}_authority", charge_refusal,
                 "Message %r from %s is a %s and this peer holds no %r authority; no "
                 "transition. Alert: every message type that needs an authority can end "
                 "with a clinically open loop on nobody's queue, and this peer was not "
@@ -746,6 +766,19 @@ class MessageHandler:
             )
             return build_ack(control_id, "AA")
         return None
+
+    def _record_refusal(self, peer: PeerIdentity, refusal: str, charge_refusal,
+                        alert: str, *alert_args) -> None:
+        """Write a refusal down, if this peer still has the budget to be written.
+
+        The counter has already moved by the time this is called, deliberately:
+        it is the one signal that must survive the suppression, because it is
+        how an operator sees that the suppression is happening at all.
+        """
+        if charge_refusal is not None and not charge_refusal():
+            return
+        self._audit_refusal(peer, refusal)
+        logger.error(alert, *alert_args)
 
     @staticmethod
     def _audit_refusal(peer: PeerIdentity, refusal: str) -> None:

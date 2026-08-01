@@ -1237,11 +1237,11 @@ def _proof_15(system: System, monkeypatch) -> None:
     real_process = MessageHandler._process
     exploded = {"count": 0}
 
-    def die_after_the_write(self, control_id, text, peer):
+    def die_after_the_write(self, control_id, text, peer, charge_refusal=None):
         if "ORU^R01" in text:
             exploded["count"] += 1
             raise store_module.StoreUnavailableError("killed mid-parse")
-        return real_process(self, control_id, text, peer)
+        return real_process(self, control_id, text, peer, charge_refusal)
 
     monkeypatch.setattr(MessageHandler, "_process", die_after_the_write)
     acks = system.over_the_wire(result("RES-1", placer="PL1", filler="ACC1"))
