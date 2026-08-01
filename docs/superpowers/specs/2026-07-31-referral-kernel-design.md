@@ -724,6 +724,51 @@ the concurrency an attacker creates. **L3** `last_accepted` is set from AR-rejec
 truncation alerts name a control id with no archive row. **L4** no field-length bound at the parse
 boundary; a 15 MiB MSH-10 reaches the DB key and the log while only the ACK is capped.
 
+### 11.6a Remediation status
+
+All nine CRITICAL/HIGH findings were fixed in `healthcare_rag/referral_loop/` before extraction, so
+they carry through `git filter-repo` with history. Fifteen commits, `015e43f`..`e96f42c`. Verified
+`1042 passed, 11 skipped` on `python -m pytest tests/referral_loop -q` (baseline was 881).
+
+| Finding | Commits | Status |
+|---|---|---|
+| C1 MSH-2 offset pinning | `015e43f`, `9d9bc0e` | Closed |
+| C2 transport auth + peer identity | `6ffcd42`, `e96f42c` | Closed except the handshake placement below |
+| H1 watermark poisoning | `2e99081`, `1cbee3e`, `428507e` | Closed |
+| H2 MSH-7 fail-open | `2e99081` | Closed |
+| H3 cross-patient attachment | `d14c787`, `2cf96e2` | Closed |
+| H4 audit authorizer | `8c14e69`, `aed86e6`, `7cc9ac2` | Closed |
+| H5 DNS rebinding + CSRF | `95c35a7`, `54bd493` | Closed |
+| H6 archive + connection DoS | `55ad80c`, `78f1c3d` | Closed |
+| H7 AE-wedge | `55ad80c` | Closed |
+
+**One HIGH remains open** and must be in slice 1's definition of done: the TLS handshake runs in
+`MLLPServer.get_request`, i.e. on socketserver's single-threaded accept loop, *before*
+`verify_request`. One TCP connection sending zero bytes delays a legitimate mTLS delivery by the
+full handshake timeout — measured at 4.75s against a 5s bound — and every connection budget is
+therefore spent *after* the cost it exists to bound. Fix: wrap in `MLLPRequestHandler.handle`
+before peer resolution, so `verify_request` refuses an over-budget client at zero TLS cost. Trap:
+`wrap_socket` detaches the original socket, so the `SSLSocket` must be closed by the handler or
+every authenticated connection leaks a descriptor.
+
+Three findings surfaced *during* remediation and are recorded because they generalize:
+
+1. **A fix introduced a worse defect than the one it fixed.** `_widen_key`'s table rebuild ran its
+   `DROP TRIGGER` / `ALTER TABLE RENAME` / `CREATE TABLE` outside any transaction, because Python's
+   `sqlite3` opens one only before DML. A process killed during the copy left a durably renamed
+   aside table and a durably created empty `raw_messages`, and the next open **succeeded, exit 0,
+   no warning, `raw_count() == 0`** — an append-only PHI archive emptied silently and permanently.
+   Fixed in `e96f42c` with `BEGIN IMMEDIATE` plus a boot refusal on a stranded `*__legacy` table.
+2. **Bounding one branch moves the attacker to the next.** H6's cap, rejection budget and disk floor
+   all sat on the `reject_malformed` path; a peer drawing only AA archived 44 MiB in 6.6 seconds
+   with `framing_error_count == 0`. The discipline had to become a *rate on the archive*, not a
+   verdict on the message.
+3. **Three tests passed with their defence deleted.** Two found by an implementer, one by a
+   reviewer. The third is the instructive one: the claim "pinned client CA only, not the system
+   truststore" had no test behind it — the apparent test passed because the registry rejected the
+   foreign *fingerprint* one layer later. Where a property cannot be tested on the wire, assert the
+   configuration that produces it and prove the assertion discriminates under mutation.
+
 ### 11.7 Requirements added by the audit
 
 Beyond the fixes above, three requirements enter the spec:
@@ -757,6 +802,19 @@ Beyond the fixes above, three requirements enter the spec:
 3. **Structural tests** — import closure (`core/` imports no protocol code); no-string-SQL AST
    check; every `Transition` construction site supplies an explicit `assertion_source`.
 4. **Existing gate preserved** — replay harness false-match rate.
+
+Two standing rules, both earned during the 2026-07-31 remediation rather than assumed:
+
+- **Assert the class, not the exploit string.** Every one of the seven fix units initially closed
+  the reported input while leaving the defect open — a five-character `MSH-2` where four were
+  pinned, `id = -1` where `id <= 0` was allowed, an accepted frame where the rejected path was
+  bounded. A regression test that encodes the auditor's literal bytes proves only that those bytes
+  are handled. Where the input space is small enough, exhaust it: C1 was finally settled by testing
+  278,700 header shapes against an independently written reference reader.
+- **Every claimed protection needs a test that fails when the claim is false.** Prove it by
+  mutation — delete or invert the defence and confirm the test goes red. Three tests in this
+  subsystem passed with their defence removed, because a *different* layer refused one step later.
+  A test that cannot distinguish which layer refused is not testing the layer it names.
 
 Plus `make security-scan` (dependency audit, SAST, secret scan) and SBOM generation.
 
