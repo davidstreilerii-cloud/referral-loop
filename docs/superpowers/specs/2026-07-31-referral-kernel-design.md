@@ -742,14 +742,15 @@ they carry through `git filter-repo` with history. Fifteen commits, `015e43f`..`
 | H6 archive + connection DoS | `55ad80c`, `78f1c3d` | Closed |
 | H7 AE-wedge | `55ad80c` | Closed |
 
-**One HIGH remains open** and must be in slice 1's definition of done: the TLS handshake runs in
-`MLLPServer.get_request`, i.e. on socketserver's single-threaded accept loop, *before*
-`verify_request`. One TCP connection sending zero bytes delays a legitimate mTLS delivery by the
-full handshake timeout — measured at 4.75s against a 5s bound — and every connection budget is
-therefore spent *after* the cost it exists to bound. Fix: wrap in `MLLPRequestHandler.handle`
-before peer resolution, so `verify_request` refuses an over-budget client at zero TLS cost. Trap:
-`wrap_socket` detaches the original socket, so the `SSLSocket` must be closed by the handler or
-every authenticated connection leaks a descriptor.
+The last of these was the TLS handshake running in `MLLPServer.get_request` — on socketserver's
+single-threaded accept loop, *before* `verify_request`. One TCP connection sending zero bytes
+delayed a legitimate mTLS delivery by the full handshake timeout (measured 3.76s against a 0.06s
+baseline), and every connection budget was therefore spent *after* the cost it existed to bound;
+an over-budget connection produced an empty log because it died in a handshake the cap should have
+prevented. Closed in `13195ed` by moving the wrap into `MLLPRequestHandler` before peer resolution.
+Residual, stated: a stalled handshake still costs a thread and a connection slot for
+`tls_handshake_timeout`, so 64 slots is 64 stalled handshakes before a legitimate client is refused
+at the cap — bounded and attributable where it was previously unbounded and invisible.
 
 Three findings surfaced *during* remediation and are recorded because they generalize:
 
@@ -763,11 +764,16 @@ Three findings surfaced *during* remediation and are recorded because they gener
    all sat on the `reject_malformed` path; a peer drawing only AA archived 44 MiB in 6.6 seconds
    with `framing_error_count == 0`. The discipline had to become a *rate on the archive*, not a
    verdict on the message.
-3. **Three tests passed with their defence deleted.** Two found by an implementer, one by a
-   reviewer. The third is the instructive one: the claim "pinned client CA only, not the system
-   truststore" had no test behind it — the apparent test passed because the registry rejected the
-   foreign *fingerprint* one layer later. Where a property cannot be tested on the wire, assert the
-   configuration that produces it and prove the assertion discriminates under mutation.
+3. **Four tests passed with their defence deleted.** Three found by implementers, one by a
+   reviewer. Two are instructive. The claim "pinned client CA only, not the system truststore" had
+   no test behind it — the apparent test passed because the registry rejected the foreign
+   *fingerprint* one layer later, and the fixture could not produce a real one since its "foreign"
+   CA was untrusted everywhere. Resolution: where a property cannot be tested on the wire, assert
+   the configuration that produces it and prove *that* discriminates under mutation. Separately, a
+   descriptor-leak test measured process handle count across 25 connections and passed unchanged
+   with the close deleted — CPython refcounts the handler away the instant `handle()` returns and
+   `socket.__del__` closes the descriptor, so the collector was hiding the leak. That is a reprieve
+   one reference cycle removes, not a working defence.
 
 ### 11.7 Requirements added by the audit
 
@@ -812,9 +818,14 @@ Two standing rules, both earned during the 2026-07-31 remediation rather than as
   are handled. Where the input space is small enough, exhaust it: C1 was finally settled by testing
   278,700 header shapes against an independently written reference reader.
 - **Every claimed protection needs a test that fails when the claim is false.** Prove it by
-  mutation — delete or invert the defence and confirm the test goes red. Three tests in this
+  mutation — delete or invert the defence and confirm the test goes red. Four tests in this
   subsystem passed with their defence removed, because a *different* layer refused one step later.
   A test that cannot distinguish which layer refused is not testing the layer it names.
+- **A test that measures a resource the runtime also manages is measuring the runtime.** Handle
+  counts, memory, open descriptors, connection state — the garbage collector, refcounting, and the
+  OS will all clean up behind a defect and turn the test green. Take the runtime out of the
+  experiment (hold a reference, disable the collector, ask the object directly) or the test proves
+  nothing about the code.
 
 Plus `make security-scan` (dependency audit, SAST, secret scan) and SBOM generation.
 
