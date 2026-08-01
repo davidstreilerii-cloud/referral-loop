@@ -31,31 +31,9 @@ from referral_loop.matcher import (
 )
 from referral_loop.pack import RulePack
 from referral_loop.parse_hl7 import parse_hl7_text
+from tests._pack import PACK
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
-
-# Deliberately narrower than the shipped pack: filler_order_number lists only
-# OBR-3 and ORC-3, so spec test 17's relocation to OBR-18 genuinely requires a
-# pack change. The shipped pack already lists OBR-18 as a fallback, which would
-# have made that test pass without the pack doing any work at all.
-PACK = RulePack(
-    version="test",
-    confidence_floor=0.90,
-    date_windows_hours={"CT": 24, "MG": 720, "_default": 168},
-    staleness_hours={"CT": 4, "_default": 336},
-    modality_equivalence={"CT": ["CT", "CAT"], "MG": ["MG", "MAM"]},
-    tie_breakers=("nearest_order_date", "same_ordering_provider", "most_specific_modality"),
-    tier_confidence={1: 1.0, 2: 0.98, 3: 0.92, 4: 0.70},
-    field_map={
-        "placer_order_number": ["OBR-2", "ORC-2"],
-        "filler_order_number": ["OBR-3", "ORC-3"],
-        "service_code": ["OBR-4.1"],
-        "modality": ["OBR-24", "OBR-4.2"],
-        "ordering_provider": ["OBR-16.1"],
-        "mrn": ["PID-3.1"],
-    },
-    min_auto_match_rate=0.5,
-)
 
 
 def _pack(**overrides) -> RulePack:

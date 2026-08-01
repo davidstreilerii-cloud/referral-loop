@@ -69,7 +69,7 @@ from referral_loop.peers import (
 from referral_loop.registry import Registry
 from referral_loop.staleness import is_stale, staleness_ratio
 from referral_loop.store import LoopStore
-from tests.test_matcher import PACK
+from tests._pack import PACK
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -276,7 +276,7 @@ def test_raw_survives_process_death_mid_parse(tmp_path):
         "from referral_loop.listener import MessageHandler\n"
         "from referral_loop.registry import Registry\n"
         "from referral_loop.store import LoopStore\n"
-        "from tests.test_matcher import PACK\n"
+        "from tests._pack import PACK\n"
         "store = LoopStore(sys.argv[1])\n"
         "handler = MessageHandler(store=store, registry=Registry(store), pack=PACK)\n"
         "def wedged(_text):\n"

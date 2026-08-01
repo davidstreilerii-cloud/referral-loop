@@ -20,7 +20,7 @@ from referral_loop.staleness import (
     require_thresholds_accepted,
     staleness_ratio,
 )
-from tests.test_matcher import PACK
+from tests._pack import PACK
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 

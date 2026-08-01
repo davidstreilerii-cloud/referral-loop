@@ -300,7 +300,7 @@ def test_the_listener_answers_ar_to_every_structural_fault(tmp_path):
     from referral_loop.listener import MessageHandler, ack_code
     from referral_loop.registry import Registry
     from referral_loop.store import LoopStore
-    from tests.test_matcher import PACK
+    from tests._pack import PACK
 
     store = LoopStore(tmp_path / "loops.db")
     handler = MessageHandler(store=store, registry=Registry(store), pack=PACK)

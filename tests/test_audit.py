@@ -46,7 +46,7 @@ from referral_loop.pack import load_pack
 from referral_loop.registry import Registry
 from referral_loop.store import LoopStore
 from referral_loop.worklist import create_app
-from tests.test_matcher import PACK
+from tests._pack import PACK
 from tests.test_pack import PACK as PACK_JSON
 from tests.test_pack import _write_pack
 from tests.test_worklist import (

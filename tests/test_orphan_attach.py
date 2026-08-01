@@ -44,7 +44,7 @@ from referral_loop.events import (
 from referral_loop.registry import Registry
 from referral_loop.store import LoopStore
 from referral_loop.worklist import create_app
-from tests.test_matcher import PACK
+from tests._pack import PACK
 from tests.test_worklist import (
     _E2E_ORDER,
     _E2E_RESULT,

@@ -64,7 +64,7 @@ from tests.test_listener import (
     result,
     scheduling,
 )
-from tests.test_matcher import PACK
+from tests._pack import PACK
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

@@ -31,7 +31,7 @@ from referral_loop.worklist import (
     create_blueprint,
     make_worklist_server,
 )
-from tests.test_matcher import PACK
+from tests._pack import PACK
 
 # Planted where a real PID-3 lands. If any of these strings reaches HTML, JSON or
 # a log record, the product has an egress problem, not a formatting problem.
