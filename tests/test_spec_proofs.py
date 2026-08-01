@@ -45,27 +45,27 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_rag.referral_loop import audit as audit_module
-from healthcare_rag.referral_loop import registry as registry_module
-from healthcare_rag.referral_loop import store as store_module
-from healthcare_rag.referral_loop.audit import referral_audit_entries
-from healthcare_rag.referral_loop.cli import PUBKEY_ENV, boot
-from healthcare_rag.referral_loop.errors import PackVerificationError
-from healthcare_rag.referral_loop.eval import (
+from referral_loop import audit as audit_module
+from referral_loop import registry as registry_module
+from referral_loop import store as store_module
+from referral_loop.audit import referral_audit_entries
+from referral_loop.cli import PUBKEY_ENV, boot
+from referral_loop.errors import PackVerificationError
+from referral_loop.eval import (
     check_release_criteria,
     format_report,
     replay,
     synthetic_corpus,
 )
-from healthcare_rag.referral_loop.events import Loop, LoopEvent, LoopState
-from healthcare_rag.referral_loop.listener import MessageHandler, make_mllp_server
-from healthcare_rag.referral_loop.mllp import CR, FS, frame
-from healthcare_rag.referral_loop.pack import RulePack, load_pack
-from healthcare_rag.referral_loop.peers import PeerRegistry
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
-from healthcare_rag.referral_loop.worklist import create_app
-from tests.referral_loop import spec_guards
+from referral_loop.events import Loop, LoopEvent, LoopState
+from referral_loop.listener import MessageHandler, make_mllp_server
+from referral_loop.mllp import CR, FS, frame
+from referral_loop.pack import RulePack, load_pack
+from referral_loop.peers import PeerRegistry
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
+from referral_loop.worklist import create_app
+from tests import spec_guards
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_PACK_DIR = REPO_ROOT / "healthcare_rag" / "referral_loop" / "rules"
@@ -994,7 +994,7 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
 
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/referral_loop", "-q",
-         "-p", "tests.referral_loop.spec_guards",
+         "-p", "tests.spec_guards",
          "-m", "not docker",
          "--deselect",
          "tests/referral_loop/test_spec_proofs.py::"
@@ -1205,7 +1205,7 @@ def test_spec_14_the_scan_can_actually_fail(system, caplog):
 def test_spec_14_can_fail_on_a_real_leak(system, caplog, monkeypatch):
     """Not a string appended to a copy: an actual leak, through the renderer,
     reaching the actual HTML."""
-    from healthcare_rag.referral_loop import worklist as worklist_module
+    from referral_loop import worklist as worklist_module
 
     real_row = worklist_module._row
 
@@ -1278,8 +1278,8 @@ def test_spec_15_can_fail(system, monkeypatch):
     real_handle = MessageHandler.handle
 
     def always_aa(self, text):
-        from healthcare_rag.referral_loop.listener import peek_control_id
-        from healthcare_rag.referral_loop.mllp import build_ack
+        from referral_loop.listener import peek_control_id
+        from referral_loop.mllp import build_ack
         real_handle(self, text)
         return build_ack(peek_control_id(text), "AA")
 
@@ -1331,7 +1331,7 @@ def test_spec_16_can_fail(system, monkeypatch):
     """Key the dedup on MSH-10 alone -- the obvious implementation, and the one
     that lets every engine retry double-count."""
     monkeypatch.setattr(
-        "healthcare_rag.referral_loop.listener.content_key",
+        "referral_loop.listener.content_key",
         lambda message, pack, *, mrn: None,
     )
     with pytest.raises(AssertionError):
@@ -1516,7 +1516,7 @@ def test_spec_18_can_fail(tmp_path, relocation, monkeypatch):
     """Read OBR-3 from a constant instead of from the pack. This is the exact
     regression 'rules as data' claims cannot happen, and it is one hardcoded
     index away."""
-    from healthcare_rag.referral_loop import matcher as matcher_module
+    from referral_loop import matcher as matcher_module
 
     real = matcher_module.concept_value
 

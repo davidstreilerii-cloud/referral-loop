@@ -1,6 +1,6 @@
 import pytest
 
-from healthcare_rag.referral_loop.parse_hl7 import (
+from referral_loop.parse_hl7 import (
     ALLOWED_SEGMENTS,
     MAX_SEGMENTS,
     MSH_DATETIME,
@@ -297,10 +297,10 @@ def test_the_listener_answers_ar_to_every_structural_fault(tmp_path):
     file tests the parser, but a fault the listener never consults is not a
     defense, so one test crosses the seam.
     """
-    from healthcare_rag.referral_loop.listener import MessageHandler, ack_code
-    from healthcare_rag.referral_loop.registry import Registry
-    from healthcare_rag.referral_loop.store import LoopStore
-    from tests.referral_loop.test_matcher import PACK
+    from referral_loop.listener import MessageHandler, ack_code
+    from referral_loop.registry import Registry
+    from referral_loop.store import LoopStore
+    from tests.test_matcher import PACK
 
     store = LoopStore(tmp_path / "loops.db")
     handler = MessageHandler(store=store, registry=Registry(store), pack=PACK)

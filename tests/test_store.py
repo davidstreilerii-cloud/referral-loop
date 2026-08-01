@@ -11,9 +11,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import LoopNotFoundError, StoreUnavailableError
-from healthcare_rag.referral_loop.events import LoopEvent, LoopState
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop.errors import LoopNotFoundError, StoreUnavailableError
+from referral_loop.events import LoopEvent, LoopState
+from referral_loop.store import LoopStore
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -103,8 +103,8 @@ _HARD_KILL_CHILD = """
 import os, sys, time
 sys.path.insert(0, {repo!r})
 from datetime import datetime, timezone
-from healthcare_rag.referral_loop.events import LoopEvent
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop.events import LoopEvent
+from referral_loop.store import LoopStore
 
 store = LoopStore({db!r})
 store.record_raw("CTRL1", "MSH|must survive")

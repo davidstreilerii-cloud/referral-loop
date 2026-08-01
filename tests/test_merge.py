@@ -13,14 +13,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import (
+from referral_loop.errors import (
     CircularMergeError,
     ReferralLoopError,
     StoreUnavailableError,
 )
-from healthcare_rag.referral_loop.events import LoopState
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop.events import LoopState
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
 
 T0 = datetime(2026, 7, 25, 9, 0, tzinfo=timezone.utc)
 T1 = T0 + timedelta(hours=1)

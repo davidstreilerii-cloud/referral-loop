@@ -17,18 +17,18 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_rag.referral_loop import audit, retention
-from healthcare_rag.referral_loop.errors import ReferralLoopError, StoreUnavailableError
-from healthcare_rag.referral_loop.events import LabelType, LoopEvent, LoopState
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.retention import (
+from referral_loop import audit, retention
+from referral_loop.errors import ReferralLoopError, StoreUnavailableError
+from referral_loop.events import LabelType, LoopEvent, LoopState
+from referral_loop.registry import Registry
+from referral_loop.retention import (
     RAW_DAYS_ENV,
     RESOLVED_DAYS_ENV,
     RetentionPolicy,
     purge,
 )
-from healthcare_rag.referral_loop import store as store_module
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop import store as store_module
+from referral_loop.store import LoopStore
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 LONG_AGO = NOW - timedelta(days=400)

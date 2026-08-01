@@ -12,15 +12,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import ThresholdsNotAcceptedError
-from healthcare_rag.referral_loop.events import Loop, LoopState
-from healthcare_rag.referral_loop.staleness import (
+from referral_loop.errors import ThresholdsNotAcceptedError
+from referral_loop.events import Loop, LoopState
+from referral_loop.staleness import (
     age,
     is_stale,
     require_thresholds_accepted,
     staleness_ratio,
 )
-from tests.referral_loop.test_matcher import PACK
+from tests.test_matcher import PACK
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 

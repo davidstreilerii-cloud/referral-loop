@@ -31,12 +31,12 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from healthcare_rag.referral_loop import audit as referral_audit
-from healthcare_rag.referral_loop.cli import PUBKEY_ENV, main
-from healthcare_rag.referral_loop.errors import ReferralLoopError
-from healthcare_rag.referral_loop.eval import _order as _eval_order
-from healthcare_rag.referral_loop.eval import _result as _eval_result
-from healthcare_rag.referral_loop.eval import (
+from referral_loop import audit as referral_audit
+from referral_loop.cli import PUBKEY_ENV, main
+from referral_loop.errors import ReferralLoopError
+from referral_loop.eval import _order as _eval_order
+from referral_loop.eval import _result as _eval_result
+from referral_loop.eval import (
     EvalError,
     EvalResult,
     LabeledCase,
@@ -48,11 +48,11 @@ from healthcare_rag.referral_loop.eval import (
     replay,
     synthetic_corpus,
 )
-from healthcare_rag.referral_loop.events import LoopState
-from healthcare_rag.referral_loop.listener import MessageHandler
-from healthcare_rag.referral_loop.pack import RulePack, load_pack
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop.events import LoopState
+from referral_loop.listener import MessageHandler
+from referral_loop.pack import RulePack, load_pack
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_PACK_DIR = REPO_ROOT / "healthcare_rag" / "referral_loop" / "rules"

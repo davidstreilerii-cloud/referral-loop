@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from healthcare_rag.referral_loop.errors import PackVerificationError
-from healthcare_rag.referral_loop.pack import RulePack, load_pack
+from referral_loop.errors import PackVerificationError
+from referral_loop.pack import RulePack, load_pack
 
 PACK = {
     "version": "1.0.0",

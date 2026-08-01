@@ -37,10 +37,10 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_rag.referral_loop import listener as listener_module
-from healthcare_rag.referral_loop.errors import StoreUnavailableError
-from healthcare_rag.referral_loop.events import LoopState
-from healthcare_rag.referral_loop.listener import (
+from referral_loop import listener as listener_module
+from referral_loop.errors import StoreUnavailableError
+from referral_loop.events import LoopState
+from referral_loop.listener import (
     _ARCHIVE_BYTES_PER_WINDOW,
     _MALFORMED_ARCHIVE_BYTES,
     _MALFORMED_PREFIX,
@@ -52,24 +52,24 @@ from healthcare_rag.referral_loop.listener import (
     content_key,
     make_mllp_server,
 )
-from healthcare_rag.referral_loop.matcher import field_value
-from healthcare_rag.referral_loop.mllp import CR, FS, VT, frame
-from healthcare_rag.referral_loop.mllp_server import (
+from referral_loop.matcher import field_value
+from referral_loop.mllp import CR, FS, VT, frame
+from referral_loop.mllp_server import (
     DESYNC_GRACE_SECONDS,
     FIRST_FRAME_SECONDS,
     MAX_FRAME_BYTES,
 )
-from healthcare_rag.referral_loop.parse_hl7 import parse_hl7_text
-from healthcare_rag.referral_loop.peers import (
+from referral_loop.parse_hl7 import parse_hl7_text
+from referral_loop.peers import (
     AUTHORITIES,
     TRANSPORT_PLAINTEXT,
     PeerIdentity,
     PeerRegistry,
 )
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.staleness import is_stale, staleness_ratio
-from healthcare_rag.referral_loop.store import LoopStore
-from tests.referral_loop.test_matcher import PACK
+from referral_loop.registry import Registry
+from referral_loop.staleness import is_stale, staleness_ratio
+from referral_loop.store import LoopStore
+from tests.test_matcher import PACK
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -244,7 +244,7 @@ def test_valid_order_returns_aa_after_a_durable_write(handler):
 def test_raw_is_persisted_before_parsing(handler, monkeypatch):
     """In-process cousin of the out-of-process proof below. Kept because it
     pins the *ordering* cheaply on every run."""
-    import healthcare_rag.referral_loop.listener as listener_mod
+    import referral_loop.listener as listener_mod
 
     def exploding_parse(_text):
         raise RuntimeError("parser blew up")
@@ -272,11 +272,11 @@ def test_raw_survives_process_death_mid_parse(tmp_path):
     script.write_text(
         "import sys, time\n"
         f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
-        "import healthcare_rag.referral_loop.listener as listener_mod\n"
-        "from healthcare_rag.referral_loop.listener import MessageHandler\n"
-        "from healthcare_rag.referral_loop.registry import Registry\n"
-        "from healthcare_rag.referral_loop.store import LoopStore\n"
-        "from tests.referral_loop.test_matcher import PACK\n"
+        "import referral_loop.listener as listener_mod\n"
+        "from referral_loop.listener import MessageHandler\n"
+        "from referral_loop.registry import Registry\n"
+        "from referral_loop.store import LoopStore\n"
+        "from tests.test_matcher import PACK\n"
         "store = LoopStore(sys.argv[1])\n"
         "handler = MessageHandler(store=store, registry=Registry(store), pack=PACK)\n"
         "def wedged(_text):\n"
@@ -964,7 +964,7 @@ def test_peek_agrees_with_the_parser_about_the_control_id(handler):
     """The archive is keyed on the peeked value and everything downstream on the
     parsed one. Two implementations that disagree key the archive on an id the
     rest of the pipeline never sees."""
-    from healthcare_rag.referral_loop.parse_hl7 import peek_control_id
+    from referral_loop.parse_hl7 import peek_control_id
 
     for text in (order(), result(), merge("M1"), scheduling("S1", "SIU^S12")):
         assert peek_control_id(text) == parse_hl7_text(text).control_id
@@ -1718,7 +1718,7 @@ def test_the_archive_refuses_a_malformed_frame_when_the_volume_is_nearly_full(ha
     two compete for the last of the disk, the clinical message wins.
     """
     handler.archive_disk_floor_bytes = 1 << 60      # nothing is ever this free
-    with caplog.at_level(logging.ERROR, logger="healthcare_rag.referral_loop.listener"):
+    with caplog.at_level(logging.ERROR, logger="referral_loop.listener"):
         assert ack_code(handler.reject_malformed(b"garbage", "reason")) == "AR"
     assert handler.store.raw_count() == 0
     assert handler.framing_error_count == 1, "still counted -- the rejection happened"
@@ -1943,7 +1943,7 @@ def test_the_throttle_alerts_once_per_window_rather_than_once_per_message(handle
     protecting. The counter carries the rest."""
     handler.archive_bytes_per_window = 1
     peer = _engine()
-    with caplog.at_level(logging.ERROR, logger="healthcare_rag.referral_loop.listener"):
+    with caplog.at_level(logging.ERROR, logger="referral_loop.listener"):
         for index in range(6):
             handler.handle(order(f"ORM_{index}"), peer=peer)
     alerts = [r for r in caplog.records if "archive budget" in r.getMessage()]
@@ -2020,7 +2020,7 @@ def test_the_alert_reports_a_pre_existing_row_rather_than_a_fresh_write(handler,
     `reject_malformed` ignored that -- so an identical retransmit, which is
     exactly what content addressing is for, was reported as a write that had
     just happened. Three outcomes, three sentences."""
-    with caplog.at_level(logging.ERROR, logger="healthcare_rag.referral_loop.listener"):
+    with caplog.at_level(logging.ERROR, logger="referral_loop.listener"):
         handler.reject_malformed(b"identical garbage", "reason")
         handler.reject_malformed(b"identical garbage", "reason")
     lines = [r.getMessage() for r in caplog.records if "Malformed framing" in r.getMessage()]

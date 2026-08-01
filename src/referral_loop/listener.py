@@ -111,10 +111,12 @@ from .matcher import (
     match_result,
     result_key_from_message,
 )
+
 # `ack_code` is re-exported: it moved down to `mllp` so the stream reader can
 # branch on an ACK without importing this module, and the ingest API this
 # subsystem documents is still `listener`.
 from .mllp import VT, ack_code, build_ack, deframe  # noqa: F401
+
 # Re-exported: the ingest API this subsystem documents is `listener`, and the
 # socket layer lives in its own module because stream reassembly fails in ways
 # message handling cannot recover from (see mllp_server). Importers get one
@@ -136,7 +138,13 @@ from .parse_hl7 import (
     structural_fault,
 )
 from .peers import (
-    CANCEL, FILEDROP_PEER, LOCAL_PEER, MERGE, RESULT, TRANSPORT_IN_PROCESS, PeerIdentity,
+    CANCEL,
+    FILEDROP_PEER,
+    LOCAL_PEER,
+    MERGE,
+    RESULT,
+    TRANSPORT_IN_PROCESS,
+    PeerIdentity,
 )
 from .registry import CORRECTED, FINAL, PRELIMINARY, Registry
 from .store import Attribution, LoopStore, attributed

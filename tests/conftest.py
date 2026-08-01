@@ -18,7 +18,7 @@ was rewritten to save and restore the value itself.
 """
 import pytest
 
-from healthcare_rag.referral_loop import audit
+from referral_loop import audit
 
 # Read once, at collection, before anything has redirected it. This is the path
 # a real install writes to, and test_audit asserts against it.

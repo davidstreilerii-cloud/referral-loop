@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+# cli.py defaults its database here. A PHI-bearing SQLite file must never be
+# committable by accident.
+data/
+.venv/

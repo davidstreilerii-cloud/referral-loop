@@ -11,6 +11,7 @@ Same principle as spec test 7: assert on the real end state, not on a proxy.
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -24,8 +25,8 @@ FORBIDDEN = [
 
 _PROBE = """
 import json, sys
-import healthcare_rag.referral_loop
-import healthcare_rag.referral_loop.errors
+import referral_loop
+import referral_loop.errors
 print(json.dumps(sorted(sys.modules)))
 """
 
@@ -66,4 +67,17 @@ def test_anthropic_is_in_the_closure_and_that_is_expected():
     assert "anthropic" in _run_probe(), (
         "If anthropic is no longer in the closure the parent package changed; "
         "re-check that spec test 6 still proves what it claims."
+    )
+
+
+def test_the_suite_is_exercising_this_checkout_and_not_an_installed_copy():
+    """A pip-installed copy of the monorepo satisfies `import referral_loop...` just as
+    well as src/ does, so a green suite proves nothing about which tree ran. This is the
+    only test that can tell the difference, and without it the parity check in the
+    extraction plan is a tautology."""
+    import referral_loop
+
+    here = Path(__file__).resolve().parents[1] / "src" / "referral_loop"
+    assert Path(referral_loop.__file__).resolve().parent == here, (
+        f"referral_loop resolved to {referral_loop.__file__}, not {here}"
     )

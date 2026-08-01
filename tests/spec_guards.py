@@ -15,7 +15,7 @@ write a test for. That difference is only observable by arming the guard and
 running everything.
 
 `test_spec_proofs.py::test_spec_12_and_13_the_whole_suite_under_both_guards`
-re-runs the suite in a subprocess with `-p tests.referral_loop.spec_guards`.
+re-runs the suite in a subprocess with `-p tests.spec_guards`.
 The guards are installed **only** when loaded that way, so importing this module
 is inert -- an autouse fixture here would arm them for the ordinary run too, and
 then the meta-test would prove nothing the plain run had not already shown.

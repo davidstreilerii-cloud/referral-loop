@@ -26,26 +26,26 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop import audit
-from healthcare_rag.referral_loop import store as store_module
-from healthcare_rag.referral_loop.audit import AuditAction, referral_audit_entries
-from healthcare_rag.referral_loop.errors import (
+from referral_loop import audit
+from referral_loop import store as store_module
+from referral_loop.audit import AuditAction, referral_audit_entries
+from referral_loop.errors import (
     LoopNotFoundError,
     ReferralLoopError,
     StoreUnavailableError,
 )
-from healthcare_rag.referral_loop.events import (
+from referral_loop.events import (
     LABEL_OUTCOME,
     LabelOutcome,
     LabelType,
     LoopEvent,
     LoopState,
 )
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
-from healthcare_rag.referral_loop.worklist import create_app
-from tests.referral_loop.test_matcher import PACK
-from tests.referral_loop.test_worklist import (
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
+from referral_loop.worklist import create_app
+from tests.test_matcher import PACK
+from tests.test_worklist import (
     _E2E_ORDER,
     _E2E_RESULT,
     _E2E_SENTINELS,
@@ -338,7 +338,7 @@ def test_an_attached_orphan_is_not_a_match_candidate_or_a_dismissal_candidate(st
     """It is terminal in both directions: a redelivered result must not re-match
     it, and dismissing it would inflate the dismissal rate spec section 5 watches
     for feed drift with work a coordinator actually completed."""
-    from healthcare_rag.referral_loop.matcher import MATCHABLE_STATES
+    from referral_loop.matcher import MATCHABLE_STATES
 
     orphan_id = _orphan(registry)
     registry.attach_orphan(orphan_id, _target(registry), actor="a", role="r")
@@ -553,7 +553,7 @@ def test_the_tier_on_a_false_match_label_comes_from_the_matcher_not_the_caller(t
     assertion in this file green while the most valuable label the system
     produces silently stopped saying which rule misfired.
     """
-    from healthcare_rag.referral_loop.listener import MessageHandler
+    from referral_loop.listener import MessageHandler
 
     store = LoopStore(tmp_path / "loops.db")
     reg = Registry(store, pack_version=PACK.version)
@@ -805,7 +805,7 @@ def _drive_every_labelling_action(tmp_path, sentinels):
     """Real HL7 in, every label out. Sentinels in PID/NK1/GT1/NTE arrive through
     the listener; the actor name and the free-text reason are sentinels too,
     because those are the channels a coordinator opens by typing."""
-    from healthcare_rag.referral_loop.listener import MessageHandler
+    from referral_loop.listener import MessageHandler
 
     store = LoopStore(tmp_path / "loops.db")
     reg = Registry(store, pack_version=PACK.version)
@@ -1033,7 +1033,7 @@ def test_a_self_attachment_of_a_real_orphan_is_still_refused_as_a_409(http, regi
 
 
 def test_the_page_offers_both_actions_and_still_claims_nothing_clinical(http, registry):
-    from tests.referral_loop.test_worklist import FORBIDDEN_WORDS
+    from tests.test_worklist import FORBIDDEN_WORDS
 
     _orphan(registry)
     _matched(registry, mrn="MRN-2")
@@ -1097,7 +1097,7 @@ def test_two_coordinators_attaching_one_orphan_to_two_loops_produce_one_attachme
 
 def test_no_event_type_added_by_this_task_maps_to_closed():
     """Spec test 9, over the two new event types specifically."""
-    from healthcare_rag.referral_loop.store import _EVENT_STATE
+    from referral_loop.store import _EVENT_STATE
 
     assert _EVENT_STATE["attached"] is LoopState.ATTACHED
     assert _EVENT_STATE["unmatched"] is LoopState.OPEN

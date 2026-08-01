@@ -186,7 +186,7 @@ def test_the_entry_point_runs_inside_the_image(referral_image):
     Also the only proof that the Dockerfile's file-by-file COPY set is complete:
     a missing module surfaces here as an ImportError and nowhere else.
     """
-    proc = _in_image(referral_image, "python", "-m", "healthcare_rag.referral_loop.cli", "--help")
+    proc = _in_image(referral_image, "python", "-m", "referral_loop.cli", "--help")
     assert proc.returncode == 0, proc.stderr
     for mode in ("listen", "filedrop", "worklist", "purge"):
         assert mode in proc.stdout
@@ -195,7 +195,7 @@ def test_the_entry_point_runs_inside_the_image(referral_image):
 @requires_docker
 def test_the_image_refuses_to_boot_without_the_public_key(referral_image):
     """The boot gates hold in the image, not only under pytest."""
-    proc = _in_image(referral_image, "python", "-m", "healthcare_rag.referral_loop.cli",
+    proc = _in_image(referral_image, "python", "-m", "referral_loop.cli",
                      "filedrop")
     assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
     assert "REFERRAL_PACK_PUBKEY" in proc.stderr

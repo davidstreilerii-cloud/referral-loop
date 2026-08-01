@@ -31,20 +31,20 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from healthcare_rag.referral_loop import audit as referral_audit
-from healthcare_rag.referral_loop import cli
-from healthcare_rag.referral_loop.cli import PUBKEY_ENV, boot, main
-from healthcare_rag.referral_loop.errors import (
+from referral_loop import audit as referral_audit
+from referral_loop import cli
+from referral_loop.cli import PUBKEY_ENV, boot, main
+from referral_loop.errors import (
     PackVerificationError,
     ReferralLoopError,
     StoreUnavailableError,
     ThresholdsNotAcceptedError,
 )
-from healthcare_rag.referral_loop.events import LoopEvent, LoopState
-from healthcare_rag.referral_loop.mllp import deframe, frame
-from healthcare_rag.referral_loop.retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV
-from healthcare_rag.referral_loop.store import LoopStore
-from tests.referral_loop.test_listener import MRN, ORDERED_AT, order, result
+from referral_loop.events import LoopEvent, LoopState
+from referral_loop.mllp import deframe, frame
+from referral_loop.retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV
+from referral_loop.store import LoopStore
+from tests.test_listener import MRN, ORDERED_AT, order, result
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_PACK_DIR = REPO_ROOT / "healthcare_rag" / "referral_loop" / "rules"
@@ -542,7 +542,7 @@ def test_help_works_with_no_pack_no_environment_and_no_database(tmp_path):
                         "REFERRAL_THRESHOLDS_ACCEPTED", PUBKEY_ENV}}
     env["PYTHONPATH"] = str(REPO_ROOT)
     proc = subprocess.run(
-        [sys.executable, "-m", "healthcare_rag.referral_loop.cli", "--help"],
+        [sys.executable, "-m", "referral_loop.cli", "--help"],
         capture_output=True, text=True, timeout=180, cwd=tmp_path, env=env,
     )
     assert proc.returncode == 0, proc.stderr

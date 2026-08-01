@@ -19,9 +19,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import StoreUnavailableError
-from healthcare_rag.referral_loop.events import LoopEvent
-from healthcare_rag.referral_loop.store import STATS_TABLES, UNBOUNDED_TABLES, LoopStore
+from referral_loop.errors import StoreUnavailableError
+from referral_loop.events import LoopEvent
+from referral_loop.store import STATS_TABLES, UNBOUNDED_TABLES, LoopStore
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 

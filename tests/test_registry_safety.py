@@ -10,15 +10,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import (
+from referral_loop.errors import (
     LoopNotFoundError,
     ReferralLoopError,
     ReservedStateError,
     StaleMessageError,
 )
-from healthcare_rag.referral_loop.events import LoopEvent, LoopState
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop.events import LoopEvent, LoopState
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
 
 T0 = datetime(2026, 7, 25, 9, 0, tzinfo=timezone.utc)
 T1 = T0 + timedelta(hours=1)
@@ -692,7 +692,7 @@ def test_a_correction_cannot_interleave_with_an_acknowledgement(registry, monkey
 def test_no_event_type_maps_to_closed(registry, store):
     """The whole v1 guarantee in one assertion: state comes only from replaying
     the event-type map, so a state absent from its values cannot be reached."""
-    from healthcare_rag.referral_loop.store import _EVENT_STATE
+    from referral_loop.store import _EVENT_STATE
 
     assert LoopState.CLOSED not in _EVENT_STATE.values()
 

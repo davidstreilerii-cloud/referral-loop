@@ -19,9 +19,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop.errors import PackVerificationError
-from healthcare_rag.referral_loop.events import Loop, LoopState
-from healthcare_rag.referral_loop.matcher import (
+from referral_loop.errors import PackVerificationError
+from referral_loop.events import Loop, LoopState
+from referral_loop.matcher import (
     ResultKey,
     concept_value,
     field_value,
@@ -29,8 +29,8 @@ from healthcare_rag.referral_loop.matcher import (
     match_result,
     result_key_from_message,
 )
-from healthcare_rag.referral_loop.pack import RulePack
-from healthcare_rag.referral_loop.parse_hl7 import parse_hl7_text
+from referral_loop.pack import RulePack
+from referral_loop.parse_hl7 import parse_hl7_text
 
 NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 

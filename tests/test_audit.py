@@ -29,27 +29,27 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_rag.referral_loop import audit
-from healthcare_rag.referral_loop.audit import (
+from referral_loop import audit
+from referral_loop.audit import (
     AuditAction,
     AuditScope,
     RefusalCode,
     audited,
     referral_audit_entries,
 )
-from healthcare_rag.referral_loop.errors import (
+from referral_loop.errors import (
     CircularMergeError,
     PackVerificationError,
     ReferralLoopError,
 )
-from healthcare_rag.referral_loop.pack import load_pack
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
-from healthcare_rag.referral_loop.worklist import create_app
-from tests.referral_loop.test_matcher import PACK
-from tests.referral_loop.test_pack import PACK as PACK_JSON
-from tests.referral_loop.test_pack import _write_pack
-from tests.referral_loop.test_worklist import (
+from referral_loop.pack import load_pack
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
+from referral_loop.worklist import create_app
+from tests.test_matcher import PACK
+from tests.test_pack import PACK as PACK_JSON
+from tests.test_pack import _write_pack
+from tests.test_worklist import (
     _E2E_ORDER,
     _E2E_RESULT,
     _E2E_SENTINELS,
@@ -299,7 +299,7 @@ def test_inbound_messages_are_not_audited(tmp_path):
     """The raw archive already holds every message verbatim and durably. A second
     exportable copy doubles the PHI footprint for no added assurance, and would
     break this module's whole claim that no audit value is message-derived."""
-    from healthcare_rag.referral_loop.listener import MessageHandler
+    from referral_loop.listener import MessageHandler
 
     store = LoopStore(tmp_path / "loops.db")
     handler = MessageHandler(store=store, registry=Registry(store), pack=PACK)
@@ -431,7 +431,7 @@ def _sentinels_on_disk(sentinels: dict[str, str]) -> dict[str, list[str]]:
 
 def _drive_every_audited_action(tmp_path, caplog):
     """Real HL7 in, every coordinator action out, including the refused ones."""
-    from healthcare_rag.referral_loop.listener import MessageHandler
+    from referral_loop.listener import MessageHandler
 
     store = LoopStore(tmp_path / "loops.db")
     reg = Registry(store)
@@ -604,7 +604,7 @@ def test_an_unwritable_audit_does_not_stop_a_coordinator(registry, caplog, monke
 
     registry.acknowledge(loop_id, actor="a", role="r", control_id="C-ACK")
 
-    from healthcare_rag.referral_loop.events import LoopState
+    from referral_loop.events import LoopState
     assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED, "the action was blocked"
     assert audit.write_failures() == before + 1
     assert "OSError" in caplog.text and "dropped" in caplog.text
@@ -620,7 +620,7 @@ def test_a_failing_init_does_not_stop_a_coordinator_either(registry, caplog, mon
 
     registry.acknowledge(loop_id, actor="a", role="r", control_id="C-ACK")
 
-    from healthcare_rag.referral_loop.events import LoopState
+    from referral_loop.events import LoopState
     assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
     assert "PermissionError" in caplog.text
 
@@ -715,7 +715,7 @@ def test_the_default_audit_database_is_the_guardrail_stacks_own():
     The conftest redirects the live path, so this reads the value captured
     before any redirect rather than the patched one.
     """
-    from tests.referral_loop.conftest import INSTALLED_AUDIT_DB
+    from tests.conftest import INSTALLED_AUDIT_DB
 
     installed = Path(INSTALLED_AUDIT_DB).resolve()
     assert installed == (REPO_ROOT / "data" / "audit_trail.db").resolve()
@@ -792,7 +792,7 @@ def test_the_audit_database_path_is_not_computed_from_a_parent_repo_layout():
 
 _PROBE = r"""
 import json, sys
-from healthcare_rag.referral_loop import audit
+from referral_loop import audit
 audit.set_audit_db(sys.argv[1])
 with audit.audited(audit.AuditAction.PACK_LOADED, actor="s", role="system") as scope:
     scope.pack_version = "1.0.0"
@@ -833,7 +833,7 @@ def test_one_module_object_whichever_import_happens_first(tmp_path):
     interpreter, because in-process the answer depends on what ran before."""
     check = (
         "import sys\n"
-        "from healthcare_rag.referral_loop import audit\n"
+        "from referral_loop import audit\n"
         "from healthcare_rag.guardrails import immutable_audit as pkg\n"
         "assert audit._module() is pkg, 'two module objects over one database'\n"
         "assert audit._module()._db_lock is pkg._db_lock\n"
@@ -841,7 +841,7 @@ def test_one_module_object_whichever_import_happens_first(tmp_path):
     _probe(tmp_path, prelude=check)
     _probe(tmp_path, prelude=(
         "from healthcare_rag.guardrails import immutable_audit as pkg\n"
-        "from healthcare_rag.referral_loop import audit\n"
+        "from referral_loop import audit\n"
         "assert audit._module() is pkg, 'two module objects over one database'\n"
     ))
 

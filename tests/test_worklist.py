@@ -21,17 +21,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from healthcare_rag.referral_loop import worklist as worklist_module
-from healthcare_rag.referral_loop.errors import StoreUnavailableError
-from healthcare_rag.referral_loop.events import LoopState
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
-from healthcare_rag.referral_loop.worklist import (
+from referral_loop import worklist as worklist_module
+from referral_loop.errors import StoreUnavailableError
+from referral_loop.events import LoopState
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
+from referral_loop.worklist import (
     create_app,
     create_blueprint,
     make_worklist_server,
 )
-from tests.referral_loop.test_matcher import PACK
+from tests.test_matcher import PACK
 
 # Planted where a real PID-3 lands. If any of these strings reaches HTML, JSON or
 # a log record, the product has an egress problem, not a formatting problem.
@@ -199,7 +199,7 @@ def test_an_orphan_is_aged_from_when_it_arrived(http, stack):
     has nothing to measure from -- so without the arrival clock every orphan
     showed a blank age and the queue lost the one number that tells a coordinator
     it is being allowed to grow."""
-    from healthcare_rag.referral_loop.events import LoopEvent
+    from referral_loop.events import LoopEvent
 
     _, _, store = stack
     arrived = datetime.now(timezone.utc) - timedelta(hours=30)
@@ -743,7 +743,7 @@ def test_real_hl7_in_and_no_sentinel_out(tmp_path, accepted, caplog):
     record emitted along the way. Asserting on the parser instead would prove
     only that the parser is careful today.
     """
-    from healthcare_rag.referral_loop.listener import MessageHandler
+    from referral_loop.listener import MessageHandler
 
     caplog.set_level(logging.DEBUG)
     store = LoopStore(tmp_path / "loops.db")
@@ -786,7 +786,7 @@ def test_real_hl7_in_and_no_sentinel_out(tmp_path, accepted, caplog):
 
 def test_the_row_builder_emits_only_allowlisted_keys(accepted):
     """An allowlist asserted as a set, so adding a field is a deliberate act."""
-    from healthcare_rag.referral_loop.events import Loop
+    from referral_loop.events import Loop
 
     loop = Loop(loop_id="L1", mrn=MRN_SENTINEL, state=LoopState.OPEN, modality="CT",
                 service_code="71260", ordering_provider="DRSENTINEL",
@@ -1230,7 +1230,7 @@ def store_bypass(stack):
     reachable through a restored or foreign-written log. That branch is on the
     worklist's primary sort key, so it is exercised here rather than assumed.
     """
-    from healthcare_rag.referral_loop.events import LoopEvent
+    from referral_loop.events import LoopEvent
 
     _, _, store = stack
 

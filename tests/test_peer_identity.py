@@ -34,13 +34,13 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from healthcare_rag.referral_loop import audit
-from healthcare_rag.referral_loop.errors import ReferralLoopError, StoreUnavailableError
-from healthcare_rag.referral_loop.events import LoopState
-from healthcare_rag.referral_loop.listener import FileDropSource, MessageHandler
-from healthcare_rag.referral_loop.mllp import CR, FS, frame
-from healthcare_rag.referral_loop.mllp_server import make_mllp_server
-from healthcare_rag.referral_loop.peers import (
+from referral_loop import audit
+from referral_loop.errors import ReferralLoopError, StoreUnavailableError
+from referral_loop.events import LoopState
+from referral_loop.listener import FileDropSource, MessageHandler
+from referral_loop.mllp import CR, FS, frame
+from referral_loop.mllp_server import make_mllp_server
+from referral_loop.peers import (
     CANCEL,
     MERGE,
     PLAINTEXT_LOOPBACK_PEER,
@@ -50,9 +50,9 @@ from healthcare_rag.referral_loop.peers import (
     PeerRegistry,
     load_peer_registry,
 )
-from healthcare_rag.referral_loop.registry import Registry
-from healthcare_rag.referral_loop.store import LoopStore
-from tests.referral_loop.test_listener import (
+from referral_loop.registry import Registry
+from referral_loop.store import LoopStore
+from tests.test_listener import (
     MRN,
     RESULTED_AT,
     SURVIVING_MRN,
@@ -64,7 +64,7 @@ from tests.referral_loop.test_listener import (
     result,
     scheduling,
 )
-from tests.referral_loop.test_matcher import PACK
+from tests.test_matcher import PACK
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -321,7 +321,7 @@ def caplog_at(handler, level):
             collected.append(record.getMessage())
 
     sink = _Sink(level=getattr(logging, level))
-    root = logging.getLogger("healthcare_rag.referral_loop")
+    root = logging.getLogger("referral_loop")
     previous = root.level
     root.addHandler(sink)
     root.setLevel(getattr(logging, level))
@@ -990,7 +990,7 @@ def test_an_authenticated_connection_closes_the_socket_it_wrapped(handler, pki, 
 
     So the socket is kept alive here and asked directly whether it was closed.
     """
-    from healthcare_rag.referral_loop.mllp_server import MLLPRequestHandler
+    from referral_loop.mllp_server import MLLPRequestHandler
 
     wrapped = []
     original = MLLPRequestHandler._secure
@@ -1177,7 +1177,7 @@ class Dying(sqlite3.Connection):
 _real_connect = sqlite3.connect
 sqlite3.connect = lambda *a, **k: _real_connect(*a, **{{**k, "factory": Dying}})
 
-from healthcare_rag.referral_loop.store import LoopStore
+from referral_loop.store import LoopStore
 LoopStore({db!r})
 print("SURVIVED")
 """
