@@ -286,12 +286,48 @@ corrected-result behavior (`OBX-11 = C`).
 
 ### 6.5 Migration from existing states
 
-| Existing | New |
-|---|---|
-| `OPEN` | `SENT` |
-| `SCHEDULED` | `SCHEDULED` |
-| `RESULTED` | `DOCUMENTED` |
-| `ACKNOWLEDGED` | `RECONCILED` |
+**Corrected 2026-08-01.** The first draft of this table listed four states. The module has
+**nine**, and twelve event types. The three omitted ones are not an oversight in the code — they
+expose a modelling decision this spec has to make.
+
+| Existing | New | Note |
+|---|---|---|
+| `OPEN` | `SENT` | |
+| `SCHEDULED` | `SCHEDULED` | |
+| `RESULTED` | `DOCUMENTED` | |
+| `ACKNOWLEDGED` | `RECONCILED` | |
+| `CANCELLED` | `CANCELLED` | |
+| `CLOSED` | — | reserved and unreachable in v1; `_RESERVED_V2_EVENTS = {"closed"}` refuses it at `store.append_event`. Drop it — §6.3's `RECONCILED` guarantee replaces what it was reserved for. |
+| `ORPHAN` | — | see below |
+| `DISMISSED` | — | see below |
+| `ATTACHED` | — | see below |
+
+Event types written to `loop_events`, all twelve: `created`, `scheduled`, `resulted`,
+`acknowledged`, `cancelled`, `orphaned`, `reopened`, `reversed`, `dismissed`, `attached`,
+`unmatched`, `merged_in` (the last being non-transitional — it carries fields and leaves state
+alone).
+
+**The modelling decision.** `ORPHAN`, `DISMISSED` and `ATTACHED` are not states a *referral* can be
+in. They are the lifecycle of an **inbound artifact that matched no referral** — a result that
+arrived naming an order nobody placed. The current schema stores both in the `loops` table, so an
+orphan is a row that looks like a referral and has an `mrn` but no order behind it.
+
+That conflation is why `_EXACT_TIER_STATES` has to include `ATTACHED`, why `_NEVER_DELETABLE` has
+to list `ORPHAN` separately, and why `attach_orphan` routes a coordinator's decision through
+`record_result` with no `MSH-7` — the exemption that needed its own safety argument during the
+security audit (§11.6 H2).
+
+**Decision: separate them.** The canonical model in §5 gets a second aggregate, `InboundArtifact`,
+with its own small lifecycle — `unmatched → {attached | dismissed}` — and its own table. A referral
+never enters those states; an artifact never enters the eleven. Attaching becomes an explicit
+`Transition` on the *referral* carrying `assertion_source = HUMAN` and an `Evidence` referencing
+the artifact, which is exactly the shape §8.1 already defines and removes the need for the
+`attached_from` exemption entirely.
+
+This is more work than a rename, and it is the right time to do it: the two aggregates have
+different identities, different retention rules (`_NEVER_DELETABLE` already treats them
+differently), and different provenance semantics. In FHIR terms the referral is `Task` and the
+artifact is `DocumentReference`, which is the projection §7 will need regardless.
 
 ---
 
