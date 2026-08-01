@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 import pytest
 
 from healthcare_rag.referral_loop.errors import FramingError
-from healthcare_rag.referral_loop.mllp import VT, FS, CR, build_ack, deframe, frame
+from healthcare_rag.referral_loop.mllp import (
+    VT, FS, CR, ack_code, build_ack, deframe, frame,
+)
 from healthcare_rag.referral_loop.parse_hl7 import (
     MSH_CONTROL_ID, MSH_MESSAGE_TYPE, parse_hl7_text,
 )
@@ -32,6 +34,24 @@ def test_ack_codes():
     assert "|AE|" in build_ack("CTRL1", "AE")
     assert "|AR|" in build_ack("CTRL1", "AR")
     assert "CTRL1" in build_ack("CTRL1", "AA")
+
+
+def test_ack_code_reads_every_code_build_ack_can_emit():
+    """`ack_code` lives beside `build_ack` because it is its inverse, and
+    because the stream reader has to branch on the outcome of `handle()` --
+    an application-level `AR` closes the connection -- without importing the
+    listener that calls it."""
+    for code in ("AA", "AE", "AR"):
+        assert ack_code(build_ack("CTRL1", code)) == code
+
+
+def test_ack_code_parses_msa2_rather_than_testing_for_a_substring():
+    """MSA-2 echoes the inbound control id, which is attacker-influenced.
+    `"|AA|" in ack` over that text is a substring test on hostile input;
+    sanitize_control_id makes it safe today and parsing keeps it safe if that
+    ever changes."""
+    assert ack_code(build_ack("AA", "AR")) == "AR"
+    assert ack_code("MSH|^~\\&|\r") == "", "no MSA segment means no code"
 
 
 def test_invalid_utf8_raises_framing_error_not_unicode_error():

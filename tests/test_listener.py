@@ -23,6 +23,7 @@ the test states.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import socket
 import subprocess
@@ -40,6 +41,7 @@ from healthcare_rag.referral_loop import listener as listener_module
 from healthcare_rag.referral_loop.errors import StoreUnavailableError
 from healthcare_rag.referral_loop.events import LoopState
 from healthcare_rag.referral_loop.listener import (
+    _MALFORMED_ARCHIVE_BYTES,
     _MRN_RESOLUTION_ATTEMPTS,
     FileDropSource,
     MessageHandler,
@@ -345,10 +347,29 @@ def test_store_failure_during_apply_also_returns_ae(handler, monkeypatch):
     assert len(loops(handler)) == 1
 
 
-def test_message_with_no_control_id_is_never_acked_aa(handler):
-    """A message we cannot key is one we cannot promise not to double-process."""
+def test_message_with_no_control_id_is_rejected_ar_not_queued_for_retry(handler):
+    """A message we cannot key is one we cannot promise not to double-process --
+    and an empty MSH-10 is a *permanent* property of those bytes.
+
+    This test previously asserted `AE`, which pinned defect H7 rather than the
+    requirement. `AE` means "queue and retry", and an interface engine retries a
+    queued `AE` at the head of its outbound queue, so one 60-byte message stops
+    the entire clinical feed behind it -- forever, because these bytes will
+    never become acceptable. Nothing was archived either, since the refusal came
+    out of `record_raw` before the insert.
+
+    This is exactly the class this module's docstring reserves `AR` for, so the
+    empty control id is detected before the durable write and the evidence is
+    archived under the content-addressed malformed key.
+    """
     unkeyed = message(msh("ORM^O01", ""), pid(), obr())
-    assert ack_code(handler.handle(unkeyed)) == "AE"
+    assert ack_code(handler.handle(unkeyed)) == "AR"
+    assert handler.store_failure_count == 0, "this is not a transient store failure"
+    assert handler.framing_error_count == 1
+    archived = handler.store.raw_payloads()
+    assert len(archived) == 1 and MRN in archived[0], (
+        "the bytes are refused, so the archive is the only remaining copy"
+    )
 
 
 # ------------------------------------------------------------------- idempotency
@@ -757,6 +778,34 @@ def test_siu_with_no_order_number_falls_back_to_a_single_open_loop(handler):
     assert loops(handler)[0].state is LoopState.SCHEDULED
 
 
+def test_siu_naming_an_order_number_but_no_patient_schedules_nothing(handler):
+    """Follows from the H3 fix, and pinned here because nothing else recorded it.
+
+    Before H3, an `SIU^S12` carrying a valid `ORC-2` placer and no PID segment
+    reached `SCHEDULED`: the order number matched at an exact tier against a
+    candidate set that was not narrowed by patient. Now `_target_loop` asks for
+    `open_loops(mrn)` only when the message names a patient, so a message that
+    names none gets no loops, resolves to no single open loop, and is flagged
+    instead of applied. The loop stays `OPEN` and a human is told why.
+
+    That is a behaviour change, deliberate and in the safe direction: an
+    unverified order number is not enough evidence to move a loop's state, for
+    the same reason it is not enough to attach a result. Recorded rather than
+    left to be rediscovered by whoever notices the scheduled count fall.
+    """
+    handler.handle(order())
+    handler.handle(message(
+        msh("SIU^S12", "S_NO_PID", RESULTED_AT),
+        segment("SCH", {1: "APPT1", 2: "APPT1"}),
+        segment("ORC", {1: "SC", 2: PLACER}),
+    ))
+
+    assert loops(handler)[0].state is LoopState.OPEN, (
+        "an order number nobody attributed to a patient must not schedule a loop"
+    )
+    assert handler.untargeted_count == 1, "and it is flagged for review, not silently dropped"
+
+
 def test_siu_never_touches_more_than_one_loop(handler):
     """The plan's listener looped over every open loop for the patient. One
     SIU^S15 would then cancel unrelated open orders, and CANCELLED appears on
@@ -1116,6 +1165,44 @@ def read_ack(sock: socket.socket) -> str:
             break
         buffer += chunk
     return buffer.decode("utf-8", errors="replace")
+
+
+def read_until_closed(sock: socket.socket, timeout: float = 10.0) -> str:
+    """Everything the server said, up to the moment it hung up.
+
+    Reading to end-of-stream rather than to the first `FS CR` is what makes
+    "the connection was closed" assertable at all: a test that stops at the
+    ACK cannot tell an open connection from a closed one.
+    """
+    sock.settimeout(timeout)
+    buffer = b""
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            raise AssertionError(
+                f"the peer was still holding the connection open after {timeout}s; "
+                f"received {buffer!r}"
+            )
+        except OSError:
+            # A reset rather than a graceful close still means "hung up", and
+            # which of the two arrives is platform-dependent.
+            return buffer.decode("utf-8", errors="replace")
+        if not chunk:
+            return buffer.decode("utf-8", errors="replace")
+        buffer += chunk
+
+
+def peer_closed(sock: socket.socket, timeout: float = 10.0) -> bool:
+    sock.settimeout(timeout)
+    try:
+        while True:
+            if not sock.recv(4096):
+                return True
+    except socket.timeout:
+        return False
+    except OSError:
+        return True
 
 
 def test_server_binds_loopback_by_default(handler):
@@ -1549,6 +1636,268 @@ def test_two_messages_in_one_frame_are_refused(handler):
     ack = handler.handle(doubled)
     assert ack_code(ack) == "AR"
     assert loops(handler) == []
+
+
+# ------------------------------------------------- rejection is not free (H6a/L3)
+
+
+def _unkeyed() -> str:
+    """A message whose only fault is an empty MSH-10.
+
+    Framing-clean and structurally clean, so it reaches `handle()` and is
+    rejected at the application level -- the path that used to leave the
+    connection open.
+    """
+    return message(msh("ORM^O01", ""), pid(), obr())
+
+
+def test_an_application_level_rejection_closes_the_connection(handler):
+    """`AR` from `handle()` must end the connection like a framing `AR` does.
+
+    While it did not, one TCP connection could loop malformed frames forever,
+    each one costing a SHA-256, a UTF-8 decode and an INSERT committed under
+    `PRAGMA synchronous = FULL` -- an fsync per iteration, with no reconnect
+    cost and no rate limit. Content-addressing dedups only *identical* garbage,
+    so varying one byte per iteration writes a new row every time.
+    """
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(frame(_unkeyed()) + frame(order("AFTER_THE_AR")))
+            text = read_until_closed(sock)
+    assert text.count("|AR|") == 1
+    assert "|AA|" not in text, "nothing behind an application-level AR may be processed"
+    assert loops(handler) == [], "the frame pipelined behind the AR must not be applied"
+
+
+def test_a_malformed_frame_is_archived_capped_with_its_full_digest_and_length(handler):
+    """The lossless archive does not need 16 MiB.
+
+    A malformed frame is attacker-controlled bytes, and archiving all of them
+    makes the archive the amplifier: 16 MiB hashed, decoded and fsynced per
+    frame. A bounded prefix still shows a sender what arrived; the full digest
+    and the original length are what keep the row an exact identification of
+    the bytes rather than an approximation of them.
+    """
+    raw = b"X" * (4 * _MALFORMED_ARCHIVE_BYTES)
+    handler.reject_malformed(raw, "an oversized frame")
+    archived = handler.store.raw_payloads()[0]
+    assert len(archived) < _MALFORMED_ARCHIVE_BYTES + 512, "the cap is not enforced"
+    assert archived.startswith("XXXX"), "the prefix a human would read is still there"
+    assert hashlib.sha256(raw).hexdigest() in archived, "the full digest identifies the bytes"
+    assert str(len(raw)) in archived, "and the original length says how much was dropped"
+
+
+def test_a_malformed_frame_within_the_cap_is_archived_verbatim(handler):
+    """The cap must not turn every rejection into a truncated one: a
+    conformant-sized frame is still archived exactly as it arrived."""
+    handler.reject_malformed(b"MSH|no end block", "no end block")
+    assert handler.store.raw_payloads() == ["MSH|no end block"]
+
+
+def test_the_archive_refuses_a_malformed_frame_when_the_volume_is_nearly_full(handler, caplog):
+    """A full PHI volume turns every `record_raw` into a `StoreUnavailableError`,
+    so the listener answers `AE` and the engine queues and retries the whole live
+    feed indefinitely. Malformed evidence is not a clinical message; when the
+    two compete for the last of the disk, the clinical message wins.
+    """
+    handler.archive_disk_floor_bytes = 1 << 60      # nothing is ever this free
+    with caplog.at_level(logging.ERROR, logger="healthcare_rag.referral_loop.listener"):
+        assert ack_code(handler.reject_malformed(b"garbage", "reason")) == "AR"
+    assert handler.store.raw_count() == 0
+    assert handler.framing_error_count == 1, "still counted -- the rejection happened"
+    assert not any("archived as" in record.getMessage() for record in caplog.records), (
+        "the alert must not send an operator looking for a row that was never written"
+    )
+
+
+def test_an_unmeasurable_volume_still_gets_the_evidence_archived(handler, monkeypatch):
+    """A failure to *measure* free space is not evidence of a full one. Refusing
+    on an unreadable measurement would discard the only copy of what a sender
+    emitted on the strength of a guess, which is the opposite of what the floor
+    is for."""
+    def unmeasurable(_path):
+        raise OSError("no such device")
+
+    monkeypatch.setattr(listener_module.shutil, "disk_usage", unmeasurable)
+    assert ack_code(handler.reject_malformed(b"garbage", "reason")) == "AR"
+    assert handler.store.raw_count() == 1
+
+
+def test_a_peer_that_keeps_being_rejected_stops_being_read_at_all(handler):
+    """Closing the connection per rejection is not a rate limit on its own --
+    reconnecting costs an attacker nothing. Rejections are counted per peer
+    across connections, and a peer over its budget is refused at accept."""
+    with running_server(handler, max_rejections_per_peer=2) as address:
+        for index in range(5):
+            with socket.create_connection(address, timeout=10) as sock:
+                sock.sendall(b"garbage %d" % index + FS + CR)
+                peer_closed(sock)
+    assert handler.framing_error_count == 2, "the budget is per peer, not per connection"
+    assert handler.store.raw_count() == 2, "and nothing from that peer is archived after it"
+
+
+def test_a_frame_that_was_not_accepted_is_not_named_by_a_later_truncation_flag(handler):
+    """L3: `last_accepted` must name a control id with an archive row behind it.
+
+    The truncation alert tells a human to "review the archived raw for this
+    control id". Assigning `last_accepted` for any frame that was merely
+    *answered* -- rather than accepted -- sends them looking for a row that the
+    failed durable write never created.
+    """
+    db_path = Path(handler.store.db_path)
+    db_path.unlink()
+    db_path.mkdir()                     # a real store failure, so the order gets AE
+
+    with running_server(handler) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(frame(order("WHOLE1")) + VT + b"MSH|not CR terminated" + FS + CR)
+            text = read_until_closed(sock)
+
+    assert "|AE|" in text, "the store is unwritable, so the order was not accepted"
+    assert "|AR|" in text, "and the frame behind it is unframeable"
+    assert handler.store_failure_count == 1
+    assert handler.suspect_truncation_count == 0, (
+        "a frame that was never applied must not be flagged as a suspect truncation"
+    )
+
+
+def test_the_framing_error_counter_moves_only_under_the_lock(handler):
+    """L2: `+=` on an int attribute is a non-atomic load/add/store, and
+    `reject_malformed` is called straight from the socket thread. Under exactly
+    the concurrency an attacker creates, the counter that would signal the
+    attack undercounts."""
+    entered = threading.Event()
+
+    def reject():
+        entered.set()
+        handler.reject_malformed(b"garbage", "reason")
+
+    thread = threading.Thread(target=reject, daemon=True)
+    with handler._lock:
+        thread.start()
+        assert entered.wait(10)
+        time.sleep(0.1)
+        assert handler.framing_error_count == 0, "the counter moved without holding the lock"
+    thread.join(timeout=10)
+    assert handler.framing_error_count == 1
+
+
+def test_the_suspect_truncation_counter_moves_only_under_the_lock(handler):
+    """L2, the other counter the stream reader increments from a socket thread."""
+    entered = threading.Event()
+
+    def flag():
+        entered.set()
+        handler.flag_possible_truncation("WHOLE1")
+
+    thread = threading.Thread(target=flag, daemon=True)
+    with handler._lock:
+        thread.start()
+        assert entered.wait(10)
+        time.sleep(0.1)
+        assert handler.suspect_truncation_count == 0, "the counter moved without the lock"
+    thread.join(timeout=10)
+    assert handler.suspect_truncation_count == 1
+
+
+# ------------------------------------------------ connections are bounded (H6b)
+
+
+def test_connections_beyond_the_cap_are_refused_rather_than_given_a_thread(handler):
+    """`ThreadingTCPServer` with `daemon_threads` and no `max_children` gives
+    every accepted connection an OS thread for as long as the peer holds it.
+    10,000 connections is 10,000 threads; the process dies or stops being able
+    to accept the interface engine's connection at all."""
+    with running_server(handler, max_connections=1) as address:
+        with socket.create_connection(address, timeout=10) as first:
+            sock_first_ack = None
+            first.sendall(frame(order()))
+            sock_first_ack = read_ack(first)
+            assert "|AA|" in sock_first_ack, "the slot is provably held by a live connection"
+            with socket.create_connection(address, timeout=10) as second:
+                assert peer_closed(second, timeout=10), (
+                    "an unbounded accept loop is the same denial of service as an "
+                    "unbounded read buffer, one granularity up"
+                )
+
+
+def test_connections_beyond_the_per_peer_cap_are_refused(handler):
+    """The global cap alone lets one peer take every slot, which is the same
+    outage. Global room is left deliberately, so only a per-source-IP cap can
+    be what refuses this."""
+    with running_server(handler, max_connections=8, max_connections_per_peer=1) as address:
+        with socket.create_connection(address, timeout=10) as first:
+            first.sendall(frame(order()))
+            assert "|AA|" in read_ack(first)
+            with socket.create_connection(address, timeout=10) as second:
+                assert peer_closed(second, timeout=10)
+
+
+def test_a_slot_is_returned_when_the_connection_ends(handler):
+    """A semaphore that is acquired and never released is a cap that shrinks to
+    zero over an afternoon of ordinary traffic -- an outage arriving by way of
+    the fix for one."""
+    with running_server(handler, max_connections=1) as address:
+        for index in range(3):
+            with socket.create_connection(address, timeout=10) as sock:
+                sock.sendall(frame(order(f"SEQ{index}", placer=f"P{index}", filler=f"F{index}")))
+                assert "|AA|" in read_ack(sock), f"connection {index} was refused"
+    assert len(loops(handler)) == 3
+
+
+def test_a_connection_is_closed_at_its_absolute_deadline(handler):
+    """`RECV_TIMEOUT_SECONDS` is applied with `settimeout`, so it bounds each
+    `recv` call and not the connection's lifetime. A connection that speaks
+    just often enough never trips it."""
+    with running_server(handler, connection_deadline=0.3, recv_timeout=30.0) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(frame(order()))
+            assert "|AA|" in read_ack(sock)
+            assert peer_closed(sock, timeout=10), (
+                "the connection outlived its absolute budget"
+            )
+
+
+def test_a_dribbling_sender_is_closed_by_the_first_frame_timer(handler):
+    """The exploit the per-`recv` timeout cannot see: `VT`, then one byte per
+    timeout window forever. The 16 MiB buffer cap is never approached -- one
+    byte every 290 seconds reaches 16 MiB in about 150 years -- and the
+    connection owns a thread the whole time. Only a timer that starts at the
+    first byte of a frame and ignores the ones after it closes this.
+    """
+    with running_server(handler, first_frame_timeout=0.4, connection_deadline=60.0,
+                        recv_timeout=30.0) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            sock.sendall(VT + b"MSH|")
+            sock.settimeout(0.05)
+            closed = False
+            started = time.monotonic()
+            while time.monotonic() - started < 10:
+                try:
+                    sock.sendall(b"X")          # keeps every recv fresh
+                    if not sock.recv(4096):
+                        closed = True
+                        break
+                except socket.timeout:
+                    pass                        # still open; poll again
+                except OSError:
+                    closed = True
+                    break
+                time.sleep(0.05)
+    assert closed, "a sender that never completes a frame held the connection open"
+    assert loops(handler) == []
+
+
+def test_the_first_frame_timer_does_not_close_a_slow_but_complete_delivery(handler):
+    """The timer bounds an *incomplete* frame, and restarts with each frame. A
+    sender pausing between whole messages is a normal engine, not a dribbler."""
+    with running_server(handler, first_frame_timeout=0.5, connection_deadline=60.0) as address:
+        with socket.create_connection(address, timeout=10) as sock:
+            for index in range(3):
+                sock.sendall(frame(order(f"SLOW{index}", placer=f"P{index}", filler=f"F{index}")))
+                assert "|AA|" in read_ack(sock)
+                time.sleep(0.6)                 # longer than the timer, between frames
+    assert len(loops(handler)) == 3
 
 
 # ------------------------------------------------------------------ concurrency

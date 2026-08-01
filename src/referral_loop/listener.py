@@ -61,6 +61,7 @@ import base64
 import hashlib
 import json
 import logging
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -84,7 +85,10 @@ from .matcher import (
     match_result,
     result_key_from_message,
 )
-from .mllp import VT, build_ack, deframe
+# `ack_code` is re-exported: it moved down to `mllp` so the stream reader can
+# branch on an ACK without importing this module, and the ingest API this
+# subsystem documents is still `listener`.
+from .mllp import VT, ack_code, build_ack, deframe  # noqa: F401
 # Re-exported: the ingest API this subsystem documents is `listener`, and the
 # socket layer lives in its own module because stream reassembly fails in ways
 # message handling cannot recover from (see mllp_server). Importers get one
@@ -143,26 +147,37 @@ _CONTENT_KEY_VERSION = "rl-content-v1"
 # and so the same bytes are recognisably the same incident.
 _MALFORMED_PREFIX = "MALFORMED-"
 _BASE64_PREFIX = "BASE64:"
+_TRUNCATED_MARKER = "TRUNCATED"
+
+# The most of a malformed frame that is archived. Content-addressing dedups
+# *identical* retransmits only, so a sender that varies one byte per frame gets
+# a new row every time, and at the frame cap each row costs a SHA-256 over
+# 16 MiB, a 16 MiB decode and a 16 MiB INSERT committed under
+# `PRAGMA synchronous = FULL` -- one fsync apiece. That is the archive
+# amplifying the attack it exists to record.
+#
+# 64 KiB because the archive's purpose is showing a sender exactly what
+# arrived, and every conformant HL7 v2 message this listener will see fits
+# inside it several times over: mllp_server's 16 MiB frame cap is sized for an
+# ORU carrying an embedded report, not for a header a sender got wrong. Past
+# the cap the row still carries the full SHA-256 and the original length, so it
+# identifies the exact bytes; what is dropped is the tail of a frame nobody can
+# act on. `reject_malformed`'s "lossless" promise is now bounded, and says so.
+_MALFORMED_ARCHIVE_BYTES = 64 * 1024
+
+# Free space below which malformed frames stop being archived at all. A full
+# PHI volume makes every `record_raw` raise `StoreUnavailableError`, so the
+# listener answers AE and the engine queues and retries the *live clinical
+# feed* indefinitely -- the outage is caused by whatever filled the disk, and
+# attacker-controlled bytes must not be what does. When the evidence of a bad
+# sender and the next real result compete for the last of the volume, the
+# result wins. `retention.py` is a scheduled purge with no default period, so
+# it is not a quota and bounds none of this.
+_ARCHIVE_DISK_FLOOR_BYTES = 64 * 1024 * 1024
 
 # Bounded, because a resolution that keeps moving is a merge storm a human needs
 # to see rather than something to spin on. See _open_loop_retrying.
 _MRN_RESOLUTION_ATTEMPTS = 3
-
-
-def ack_code(ack: str) -> str:
-    """`AA` / `AE` / `AR` from an ACK, or "" if it carries no MSA.
-
-    Callers branch on the outcome (FileDropSource decides whether to delete a
-    file on it), and `"|AA|" in ack` is a substring test over attacker-influenced
-    text -- MSA-2 echoes the inbound control id. mllp.sanitize_control_id makes
-    that safe today; parsing the field the ACK actually means keeps it safe if
-    that ever changes.
-    """
-    for line in ack.replace("\n", "\r").split("\r"):
-        if line.startswith("MSA|"):
-            fields = line.split("|")
-            return fields[1] if len(fields) > 1 else ""
-    return ""
 
 
 def _prior_mrn(message: ParsedMessage, pack: RulePack) -> str:
@@ -274,6 +289,9 @@ class MessageHandler:
         self.registry = registry
         self.pack = pack
         self._lock = threading.RLock()
+        # An attribute rather than the constant alone, so a deployment on a
+        # small volume can lower it and a test can raise it above any real disk.
+        self.archive_disk_floor_bytes = _ARCHIVE_DISK_FLOOR_BYTES
 
         # Counters, not metrics plumbing. Each one is a distinct operational
         # fact somebody would act on differently.
@@ -338,6 +356,24 @@ class MessageHandler:
             return self.reject_malformed(
                 text.encode("utf-8", errors="replace"),
                 f"expected exactly one MSH segment, found {count}",
+            )
+
+        # Also before the archive, and for the same reason. `record_raw`
+        # refuses an empty MSH-10 -- idempotency cannot be promised without a
+        # key -- and that refusal used to arrive as a StoreUnavailableError, so
+        # this answered AE. AE means "queue and retry", and an empty MSH-10 is
+        # a permanent property of these bytes: they will never become
+        # acceptable. An engine retries a queued AE at the head of its outbound
+        # queue, so one such message stops the entire clinical feed behind it,
+        # forever, and nothing is archived because the insert never happened --
+        # a whole-interface outage from 60 bytes, reachable by accident from a
+        # misconfigured sender. AR, and the bytes are kept under the
+        # content-addressed malformed key so the evidence survives the refusal.
+        if not control_id:
+            return self.reject_malformed(
+                text.encode("utf-8", errors="replace"),
+                "MSH-10 is empty, so this message cannot be keyed and no promise can be "
+                "made about processing it exactly once",
             )
 
         # 1. Durable write. Everything after this point may fail without losing
@@ -481,7 +517,13 @@ class MessageHandler:
         the control id is named, the raw is in the archive verbatim, and a human
         can compare the two.
         """
-        self.suspect_truncation_count += 1
+        with self._lock:
+            # Called straight from a socket thread, like framing_error_count.
+            # `+=` on an int attribute is a load, an add and a store, so
+            # concurrent connections lose increments -- and this is one of the
+            # two numbers that would tell an operator an attack is under way,
+            # under exactly the concurrency an attack produces.
+            self.suspect_truncation_count += 1
         logger.error(
             "Message %r was acknowledged and applied, and the bytes that followed it did not "
             "begin a new frame. It may have been the first half of a message split by an "
@@ -492,6 +534,55 @@ class MessageHandler:
 
     # ---------------------------------------------------------------- malformed
 
+    def _archivable(self, raw: bytes, digest: str) -> str:
+        """The archive's view of a malformed frame: bounded, and honest about it.
+
+        Within `_MALFORMED_ARCHIVE_BYTES` this is exactly what arrived. Beyond
+        it the prefix is kept and the row records the full digest and the
+        original length, so the bytes stay identifiable even though they are no
+        longer all present. Bytes that are not UTF-8 are base64-encoded rather
+        than replaced, because the value of archiving a malformed frame is
+        showing the sender what it actually sent -- a frame cut at the cap in
+        the middle of a multi-byte character takes the base64 branch, which is
+        lossless for what it holds rather than approximate.
+        """
+        head = raw[:_MALFORMED_ARCHIVE_BYTES]
+        try:
+            payload = head.decode("utf-8")
+        except UnicodeDecodeError:
+            payload = _BASE64_PREFIX + base64.b64encode(head).decode("ascii")
+        if len(raw) <= _MALFORMED_ARCHIVE_BYTES:
+            return payload
+        return (
+            f"{payload}\r{_TRUNCATED_MARKER}: {len(raw)} bytes received, "
+            f"{_MALFORMED_ARCHIVE_BYTES} archived, sha256={digest}\r"
+        )
+
+    def _archive_has_room(self) -> bool:
+        """Whether there is enough of the volume left to spend on evidence.
+
+        See `_ARCHIVE_DISK_FLOOR_BYTES`. A failure to *measure* free space is
+        not evidence of a full disk, so it archives and says so -- refusing on
+        an unreadable measurement would discard the only copy of what a sender
+        emitted on the strength of a guess, which is the opposite of what this
+        path is for.
+        """
+        try:
+            free = shutil.disk_usage(Path(self.store.db_path).parent).free
+        except OSError as exc:
+            logger.error("Could not measure free space (%s); archiving anyway", exc)
+            return True
+        if free >= self.archive_disk_floor_bytes:
+            return True
+        logger.error(
+            "Only %d byte(s) free, below the %d-byte archive floor: not archiving this "
+            "malformed frame. A full volume makes every durable write fail, which answers "
+            "AE to the live feed and asks the engine to retry all of it forever; the "
+            "remaining space belongs to clinical messages.",
+            free, self.archive_disk_floor_bytes,
+        )
+        return False
+
     def reject_malformed(self, raw: bytes, reason: str) -> str:
         """Failure matrix: `AR`, archive raw, alert.
 
@@ -499,25 +590,38 @@ class MessageHandler:
         and an engine told to queue would redeliver them forever, wedging the
         interface behind a message that cannot be processed.
 
-        The archive is lossless. Bytes that are not UTF-8 are base64-encoded
-        rather than replaced, because the whole value of archiving a malformed
-        frame is being able to show the sender exactly what arrived.
+        The archive is lossless up to `_MALFORMED_ARCHIVE_BYTES` and identifies
+        the bytes exactly beyond it; see `_archivable`. It is skipped entirely
+        when the volume is nearly full; see `_archive_has_room`. Both bound what
+        an unauthenticated peer can make this path write, and neither changes
+        the answer: it is `AR` either way.
         """
-        self.framing_error_count += 1
-        control_id = _MALFORMED_PREFIX + hashlib.sha256(raw).hexdigest()[:32]
-        try:
-            payload = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            payload = _BASE64_PREFIX + base64.b64encode(raw).decode("ascii")
-        try:
-            self.store.record_raw(control_id, payload)
-        except StoreUnavailableError as exc:
-            # Still AR. The alternative is AE, which asks for the redelivery of
-            # bytes that cannot be processed either way.
-            logger.error("Could not archive a malformed frame (%s): %s", control_id, exc)
+        with self._lock:
+            # Non-atomic `+=` called straight from a socket thread; see
+            # flag_possible_truncation. This is the number that says a sender
+            # has started emitting frames we cannot trust, so it must not
+            # undercount when several connections are doing it at once.
+            self.framing_error_count += 1
+        digest = hashlib.sha256(raw).hexdigest()
+        control_id = _MALFORMED_PREFIX + digest[:32]
+        payload = self._archivable(raw, digest)
+        archived = False
+        if self._archive_has_room():
+            try:
+                self.store.record_raw(control_id, payload)
+                archived = True
+            except StoreUnavailableError as exc:
+                # Still AR. The alternative is AE, which asks for the redelivery
+                # of bytes that cannot be processed either way.
+                logger.error("Could not archive a malformed frame (%s): %s", control_id, exc)
         logger.error(
-            "Malformed framing (%s); archived as %s and answering AR. Alert: a sender is "
-            "emitting frames this listener cannot trust.", reason, control_id,
+            # "archived as" is a claim about a write that has two ways of not
+            # happening, and an operator who goes looking for a row this line
+            # promised is being sent to the archive by its own alert.
+            "Malformed framing (%s); %s and answering AR. Alert: a sender is "
+            "emitting frames this listener cannot trust.",
+            reason,
+            f"archived as {control_id}" if archived else f"NOT archived ({control_id})",
         )
         # Echo whatever control id is legible, so the engine can correlate the
         # rejection with what it sent. build_ack sanitizes it: the value is

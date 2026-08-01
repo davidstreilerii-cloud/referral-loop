@@ -79,6 +79,27 @@ def sanitize_control_id(control_id: str) -> str:
     return cleaned or "UNKNOWN"
 
 
+def ack_code(ack: str) -> str:
+    """`AA` / `AE` / `AR` from an ACK, or "" if it carries no MSA.
+
+    The inverse of `build_ack`, and here rather than in the listener because
+    both callers are below it: `FileDropSource` decides whether to delete a
+    file on this, and the stream reader decides whether the connection may be
+    read on -- an application-level `AR` desynchronises nothing but must still
+    end the connection, or a rejection costs an attacker nothing to repeat.
+
+    `"|AA|" in ack` is a substring test over attacker-influenced text, because
+    MSA-2 echoes the inbound control id. `sanitize_control_id` makes that safe
+    today; parsing the field the ACK actually means keeps it safe if that ever
+    changes.
+    """
+    for line in ack.replace("\n", "\r").split("\r"):
+        if line.startswith("MSA|"):
+            fields = line.split("|")
+            return fields[1] if len(fields) > 1 else ""
+    return ""
+
+
 def build_ack(control_id: str, code: str, now: datetime | None = None,
               ack_id: str | None = None) -> str:
     """AA = accepted, AE = error (engine queues and retries), AR = rejected.
