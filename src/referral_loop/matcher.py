@@ -213,14 +213,16 @@ def hl7_datetime(raw: str) -> datetime | None:
     across the order and the result, so the window arithmetic (a difference) is
     unaffected as long as the feed is internally consistent.
 
-    **A syntactically valid year is not a real one.** The window is bounded here
-    (`clock.is_readable_clock`) rather than at each caller, because leaving it to
-    callers is precisely what failed: the registry's clinical watermark, the
-    registry's ordering guard and a loop's `ordered_at` each consumed whatever
-    four digits of year could express, and `99991231235959` broke all three in
-    different ways. Enforced by the function making the claim, for the same
-    reason `staleness.require_thresholds_accepted` is called by `is_stale`
-    itself rather than documented as a precondition.
+    **Bounded in the past only** (`clock.is_readable_clock`): a TS from before
+    living memory is a garbled field, and nothing downstream wants to see it.
+
+    A *future* TS is returned as-is, however absurd -- `99991231235959` included.
+    That is not an oversight. `MAX_CLOCK_SKEW` is the single future bound, and
+    the guards that enforce it (`Registry._stamp`, `listener._ordered_at`) can
+    only apply, log and count a skewed timestamp if they are given one. Nulling
+    it here would silently route the loudest case down the "no timestamp at all"
+    path and out of the counters written for it, which is exactly what an
+    earlier version of this function did.
     """
     text = (raw or "").split("~", 1)[0].split("^", 1)[0].strip()
     if not text:
@@ -247,9 +249,9 @@ def hl7_datetime(raw: str) -> datetime | None:
         )
     except ValueError:
         return None
-    # Out of the window is the same answer as unparseable, and for the same
-    # reason: None already means "this timestamp cannot be trusted", and every
-    # caller already has a defined behaviour for it.
+    # Too old to be a clinical event is the same answer as unparseable, and for
+    # the same reason: None already means "this timestamp cannot be trusted".
+    # Note the asymmetry -- a future TS is deliberately let through; see above.
     return parsed if is_readable_clock(parsed) else None
 
 

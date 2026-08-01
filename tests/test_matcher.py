@@ -745,20 +745,24 @@ def test_date_only_timestamp_parses_to_midnight_utc():
 
 
 # ------------------------------------------------ the parse window is bounded
-# Four digits of year is not evidence that a year is real. Every consumer of
-# this function reasons over the number it hands back -- the registry's clinical
-# watermark, the ordering guard, a loop's `ordered_at` -- and each one used to
-# trust whatever a TS could express. The bound lives here, at the function that
-# makes the claim, for the same reason staleness.require_thresholds_accepted is
-# called by is_stale rather than documented as a precondition: three separate
-# callers already forgot.
+# In one direction only, and the asymmetry is the whole point. A timestamp from
+# before living memory has no consumer that wants to see it: the watermark
+# refuses it as stale and staleness ranks it maximally overdue, so nulling it
+# here costs nothing. A *future* one must survive the parse, because the single
+# clock-skew guard downstream is what applies it, declines to trust it, logs it
+# and counts it -- and a parse that nulled it first would hide the anomaly from
+# the very counters that exist to surface it. An earlier draft did exactly that
+# and the year-9999 exploit never reached the counter written for it.
 
 
-def test_a_year_9999_timestamp_is_not_a_readable_clock():
-    """The MSH-7 that poisoned a loop's watermark permanently. The watermark is
-    a max() over an append-only log, so a stamp it should never have taken can
-    never be lowered again and every later message for that loop is refused."""
-    assert hl7_datetime("99991231235959") is None
+def test_a_year_9999_timestamp_parses_so_the_skew_guard_can_count_it():
+    """Not None. `MAX_CLOCK_SKEW` is the one future bound, applied by the one
+    guard, with the one behaviour -- apply the message, refuse to trust its
+    clock, count it. A second bound here would give the same attack two
+    different outcomes depending only on how far ahead it was dated."""
+    assert hl7_datetime("99991231235959") == datetime(
+        9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc
+    )
 
 
 def test_a_timestamp_from_before_living_memory_is_not_a_readable_clock():

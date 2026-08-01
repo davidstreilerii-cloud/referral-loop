@@ -20,26 +20,31 @@ and each produced a distinct clinical failure --
     last on every worklist.
 
 One bug in three places, so the bound is one constant read at every site rather
-than three guards that drift apart. **Two windows**, because those sites ask two
-different questions:
+than three guards that drift apart.
 
-  * `is_readable_clock` -- "is this a timestamp at all?" Wide, and wide in the
-    past on purpose: a prior study's `OBR-7` is legitimately years old and a
-    narrow floor would discard real clinical history. Its only job is to keep a
-    year no clock could produce out of every downstream calculation.
-  * `is_future_dated` -- "may this be trusted as *this message's* clock?"
-    Narrow, because that is the question the watermark and the staleness
-    arithmetic actually ask.
+**Exactly one future bound, with exactly one behaviour.** Anything dated beyond
+`MAX_CLOCK_SKEW` is applied, not trusted, and counted -- whether it is two days
+ahead or in the year 9999. A first version of this module got that wrong in a
+way worth recording, because it is the failure mode the whole file exists to
+prevent: it bounded the *parse* at a year and *trust* at a day, which gave the
+same attack two different outcomes depending only on its magnitude. Skew inside
+the year was applied unstamped and counted; the year-9999 exploit that motivated
+the work was nulled by the parse instead, took a different path entirely, and
+never reached the counter written for it. Two bounds meant the documented policy
+was not the one that ran.
 
-One threshold cannot do both jobs. Narrow enough to protect the watermark
-rejects a decade of legitimate history; wide enough to admit that history leaves
-a year of poison available, and a year of poison is as permanent as a millennium
-of it.
+So `is_readable_clock` deliberately does **not** bound the future. A future
+timestamp has to survive the parse for the guard downstream to see it, decline
+it, log it and count it; nulling it first would hide the anomaly from the very
+counters that exist to surface it.
 
-Only the future is bounded by `MAX_CLOCK_SKEW`. A past-dated message needs no
-bound here because every consumer already fails toward visibility on one: the
-registry refuses it as clinically stale, and staleness ranks it maximally
-overdue -- the top of the worklist, not the bottom.
+The **past** is bounded here, and the asymmetry is deliberate rather than
+overlooked. A timestamp from before living memory has no consumer that wants to
+see it: the registry refuses it as clinically stale and staleness ranks it
+maximally overdue -- the top of the worklist, not the bottom -- so nothing is
+hidden by nulling it, and nothing downstream distinguishes "very old" from
+"merely old" in a way that changes a decision. It is only the future direction
+that poisons a monotonic `max()` and clamps a loop out of sight.
 
 This module imports nothing from the package, so it sits beneath the matcher,
 the registry, the listener and staleness alike and all four read the same number
@@ -56,12 +61,11 @@ from datetime import datetime, timedelta, timezone
 # the smallest skew that made a loop permanently deaf to its own correction.
 MAX_CLOCK_SKEW = timedelta(hours=24)
 
-# The parse window. A century back reaches past any living patient's imaging
-# history, so nothing real is refused; a year forward is longer than any
-# legitimately post-dated clinical event and short enough that year 9999 never
-# reaches a caller.
-_READABLE_PAST = timedelta(days=365 * 100)
-_READABLE_FUTURE = timedelta(days=366)
+# How far back a timestamp may reach and still be a clinical event rather than
+# a garbled field. A century (in Julian years, so the number means what it says)
+# is past any living patient's imaging history, so nothing real is refused.
+# There is no forward counterpart on purpose -- see the module docstring.
+_READABLE_PAST = timedelta(days=36525)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -88,11 +92,14 @@ def is_future_dated(value: datetime, now: datetime | None = None) -> bool:
 
 
 def is_readable_clock(value: datetime, now: datetime | None = None) -> bool:
-    """True when `value` could be a real clinical timestamp at all.
+    """True unless `value` is too old to be a clinical event at all.
 
-    Deliberately not the same question as `is_future_dated`: a timestamp twelve
-    hours ahead is readable and untrusted, and both facts matter to different
-    callers.
+    One-sided, and not the complement of `is_future_dated`. A timestamp twelve
+    hours ahead is readable *and* untrusted; a timestamp in the year 9999 is
+    readable and untrusted too, so that the one guard that acts on skew is the
+    one that sees it. This function's only job is the other end -- keeping a
+    garbled field out of the arithmetic -- and it must never grow a future bound
+    without moving `MAX_CLOCK_SKEW`'s behaviour with it.
     """
     reference = datetime.now(timezone.utc) if now is None else _as_utc(now)
-    return reference - _READABLE_PAST <= _as_utc(value) <= reference + _READABLE_FUTURE
+    return _as_utc(value) >= reference - _READABLE_PAST

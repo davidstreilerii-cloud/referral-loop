@@ -758,16 +758,30 @@ def _control_ids_on(handler, loop_id) -> list[str]:
     return [event.control_id for event in handler.store.events_for(loop_id)]
 
 
-def test_a_year_9999_result_cannot_deafen_a_loop_to_its_own_correction(handler):
-    """H1 on the wire, the clinically severe version.
+def _skewed_msh7(days: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y%m%d%H%M%S")
+
+
+@pytest.mark.parametrize(
+    "poison_at",
+    ["99991231235959", _skewed_msh7(30), _skewed_msh7(2)],
+    ids=["year_9999", "a_month_ahead", "two_days_ahead"],
+)
+def test_a_future_dated_result_cannot_deafen_a_loop_to_its_own_correction(handler, poison_at):
+    """H1 on the wire, the clinically severe version, across the whole band.
 
     An ORU matching at tier 1 -- the placer number the ordering feed already
-    knows -- stamped MSH-7=99991231235959. The watermark is a max() over an
-    append-only log, so once it reads year 9999 every later message for that
-    loop is refused: the final report, the correction, the cancellation. A
-    coordinator acknowledges what looks like a normal final read, the genuine
-    amendment arrives saying the prior read was preliminary, and it is silently
-    refused while the worklist goes on reporting the loop handled.
+    knows -- dated in the future. The watermark is a max() over an append-only
+    log, so once it runs ahead every later message for that loop is refused: the
+    final report, the correction, the cancellation. A coordinator acknowledges
+    what looks like a normal final read, the genuine amendment arrives saying
+    the prior read was preliminary, and it is refused while the worklist goes on
+    reporting the loop handled.
+
+    Parametrised over the magnitude of the skew on purpose. An earlier fix gave
+    year 9999 and `now + 30d` two different code paths -- refuse-message and
+    drop-stamp -- and only the second was documented, so this test passed
+    against a version that still failed for the band it was written to defend.
     """
     handler.handle(order())
     handler.handle(result(control_id="ORU_F", obx11="F", message_at="20260725120000"))
@@ -778,8 +792,7 @@ def test_a_year_9999_result_cannot_deafen_a_loop_to_its_own_correction(handler):
     assert handler.store.replay(loop_id).state is LoopState.ACKNOWLEDGED
 
     handler.handle(
-        result(control_id="ORU_9999", obx11="F", value="poison",
-               message_at="99991231235959")
+        result(control_id="ORU_POISON", obx11="F", value="poison", message_at=poison_at)
     )
     ack = handler.handle(
         result(control_id="ORU_CORR", obx11="C",
@@ -790,8 +803,12 @@ def test_a_year_9999_result_cannot_deafen_a_loop_to_its_own_correction(handler):
     assert ack_code(ack) == "AA"
     applied = _control_ids_on(handler, loop_id)
     assert "ORU_CORR" in applied, "the genuine amendment must be applied, not refused"
-    assert "ORU_9999" not in applied, "and the message that could poison the loop must not be"
-    assert handler.registry._latest_result_status(loop_id) == "C"
+    assert handler.registry._latest_result_status(loop_id) == "C", (
+        "and a read whose clock we refused to trust must not outrank it"
+    )
+    assert handler.registry.future_dated_message_count == 1, (
+        "one policy, one counter, whatever the magnitude of the skew"
+    )
 
     loop = handler.store.replay(loop_id)
     assert loop.state is LoopState.RESULTED
@@ -855,6 +872,10 @@ def test_a_year_2099_order_still_ages_and_can_turn_stale(handler, monkeypatch):
     later = datetime.now(timezone.utc) + timedelta(days=30)
     assert is_stale(loop, later, PACK) is True
     assert staleness_ratio(loop, later, PACK) > 1.0
+    assert handler.future_dated_order_count == 1, (
+        "and the flag the staleness docstring promised must fire for the "
+        "reported OBR-7, not only for skew small enough to survive the parse"
+    )
 
 
 # ------------------------------------------------------------------- MLLP wire

@@ -209,6 +209,14 @@ _MESSAGE_AT = "message_at"
 # on why an identity correction is not a clinical observation.
 _MERGE_MESSAGE_AT = "merge_message_at"
 
+# Marks an event whose MSH-7 was refused as clock-skewed (see _stamp). Records
+# that the *absence* of a stamp here was a decision, not a message that arrived
+# without one -- the two must rank differently in _latest_result_event, because
+# falling back to arrival time for a timestamp we deliberately distrusted lets
+# it outrank every genuine result dated in the past. A bare boolean: it says
+# something about a clock, never about a patient.
+_MESSAGE_AT_UNTRUSTED = "message_at_untrusted"
+
 # Written by any event that supersedes an acknowledgement.
 _CLEARED_ACK = {"ack_by": "", "ack_role": "", "ack_at": ""}
 
@@ -714,6 +722,12 @@ class Registry:
             # acknowledgement on a read that a correction has already replaced.
             # `attached_from` is the exception -- a human's attachment, not a
             # message, carrying no MSH-7 by design (see _refuse_if_stale).
+            # Safe *because* it is unreachable from the wire: attach_orphan is
+            # its only caller, and attach_orphan's only non-test caller is the
+            # coordinator worklist, which binds loopback and validates Host and
+            # Origin. Nothing an interface engine can send sets this. If that
+            # ever stops being true, this exemption has to be revisited, so the
+            # reason is recorded here rather than left to be re-derived.
             self._refuse_if_stale(
                 loop_id, message_at, f"result {obx11!r}",
                 require_message_time=not attached_from,
@@ -1265,9 +1279,16 @@ class Registry:
         half of that. The watermark is a defence, not clinical content: declining
         to advance a defence on untrusted input costs ordering information for
         one message, where refusing the message costs the result itself, and a
-        RIS running fast is endemic rather than exotic. An unstamped event still
-        orders by arrival (see `_latest_result_event`), which is the best
-        evidence a mis-clocked feed offers.
+        RIS running fast is endemic rather than exotic.
+
+        The event is marked `_MESSAGE_AT_UNTRUSTED` rather than merely left bare.
+        An event with no stamp falls back to arrival time in
+        `_latest_result_event`, and arrival is *now* -- later than every
+        legitimately past MSH-7 -- so a distrusted read would otherwise become
+        the loop's newest result permanently: a `P` blocking acknowledgement for
+        good, or an `F` outranking the correction that superseded it. The mark
+        distinguishes "we refused this clock" from "this message carried no
+        clock", which is the difference between the two rankings.
 
         Counted, not merely dropped. A silent drop is how this stayed invisible.
         """
@@ -1281,7 +1302,7 @@ class Registry:
                 "is wrong or a message is forged; both need a human.",
                 control_id, MAX_CLOCK_SKEW, self.future_dated_message_count,
             )
-            return detail
+            return {**detail, _MESSAGE_AT_UNTRUSTED: True}
         return {**detail, _MESSAGE_AT: _as_utc(message_at).isoformat()}
 
     @staticmethod
@@ -1377,6 +1398,18 @@ class Registry:
         is exactly when getting it wrong would let a loop be acknowledged on a
         superseded read, so it is defended here rather than assumed away.
 
+        **An event whose clock this registry refused ranks below every event
+        that has one.** That premise above -- arrival order equals clinical order
+        for anything appended here -- stopped being true the moment `_stamp`
+        began deliberately withholding a stamp: arrival for such an event is
+        *now*, later than every legitimately past MSH-7, so it would win the
+        ranking outright and permanently. A future-dated `P` then blocked
+        acknowledgement of the loop for good ("has no final or corrected
+        result") even after a genuine correction landed, and a future-dated `F`
+        outranked the very correction that superseded it. Ranking it last is not
+        discarding it: it still supplies the status when it is the only result
+        the loop holds, so a mis-clocked feed still reaches a queue.
+
         `unmatched` is deliberately NOT a result event, even though it is what a
         detachment writes. Its timestamp is a human's clock and every other key
         here is a message's, and mixing the two would let a coordinator's undo
@@ -1389,7 +1422,10 @@ class Registry:
         for index, event in enumerate(self.store.events_for(loop_id)):
             if event.event_type not in _RESULT_EVENTS:
                 continue
-            key = (self._message_time(event) or _as_utc(event.occurred_at), index)
+            # Leading flag, so a distrusted clock loses to any trusted one
+            # before the times are compared at all. False sorts below True.
+            trusted = not event.detail.get(_MESSAGE_AT_UNTRUSTED)
+            key = (trusted, self._message_time(event) or _as_utc(event.occurred_at), index)
             if best_key is None or key > best_key:
                 best_key = key
                 best = event

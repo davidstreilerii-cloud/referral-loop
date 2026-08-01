@@ -471,6 +471,53 @@ def test_an_unstamped_result_cannot_regress_a_watermarked_loop(registry):
     assert registry._latest_result_status(loop_id) == "C"
 
 
+def test_a_future_dated_preliminary_cannot_block_acknowledgement_forever(registry):
+    """The drop-stamp band's own hole, one layer over from the watermark.
+
+    `_latest_result_event` keyed an unstamped event on `occurred_at` -- arrival,
+    i.e. now -- which beats every legitimately past MSH-7. So a `P` dated
+    `now + 30d` became the loop's newest read permanently and `acknowledge`
+    refused with "has no final or corrected result" *even after* a genuine
+    correction arrived. The fallback's own justification was that arrival order
+    equals clinical order for anything this registry appends; that stopped being
+    true for exactly the events it deliberately refuses to stamp.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="P", control_id="C2", message_at=_beyond_skew())
+    registry.record_result(loop_id, obx11="C", control_id="C3", message_at=T2)
+
+    assert registry._latest_result_status(loop_id) == "C"
+    registry.acknowledge(loop_id, actor="coord1", role="coordinator", control_id="C4")
+    assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+
+
+def test_a_future_dated_final_does_not_outrank_a_genuine_correction(registry, store):
+    """The same inversion, costing the audit its answer: the acknowledgement
+    would record `ack_result_status` as the untrusted `F` rather than the `C` a
+    coordinator was actually looking at."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=_beyond_skew())
+    registry.record_result(loop_id, obx11="C", control_id="C3", message_at=T2)
+    registry.acknowledge(loop_id, actor="coord1", role="coordinator", control_id="C4")
+
+    acked = [e for e in store.events_for(loop_id) if e.event_type == "acknowledged"]
+    assert acked[0].detail["ack_result_status"] == "C"
+
+
+def test_a_message_dated_beyond_every_bound_takes_the_same_path_as_ordinary_skew(registry):
+    """One future bound, one behaviour. An earlier draft bounded the *parse* at
+    a year and *trust* at a day, so the year-9999 exploit that motivated the fix
+    took the refuse-message path while the documented drop-stamp path -- and its
+    counter -- never saw it."""
+    loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
+    far = datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    registry.record_result(loop_id, obx11="F", control_id="C2", message_at=far)
+
+    assert registry.get(loop_id).state is LoopState.RESULTED
+    assert registry._clinical_watermark(loop_id) == T0
+    assert registry.future_dated_message_count == 1
+
+
 def test_an_unstamped_attachment_is_not_refused(registry):
     """A coordinator attaching an orphan is a human decision routed through
     record_result, not a replayed message, and it carries no MSH-7 for the same
