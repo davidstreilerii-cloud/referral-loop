@@ -612,6 +612,36 @@ def test_listen_mode_carries_message_at_from_msh7_to_the_registry(tmp_path, good
     )
 
 
+def test_listen_mode_refuses_to_start_with_no_transport_policy(tmp_path, good_env, capsys):
+    """mTLS by default means listen mode has no default at all.
+
+    Neither --peers nor --allow-plaintext is a refusal, not a quiet fallback to
+    an unauthenticated listener. Every other listen test in this module passes
+    --allow-plaintext, so without this one the refusal branch is the only path
+    through `_peer_registry` that nothing exercises -- and it is the one that
+    decides whether a site can start a PHI-bearing port by accident.
+    """
+    code = main(["listen", "--db", str(tmp_path / "loops.db"),
+                 "--pack-dir", str(SHIPPED_PACK_DIR)])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "--peers" in err and "--allow-plaintext" in err
+    assert "Traceback" not in err
+
+
+def test_listen_mode_refuses_a_peer_registry_that_is_not_there(tmp_path, good_env, capsys):
+    """A typo'd --peers must not fall through to an unauthenticated listener."""
+    code = main(["listen", "--peers", str(tmp_path / "nope.json"),
+                 "--db", str(tmp_path / "loops.db"),
+                 "--pack-dir", str(SHIPPED_PACK_DIR)])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "peer registry" in err
+    assert "Traceback" not in err
+
+
 def test_listen_mode_binds_the_host_it_was_given(tmp_path, good_env):
     port = _free_port()
     argv = ["listen", "--allow-plaintext", "--port", str(port), "--db", str(tmp_path / "loops.db"),

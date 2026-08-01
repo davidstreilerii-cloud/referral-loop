@@ -52,6 +52,15 @@ too, where the peer is only an allowlisted source address.
 from `attributed()` rather than passed in by each caller, so a transition
 recorded by a code path nobody has written yet is still attributed.
 
+The scoping has a cost worth stating plainly, because it is a behaviour change
+and not only a defence: **the file drop and the MLLP wire are different scopes.**
+A message that arrived over a socket and is then re-dropped as a file is archived
+twice and applied twice, where before it deduped. That is the correct direction
+for an archive -- the alternative is one peer's control id silencing another's --
+but a site replaying captured traffic through the drop directory will see the
+transitions repeat, and should replay into a scratch database rather than the
+live one.
+
 Databases written before this existed are migrated in place on open: the two
 tables are rebuilt with the wider key and their existing rows land in the
 reserved `unattributed` scope. Reads consult that scope alongside the caller's
@@ -85,7 +94,7 @@ from .events import (
     LoopEvent,
     LoopState,
 )
-from .peers import LOCAL, UNATTRIBUTED
+from .peers import COORDINATOR, LOCAL, UNATTRIBUTED
 
 logger = logging.getLogger(__name__)
 
@@ -676,6 +685,33 @@ def _widen_key(conn: sqlite3.Connection, table: str, peer_column: str, ddl: str,
     )
 
 
+def _refuse_stranded(conn: sqlite3.Connection) -> None:
+    """Refuse to open a database still holding a rebuild's aside table.
+
+    The transaction below means this cannot happen, which is exactly why it is
+    checked: if one is ever on disk, the migration has already been skipped --
+    the live table now has its peer column, so `_migrate` looks at it and moves
+    on -- and the rows in the aside copy are invisible to every query in this
+    module, forever.
+
+    Failing loudly here is the difference between an operator who restores a
+    backup and an operator who reads `raw_count() == 0` as a quiet week. The
+    message names the table, because the rows are still in it and a human with
+    the file can get them back.
+    """
+    for table, *_rest in _PEER_SCOPED_TABLES:
+        legacy = f"{table}__legacy"
+        if _table_exists(conn, legacy):
+            raise StoreUnavailableError(
+                f"Refusing to open this database: it holds {legacy}, which is the aside "
+                f"copy a peer-scoping migration makes and then drops. Its rows are NOT "
+                f"visible to this application and {table} may be missing them. The "
+                "migration is transactional, so seeing this means the file was edited "
+                "outside this module or restored mid-rebuild. Recover the rows from "
+                f"{legacy} before starting the listener."
+            )
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing database up to the peer-scoped schema, or do nothing.
 
@@ -683,11 +719,55 @@ def _migrate(conn: sqlite3.Connection) -> None:
     `applied_messages(peer_id, content_key)`, and that column has to exist by
     then. A database that does not have the tables at all is left alone -- the
     script is about to create them in their current shape.
+
+    **One transaction over the whole rebuild, explicitly begun.** This is not
+    belt and braces; without it the rebuild had no boundary at all. Python's
+    sqlite3 under legacy transaction control opens a transaction before *DML*,
+    and the first three statements `_widen_key` issues -- `DROP TRIGGER`,
+    `ALTER TABLE ... RENAME`, `CREATE TABLE` -- are none of them DML. Each one
+    therefore committed on its own. A process killed between the copy and the
+    commit left a durably renamed aside table, a durably created empty
+    `raw_messages`, and a reopen that *succeeded* and reported `raw_count() ==
+    0`: an append-only archive of clinical messages emptied silently and
+    permanently, over a window as wide as an `INSERT ... SELECT` across the
+    whole archive. Measured with a real `os._exit`, at three kill points, in
+    `test_a_process_killed_mid_migration_leaves_the_archive_intact`.
+
+    The same defect had a second face: `DROP TRIGGER` committing on its own left
+    a durable window in which `raw_messages` and `applied_messages` carried no
+    append-only guard, which is precisely the operation `_purge_guards` refuses
+    when a purge asks for it.
+
+    `BEGIN IMMEDIATE` rather than a deferred `BEGIN`: this takes the write lock
+    up front, so a second process opening the same file loses the race here
+    rather than partway through rebuilding the same two tables. SQLite's DDL is
+    transactional, so every statement above rolls back together, and an explicit
+    `BEGIN` does not double-open -- pysqlite only issues its own when SQLite is
+    still in autocommit.
     """
-    for table, peer_column, ddl, triggers, carried in _PEER_SCOPED_TABLES:
-        if _table_exists(conn, table) and peer_column not in _column_names(conn, table):
+    _refuse_stranded(conn)
+    pending = [
+        row for row in _PEER_SCOPED_TABLES
+        if _table_exists(conn, row[0]) and row[1] not in _column_names(conn, row[0])
+    ]
+    if not pending:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, peer_column, ddl, triggers, carried in pending:
             _widen_key(conn, table, peer_column, ddl, triggers, carried)
-    conn.commit()
+        # The triggers `_widen_key` took off are recreated by `_SCHEMA`, which
+        # runs after this commit. They are dropped and restored in two
+        # transactions and that is unavoidable -- but the window between them is
+        # in-process and crosses no I/O, where the window this replaces was
+        # durable and unbounded.
+        conn.commit()
+    except BaseException:
+        # Including KeyboardInterrupt and SystemExit. A rebuild half-applied is
+        # the failure this whole method is about, and an interrupt is not a
+        # reason to leave one behind.
+        conn.rollback()
+        raise
 
 
 class LoopStore:
@@ -1077,14 +1157,17 @@ class LoopStore:
         here -- and "the transport's answer overrides the message's" is the rule
         this whole change is about, so it is the rule the merge follows too.
 
-        Absent outside the ingest path. A coordinator's acknowledgement is
-        attributed by `audit.py`'s actor and by the `ack_by` on the loop; there
-        is no peer behind it, and writing one would be a claim about a transport
-        that was not involved.
+        Outside the ingest path the key is still written, as the reserved
+        `coordinator`. No peer was involved -- a worklist action is attributed by
+        `audit.py`'s actor and by `ack_by` on the loop -- but leaving the field
+        off would give its absence two meanings: "a human did this" and "an
+        ingest path failed to attribute it". Those need telling apart by anyone
+        reading the log afterwards, and a field that is always present is the
+        only version of this that can be checked rather than trusted.
         """
         attribution = _attribution.get()
         if attribution is None:
-            return detail
+            return {**detail, "assertion_source": COORDINATOR}
         return {**detail, **attribution.as_detail()}
 
     @staticmethod

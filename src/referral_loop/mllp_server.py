@@ -246,8 +246,11 @@ class _PeerLedger:
     `count += 1` on a shared attribute is a load, an add and a store, and a
     connection cap that loses increments is not a cap.
 
-    Keyed on the source address, which is all the peer identity this listener
-    has (see the module docstring). Rejection timestamps are pruned on every
+    Keyed on the source address. That is no longer all the identity this
+    listener has -- connections are authenticated and resolve to a peer -- but
+    it is all the identity available at the moment these budgets are spent, and
+    a client that fails authentication never acquires one. See the module
+    docstring for why they stay here. Rejection timestamps are pruned on every
     admission, so the table holds only peers that misbehaved inside the window
     rather than growing with every address ever seen.
     """

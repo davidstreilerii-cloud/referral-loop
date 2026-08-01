@@ -29,8 +29,9 @@ cost is that a renewal is a configuration change, which is why a peer may list
 several fingerprints: a rotation is the window in which both are present, and it
 closes when the old one is removed rather than whenever a certificate expires.
 
-**Authorities are granted, never inferred.** Two of them, and the line between
-what needs one and what does not is what a refusal would cost:
+**Authorities are granted, never inferred.** Three of them, and the line
+between what needs one and what does not is a single question: can this message
+end with a clinically open loop no longer on anybody's queue?
 
   * `merge` -- `ADT^A40` relinks two charts and re-points every future message
     for the retired identifier. Nothing else in the subsystem changes who a
@@ -38,12 +39,26 @@ what needs one and what does not is what a refusal would cost:
   * `cancel` -- `SIU^S15` puts a loop in `CANCELLED`, which appears in neither
     `open_loops()` nor `resulted_unacknowledged()`, so a clinically open loop
     leaves every coordinator queue while still waiting on a result.
+  * `result` -- `ORU^R01` with `OBX-11 = F` moves a loop to `RESULTED` and makes
+    it acknowledgeable. This one was argued the other way first, and the
+    argument was wrong. A result looked additive: it puts something *on* a
+    queue, it is visible, and `undo_match` reverses it with a label. But the
+    reversal depends on somebody noticing, and the thing that happens next is a
+    coordinator acknowledging it -- at which point the loop closes and the
+    patient's genuinely pending finding reads as handled. The record leaves the
+    queue exactly as it does under `cancel`; it just goes through a human who
+    has no way to tell. A consequence one step further away is still the
+    consequence.
 
-Orders, schedules and results carry no authority of their own. They are
-additive: an order opens a loop, a result attaches or lands in the orphan queue,
-and a coordinator can undo either from the worklist with a label recorded. A
-peer that may send those *is* the clinical feed. The two above are the ones that
-make a record disappear, and a results-only feed has no business holding either.
+Orders and schedules carry no authority. Both are strictly additive -- an order
+opens a loop, a schedule attaches an appointment to one that is already open --
+and neither can retire anything. A peer that may send those *is* the clinical
+feed, and gating them would be a line in every registry entry that never refused
+anything.
+
+The cost of the three is one line per peer in a configuration file, and what it
+buys is that a scheduling feed cannot result, a results feed cannot cancel, and
+neither can merge. That is the whole of least privilege here.
 
 **Plaintext is an opt-out and is built to look like one.** `PeerRegistry`
 refuses to be constructed for a plaintext listener unless the configuration says
@@ -73,7 +88,8 @@ logger = logging.getLogger(__name__)
 # one in a config file is a refused boot rather than a silently ignored line.
 MERGE = "merge"
 CANCEL = "cancel"
-AUTHORITIES = frozenset({MERGE, CANCEL})
+RESULT = "result"
+AUTHORITIES = frozenset({MERGE, CANCEL, RESULT})
 
 TRANSPORT_MTLS = "mtls"
 TRANSPORT_PLAINTEXT = "plaintext"
@@ -88,7 +104,16 @@ UNATTRIBUTED = "unattributed"
 LOCAL = "local"
 FILEDROP = "filedrop"
 PLAINTEXT_LOOPBACK = "plaintext-loopback"
-RESERVED_PEER_IDS = frozenset({UNATTRIBUTED, LOCAL, FILEDROP, PLAINTEXT_LOOPBACK})
+# Not a peer and never resolved from a connection: the value `loop_events`
+# carries when no message asserted the transition at all -- a coordinator
+# acknowledging, dismissing, attaching or undoing from the worklist. It exists
+# so `assertion_source` is always present. Absent-meaning-human and
+# absent-meaning-an-ingest-path-forgot are indistinguishable in an append-only
+# log, and a provenance field with two meanings for its own absence is not one.
+COORDINATOR = "coordinator"
+RESERVED_PEER_IDS = frozenset(
+    {UNATTRIBUTED, LOCAL, FILEDROP, PLAINTEXT_LOOPBACK, COORDINATOR}
+)
 
 # A peer id is written into two database columns, into every log line about the
 # peer, and into an audit row's resource_id. Constrained here so none of those
@@ -540,11 +565,13 @@ def load_peer_registry(path: Path | str) -> PeerRegistry:
 __all__ = [
     "AUTHORITIES",
     "CANCEL",
+    "COORDINATOR",
     "FILEDROP",
     "FILEDROP_PEER",
     "LOCAL",
     "LOCAL_PEER",
     "MERGE",
+    "RESULT",
     "PLAINTEXT_LOOPBACK",
     "PLAINTEXT_LOOPBACK_PEER",
     "RESERVED_PEER_IDS",

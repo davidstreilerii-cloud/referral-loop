@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import socket
 import ssl
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from healthcare_rag.referral_loop import audit
-from healthcare_rag.referral_loop.errors import ReferralLoopError
+from healthcare_rag.referral_loop.errors import ReferralLoopError, StoreUnavailableError
 from healthcare_rag.referral_loop.events import LoopState
 from healthcare_rag.referral_loop.listener import FileDropSource, MessageHandler
 from healthcare_rag.referral_loop.mllp import CR, FS, frame
@@ -40,6 +41,8 @@ from healthcare_rag.referral_loop.mllp_server import make_mllp_server
 from healthcare_rag.referral_loop.peers import (
     CANCEL,
     MERGE,
+    PLAINTEXT_LOOPBACK_PEER,
+    RESULT,
     UNATTRIBUTED,
     PeerIdentity,
     PeerRegistry,
@@ -60,6 +63,8 @@ from tests.referral_loop.test_listener import (
     scheduling,
 )
 from tests.referral_loop.test_matcher import PACK
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 SYNTHETIC = "SYNTHETIC-TEST-ONLY-DO-NOT-TRUST"
 
@@ -201,7 +206,7 @@ def _registry_mapping(pki: Pki) -> dict:
                 "certificate_sha256": [pki.ris.fingerprint],
                 "sending_application": "EHR",
                 "sending_facility": "HOSP",
-                "authorities": [MERGE, CANCEL],
+                "authorities": [MERGE, CANCEL, RESULT],
             },
             {
                 "peer_id": LAB,
@@ -481,17 +486,58 @@ def test_an_unregistered_certificate_never_gets_to_send_a_message(handler, pki, 
     assert handler.store.applied_count() == 1, "only the engine's order was applied"
 
 
-def test_a_certificate_from_another_ca_cannot_complete_the_handshake(handler, pki, peers):
-    """Same subject, same common name, different issuer. CERT_REQUIRED against
-    a pinned CA file is what makes the fingerprint pin meaningful: without it an
-    attacker would only need to mint a certificate naming itself."""
+def test_a_certificate_from_another_ca_is_refused_at_the_handshake(handler, pki, peers,
+                                                                   caplog):
+    """Same subject, same common name, different issuer -- refused by the CA check.
+
+    The log assertion is the test. Asserting only "no AA" was green when the
+    reviewer added the foreign root to `load_verify_locations`, because the
+    fingerprint pin declined it one layer later: the test passed while the claim
+    in its own docstring was false. Which layer refuses is the difference
+    between "this listener trusts one CA" and "this listener trusts any CA and
+    then checks a list", and only the first of those is what `CERT_REQUIRED`
+    against a pinned file buys.
+    """
     forged = client_context(pki, pki.foreign, ca=pki.ca)
     forged.load_cert_chain(str(pki.foreign.cert), str(pki.foreign.key))
 
-    with serving(handler, peers) as address:
-        assert refused(address, order(control_id="ORM_1"), forged)
+    with caplog.at_level("INFO"):
+        with serving(handler, peers) as address:
+            assert refused(address, order(control_id="ORM_1"), forged)
 
+    assert "TLS handshake with 127.0.0.1 failed" in caplog.text
+    assert "maps to a peer" not in caplog.text, (
+        "the certificate completed a handshake and was declined by the fingerprint pin "
+        "instead, so this listener is trusting an issuer it was never given"
+    )
     assert handler.store.raw_count() == 0
+
+
+def test_the_server_trusts_exactly_the_configured_ca_and_nothing_else(pki, peers):
+    """The other half of the same claim, and the half no wire test can show here.
+
+    A behavioural test would need a certificate that verifies under the
+    *system* truststore, and this fixture cannot mint one -- both of its roots
+    are synthetic and neither is installed anywhere. So the claim "pinned client
+    CA only, not the system truststore" is asserted against the context object
+    directly: the set of CAs it will accept must be exactly the one file the
+    registry named.
+
+    Not a tautology, and it fails on the mutation that matters: an
+    `SSLContext` that had also called `load_default_certs()` -- the one-line
+    change that would silently make every public CA able to mint an interface
+    engine for this listener -- returns hundreds of certificates here instead of
+    one.
+    """
+    trusted = peers.tls_context().get_ca_certs()
+
+    assert len(trusted) == 1, (
+        f"the listener trusts {len(trusted)} certificate authorities; it was configured "
+        "with one, and every extra one is an issuer that can mint a peer"
+    )
+    subject = dict(pair for rdn in trusted[0]["subject"] for pair in rdn)
+    assert subject["organizationName"] == SYNTHETIC
+    assert subject["commonName"] == f"{SYNTHETIC} root"
 
 
 def test_a_client_offering_no_certificate_is_refused_at_the_handshake(handler, pki, peers,
@@ -530,6 +576,47 @@ def test_a_plaintext_client_gets_nothing_from_an_mtls_listener(handler, pki, pee
             raw.close()
 
     assert handler.store.raw_count() == 0
+
+
+def test_a_registered_peer_without_result_authority_cannot_result_another_feeds_loop(
+    handler, pki, peers,
+):
+    """Exploit 4, closed rather than narrowed.
+
+    The first version of this fix left `ORU^R01` ungated, on the reasoning that
+    a result is additive and reversible from the worklist. Measured, that left
+    any peer holding any certificate able to move another feed's loop to
+    RESULTED with `OBX-11 = F`. The reversibility argument does not survive the
+    next step: a RESULTED loop is acknowledgeable, a coordinator acknowledges
+    it, and the loop closes over a finding that never arrived -- the record
+    leaves the queue exactly as it does under a cancellation, via a human who
+    has no way to tell.
+    """
+    engine = client_context(pki, pki.ris)
+    lab = client_context(pki, pki.lab)
+
+    with serving(handler, peers) as address:
+        deliver(address, order(control_id="ORM_1"), engine)
+        ack = deliver(address, result(control_id="ORU_1", obx11="F"), lab)
+
+    assert "|AA|" in ack
+    assert loops_of(handler)[0].state is LoopState.OPEN, (
+        "a peer granted no authorities resulted a loop belonging to another feed"
+    )
+    assert handler.unauthorized_result_count == 1
+
+
+def test_the_feed_that_holds_result_authority_still_results_its_own_loops(handler, pki,
+                                                                          peers):
+    """The gate is least privilege, not a wall. The clinical feed still works."""
+    engine = client_context(pki, pki.ris)
+
+    with serving(handler, peers) as address:
+        deliver(address, order(control_id="ORM_1"), engine)
+        deliver(address, result(control_id="ORU_1", obx11="F"), engine)
+
+    assert loops_of(handler)[0].state is LoopState.RESULTED
+    assert handler.unauthorized_result_count == 0
 
 
 # ================================================= assertion source and MSH claims
@@ -594,6 +681,31 @@ def test_a_peer_that_declares_no_facility_is_not_cross_checked(handler, pki, pee
 
     assert len(loops_of(handler)) == 1
     assert handler.peer_claim_mismatch_count == 0
+
+
+def test_every_event_says_who_asserted_it_including_the_ones_no_message_did(handler, pki,
+                                                                            peers):
+    """`assertion_source` is present on every event, never merely usually.
+
+    A coordinator's acknowledgement carries the reserved `coordinator` rather
+    than no key at all. Written down because the alternative gives the field's
+    absence two meanings -- "a human did this" and "an ingest path forgot to
+    attribute it" -- which are indistinguishable afterwards in an append-only
+    log, and the second is the failure this whole change is about.
+    """
+    engine = client_context(pki, pki.ris)
+    with serving(handler, peers) as address:
+        deliver(address, order(control_id="ORM_1"), engine)
+        deliver(address, result(control_id="ORU_1", obx11="F"), engine)
+
+    loop_id = loops_of(handler)[0].loop_id
+    handler.registry.acknowledge(loop_id, actor="A. Coordinator", role="rn",
+                                 control_id="ACK_1")
+
+    events = handler.store.events_for(loop_id)
+    sources = {e.event_type: e.detail.get("assertion_source") for e in events}
+    assert sources == {"created": RIS, "resulted": RIS, "acknowledged": "coordinator"}
+    assert all("assertion_source" in e.detail for e in events)
 
 
 # ============================================================== transport policy
@@ -663,6 +775,26 @@ def test_the_plaintext_opt_in_warns_every_time_a_listener_starts(handler, caplog
     )
     assert "plaintext" in warnings.lower()
     assert "not authenticated" in warnings.lower()
+
+
+def test_the_loopback_opt_in_grants_every_authority_and_says_so(handler, pki):
+    """The documented cost of opting out, asserted so it stays documented.
+
+    `PLAINTEXT_LOOPBACK_PEER` holds merge, cancel and result, so exploits 2, 3
+    and 4 are open to anything that can reach loopback under
+    `--allow-plaintext`. That is the honest encoding -- such a caller can also
+    write the drop directory and the database file -- but it is the posture
+    every `test_boot_gates` listen test runs under, so it is written down here
+    rather than left to be rediscovered.
+    """
+    assert PLAINTEXT_LOOPBACK_PEER.authorities == frozenset({MERGE, CANCEL, RESULT})
+
+    registry = PeerRegistry.plaintext_loopback()
+    with serving(handler, registry) as address:
+        assert "|AA|" in deliver(
+            address, merge("A40_1", prior=MRN, surviving=SURVIVING_MRN)
+        )
+    assert handler.store.resolve_mrn(MRN) == SURVIVING_MRN
 
 
 def test_the_loopback_opt_in_attributes_messages_to_one_named_peer(handler):
@@ -778,6 +910,155 @@ def test_a_database_written_before_this_change_still_opens_and_dedups(tmp_path):
     assert store.control_id_applied("OLD_1", peer_id=RIS) is True
     assert store.content_key_owner("old-content", peer_id=RIS) == "OLD_1"
     assert store.record_applied("NEW_1", "new-content", "ORU^R01", peer_id=RIS) is True
+
+
+def _legacy_database(path, *, raw_rows=2) -> None:
+    """A database in the shape this subsystem shipped before peer scoping."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE raw_messages (
+            control_id TEXT PRIMARY KEY, payload TEXT NOT NULL, received_at TEXT NOT NULL);
+        CREATE TABLE applied_messages (
+            control_id TEXT PRIMARY KEY, content_key TEXT,
+            message_type TEXT NOT NULL DEFAULT '', applied_at TEXT NOT NULL);
+        CREATE TRIGGER raw_messages_no_delete BEFORE DELETE ON raw_messages
+        BEGIN SELECT RAISE(ABORT, 'raw_messages is append-only'); END;
+        CREATE TRIGGER raw_messages_no_update BEFORE UPDATE ON raw_messages
+        BEGIN SELECT RAISE(ABORT, 'raw_messages is append-only'); END;
+        """
+    )
+    for index in range(raw_rows):
+        conn.execute(
+            "INSERT INTO raw_messages VALUES (?, ?, ?)",
+            (f"OLD_{index}", f"MSH|archived clinical message {index}",
+             "2026-01-01T00:00:00+00:00"),
+        )
+    conn.commit()
+    conn.close()
+
+
+# The child process for the crash test. Opens the store -- which runs the
+# migration -- and dies with `os._exit` partway through it, so no `finally`, no
+# atexit hook and no SQLite cleanup runs. That is the distinction that matters:
+# an in-process `raise` would let the connection close normally and roll back
+# for reasons the real failure would not supply.
+_CRASH_SCRIPT = """
+import os, sqlite3, sys
+sys.path.insert(0, {repo!r})
+
+# sqlite3.Connection is an immutable type, so the seam is a connection factory
+# rather than a patched method.
+class Dying(sqlite3.Connection):
+    def execute(self, sql, *args, **kwargs):
+        if sql.strip().upper().startswith({trigger!r}):
+            os._exit(7)
+        return super().execute(sql, *args, **kwargs)
+
+_real_connect = sqlite3.connect
+sqlite3.connect = lambda *a, **k: _real_connect(*a, **{{**k, "factory": Dying}})
+
+from healthcare_rag.referral_loop.store import LoopStore
+LoopStore({db!r})
+print("SURVIVED")
+"""
+
+
+def _crash_during_migration(tmp_path, db_path, trigger_sql: str):
+    import subprocess
+
+    script = tmp_path / "crash.py"
+    script.write_text(
+        _CRASH_SCRIPT.format(repo=str(REPO_ROOT), db=str(db_path), trigger=trigger_sql),
+        encoding="utf-8",
+    )
+    return subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          timeout=120)
+
+
+@pytest.mark.parametrize(
+    "trigger_sql",
+    ["ALTER TABLE RAW_MESSAGES", "INSERT INTO RAW_MESSAGES", "DROP TABLE RAW_MESSAGES__LEGACY"],
+)
+def test_a_process_killed_mid_migration_leaves_the_archive_intact(tmp_path, trigger_sql):
+    """The migration rebuilds an append-only PHI archive. It must be atomic.
+
+    Measured, not assumed: without an explicit transaction, `DROP TRIGGER`,
+    `ALTER TABLE ... RENAME` and `CREATE TABLE` each committed on their own --
+    Python's sqlite3 opens a transaction before DML, and none of those three is
+    DML. A process killed after the copy and before the commit therefore left a
+    durably renamed `raw_messages__legacy`, a durably created empty
+    `raw_messages`, and a reopen that *succeeded*, reported `raw_count() == 0`
+    and never looked at the aside table again. An append-only archive of
+    clinical messages, emptied silently and permanently, with the operator's
+    only signal a row count they have no baseline for.
+
+    Three kill points, one per phase the rebuild passes through, because the
+    interesting failure is not any single statement -- it is that the sequence
+    has no boundary. The second one is the whole `INSERT ... SELECT` over the
+    archive, which on a real site is the widest window of the three.
+    """
+    db_path = tmp_path / "legacy.db"
+    _legacy_database(db_path)
+
+    proc = _crash_during_migration(tmp_path, db_path, trigger_sql)
+    assert proc.returncode == 7, (
+        f"the child was expected to die at {trigger_sql!r}; it said {proc.stdout!r} "
+        f"{proc.stderr!r}"
+    )
+
+    # Before anything reopens it: the file on disk must still be a database
+    # nothing can delete from. `DROP TRIGGER` is the first statement the rebuild
+    # issues, and outside a transaction it committed on its own -- leaving a
+    # durable window in which the archive carried no append-only guard at all.
+    # That is the operation shape `_purge_guards` exists to refuse, arriving
+    # through a migration instead of a purge.
+    import sqlite3
+
+    inspect = sqlite3.connect(db_path)
+    try:
+        armed = {name for (name,) in inspect.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+    finally:
+        inspect.close()
+    assert {"raw_messages_no_delete", "raw_messages_no_update"} <= armed, (
+        f"the crash left the archive without its append-only triggers: {sorted(armed)}"
+    )
+
+    # Reopening runs the migration again, from the top, on an unchanged database.
+    store = LoopStore(db_path)
+    assert store.raw_count() == 2, (
+        "archived clinical messages did not survive a crash during the migration"
+    )
+    assert store.assertion_sources() == [UNATTRIBUTED]
+    assert sorted(r["control_id"] for r in store._read(
+        "SELECT control_id FROM raw_messages")) == ["OLD_0", "OLD_1"]
+
+
+def test_a_stranded_legacy_table_refuses_the_boot_rather_than_reporting_an_empty_archive(
+    tmp_path,
+):
+    """The last line of defence behind the transaction above.
+
+    If a `*__legacy` table is ever on disk, some archive rows are in it and
+    `_migrate` will not look: the live table now has the peer column, so the
+    migration is skipped and the rows are invisible forever. Refusing the boot
+    and naming the table is the difference between an operator who restores a
+    backup and an operator who reads `raw_count() == 0` as a quiet week.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "stranded.db"
+    LoopStore(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE raw_messages__legacy (control_id TEXT)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(StoreUnavailableError, match="raw_messages__legacy"):
+        LoopStore(db_path)
 
 
 def test_an_upgraded_database_keeps_its_append_only_triggers(tmp_path):

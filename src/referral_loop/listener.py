@@ -66,13 +66,14 @@ caller is. Three things follow from it and none of them is optional:
      primary key and anyone who could deliver a message could claim the id a
      real feed was about to use, which answered the genuine result `AA` and
      dropped it.
-  2. **Destructive transitions need an authority.** `ADT^A40` relinks two
-     charts; `SIU^S15` removes a clinically open loop from every worklist. Both
-     are refused unless the registry granted the peer that authority by name,
-     and the refusal is `AA` -- the message is well formed and will never become
-     acceptable from this peer, so asking the engine to retry it forever helps
-     nobody -- plus a counter, an ERROR line and a row in the immutable audit
-     trail.
+  2. **Three message types need an authority.** `ADT^A40` relinks two charts;
+     `SIU^S15` removes a clinically open loop from every worklist; `ORU^R01`
+     marks one RESULTED and acknowledgeable, so a coordinator closes it and a
+     genuinely pending finding reads as handled. Each is refused unless the
+     registry granted the peer that authority by name, and the refusal is `AA`
+     -- the message is well formed and will never become acceptable from this
+     peer, so asking the engine to retry it forever helps nobody -- plus a
+     counter, an ERROR line and a row in the immutable audit trail.
   3. **`MSH-3`/`MSH-4` are claims, not identity.** They are recorded on the
      event beside `assertion_source`, and where the registry says what a peer
      sends, a message contradicting it produces no transition. A self-asserted
@@ -135,7 +136,7 @@ from .parse_hl7 import (
     structural_fault,
 )
 from .peers import (
-    CANCEL, FILEDROP_PEER, LOCAL_PEER, MERGE, TRANSPORT_IN_PROCESS, PeerIdentity,
+    CANCEL, FILEDROP_PEER, LOCAL_PEER, MERGE, RESULT, TRANSPORT_IN_PROCESS, PeerIdentity,
 )
 from .registry import CORRECTED, FINAL, PRELIMINARY, Registry
 from .store import Attribution, LoopStore, attributed
@@ -175,12 +176,24 @@ _ORDER_CONTROL_REF = f"ORC-{ORC_ORDER_CONTROL}"
 _SENDING_APPLICATION_REF = f"MSH-{MSH_SENDING_APPLICATION}.1"
 _SENDING_FACILITY_REF = f"MSH-{MSH_SENDING_FACILITY}.1"
 
-# The message types whose refusal costs a peer an authority it was not granted.
-# Both make a record leave every coordinator queue -- one by re-pointing it at
-# another chart, one by retiring it while it is still clinically open. Orders,
-# schedules and results are additive and recoverable from the worklist, so they
-# carry no authority of their own; see peers.py for the full argument.
-_AUTHORITY_REQUIRED = {MERGE_TYPE: MERGE, CANCEL_TYPE: CANCEL}
+# The message types that need an authority named in the peer registry. All three
+# can end with a clinically open loop on nobody's queue: a merge re-points it at
+# another chart, a cancellation retires it outright, and a result marks it
+# RESULTED and acknowledgeable -- after which a coordinator closes it and the
+# patient's genuinely pending finding reads as handled. Orders and schedules are
+# strictly additive and carry no authority. See peers.py for the full argument,
+# including why `result` was argued the other way first and why that was wrong.
+_AUTHORITY_REQUIRED = {MERGE_TYPE: MERGE, CANCEL_TYPE: CANCEL, RESULT_TYPE: RESULT}
+
+# Which counter a refused authority increments. A dict rather than a branch: a
+# fourth authority added to the table above without a number here would be
+# refused correctly and counted as nothing, and the counters are how an operator
+# sees any of this happening at all.
+_AUTHORITY_COUNTER = {
+    MERGE: "unauthorized_merge_count",
+    CANCEL: "unauthorized_cancel_count",
+    RESULT: "unauthorized_result_count",
+}
 
 # Version tag inside the content key. A change to what the key hashes over must
 # not silently make every message in flight look new *or* look like a duplicate
@@ -413,11 +426,13 @@ class MessageHandler:
         # reasons.
         self.archive_throttled_count = 0
         # Transitions refused because the peer that sent them holds no such
-        # authority. Two numbers rather than one: a results feed that has
-        # started emitting cancellations and a peer attempting a patient merge
-        # are different incidents and go to different people.
+        # authority. One number each rather than one between them: a results
+        # feed that has started emitting cancellations, a scheduling feed
+        # emitting results, and a peer attempting a patient merge are three
+        # different incidents and go to three different people.
         self.unauthorized_merge_count = 0
         self.unauthorized_cancel_count = 0
+        self.unauthorized_result_count = 0
         # Messages whose MSH-3/MSH-4 contradicted the peer that delivered them.
         # Either a feed is misrouted or a peer is reaching past its own scope,
         # and both need somebody to look at the registry.
@@ -719,17 +734,15 @@ class MessageHandler:
 
         authority = _AUTHORITY_REQUIRED.get(message.message_type)
         if authority is not None and not peer.holds(authority):
-            if authority == MERGE:
-                self.unauthorized_merge_count += 1
-            else:
-                self.unauthorized_cancel_count += 1
+            counter = _AUTHORITY_COUNTER[authority]
+            setattr(self, counter, getattr(self, counter) + 1)
             self._audit_refusal(peer, f"missing_{authority}_authority")
             logger.error(
                 "Message %r from %s is a %s and this peer holds no %r authority; no "
-                "transition. Alert: %s changes which chart a record belongs to or removes a "
-                "clinically open loop from every worklist, and this peer was not granted it.",
+                "transition. Alert: every message type that needs an authority can end "
+                "with a clinically open loop on nobody's queue, and this peer was not "
+                "granted this one.",
                 control_id, peer.peer_id, message.message_type, authority,
-                message.message_type,
             )
             return build_ack(control_id, "AA")
         return None
