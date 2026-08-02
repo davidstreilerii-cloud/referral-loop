@@ -15,6 +15,7 @@ an adapter lets a fetched DocumentReference close a loop, that has to be a line 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,8 @@ _MAX_VENDOR = 64
 _MAX_URL = 512
 
 _DEFAULT_PORTS = {"https": 443, "http": 80}
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectorConfigError(ReferralLoopError):
@@ -257,6 +260,25 @@ class ConnectorRegistry:
 
     def connector_ids(self) -> tuple[str, ...]:
         return tuple(p.connector_id for p in self.connectors)
+
+    def warn_on_peer_collisions(self, peer_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """Names used by both an inbound peer and an outbound connector.
+
+        A warning rather than a refusal. One organization on both ends is the natural thing to
+        configure, and the two files are read by different code paths, so nothing resolves
+        wrongly -- but audit rows from the two directions sit next to each other, and a reader
+        who has to work out which direction `example-ris` meant has been handed a puzzle we
+        could have flagged at boot.
+        """
+        shared = tuple(sorted(set(self.connector_ids()) & set(peer_ids)))
+        for name in shared:
+            logger.warning(
+                "connector_id %r is also a configured peer id. Inbound and outbound are "
+                "resolved separately, so nothing is ambiguous to the code -- but audit rows "
+                "from both directions will carry this name.",
+                name,
+            )
+        return shared
 
     def endpoints(self) -> frozenset[tuple[str, str, int]]:
         """The egress allowlist. Every destination this process may reach, and nothing else."""

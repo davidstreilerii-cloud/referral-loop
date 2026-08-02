@@ -270,3 +270,33 @@ def test_the_allowlist_covers_both_the_api_and_the_token_host():
             ("https", "auth.example-med.example", 443),
         }
     )
+
+
+from referral_loop.peers import RESERVED_PEER_IDS
+
+
+@pytest.mark.parametrize("reserved", sorted(RESERVED_PEER_IDS))
+def test_a_reserved_peer_id_is_refused_as_a_connector_id(reserved):
+    """The two namespaces are separate files, which does not mean they may overlap. These five
+    already carry meanings in audit rows; 'coordinator' means no message asserted the transition
+    at all, so a connector able to claim it could attribute its own action to a human."""
+    with pytest.raises(ConnectorConfigError, match="reserved"):
+        _registry(_profile(connector_id=reserved))
+
+
+def test_an_id_shared_with_a_configured_peer_warns_but_loads(caplog):
+    """One organization on both ends of the relationship is the natural case, and the two files
+    are read by different code paths -- so the ambiguity is only in the reader's head. But audit
+    rows from the two directions will sit next to each other."""
+    reg = _registry(_profile(connector_id="example-ris"))
+    with caplog.at_level("WARNING"):
+        collisions = reg.warn_on_peer_collisions(("example-ris", "example-lab"))
+    assert collisions == ("example-ris",)
+    assert "example-ris" in caplog.text
+
+
+def test_no_collision_is_silent(caplog):
+    reg = _registry()
+    with caplog.at_level("WARNING"):
+        assert reg.warn_on_peer_collisions(("example-ris",)) == ()
+    assert caplog.text == ""
