@@ -13,6 +13,7 @@ from referral_loop.connect.connectors import (
     endpoint_of,
     load_connector_registry,
 )
+from referral_loop.peers import RESERVED_PEER_IDS
 
 
 def _profile(**overrides) -> dict:
@@ -270,9 +271,6 @@ def test_the_allowlist_covers_both_the_api_and_the_token_host():
             ("https", "auth.example-med.example", 443),
         }
     )
-
-
-from referral_loop.peers import RESERVED_PEER_IDS
 
 
 @pytest.mark.parametrize("reserved", sorted(RESERVED_PEER_IDS))

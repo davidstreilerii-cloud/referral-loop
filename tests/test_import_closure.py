@@ -8,6 +8,7 @@ closure the interpreter's whole closure rather than this test's share of it.
 
 Same principle as spec test 7: assert on the real end state, not on a proxy.
 """
+import ast
 import json
 import subprocess
 import sys
@@ -114,8 +115,6 @@ def test_anthropic_is_not_in_the_closure_and_that_is_the_point():
         "spec 13 proves that behaviourally only for the clients it knows to poison."
     )
 
-
-import ast
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "referral_loop"
 

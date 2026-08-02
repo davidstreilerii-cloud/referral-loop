@@ -10,8 +10,8 @@ from referral_loop.connect.connectors import ConnectorRegistry
 from referral_loop.connect.egress import (
     MAX_RESPONSE_BYTES,
     EgressRefused,
-    check_allowed,
     build_opener,
+    check_allowed,
 )
 
 

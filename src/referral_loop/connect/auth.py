@@ -18,6 +18,7 @@ import logging
 import os
 import secrets
 import urllib.parse  # parse only -- urllib.request lives in egress.py and the AST test enforces it
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,7 +55,7 @@ def _b64u(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _segment(payload: dict[str, object]) -> str:
+def _segment(payload: Mapping[str, object]) -> str:
     # Compact and key-sorted so the bytes are reproducible; a signature over a dict whose
     # serialisation varies is not reproducible in a test.
     return _b64u(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))

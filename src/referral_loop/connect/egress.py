@@ -71,7 +71,7 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
     is a misconfiguration worth surfacing rather than absorbing.
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise EgressRefused(
             f"refused a {code} redirect to {newurl!r}. Redirects are never followed: the "
             "destination of a signed credential is a local decision, not the remote's"
