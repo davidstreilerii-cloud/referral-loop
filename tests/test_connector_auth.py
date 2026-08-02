@@ -10,7 +10,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from referral_loop.connect.auth import ASSERTION_LIFETIME, build_assertion
+from referral_loop.connect.auth import ASSERTION_LIFETIME, REFRESH_MARGIN, Token, TokenCache, build_assertion
 from referral_loop.connect.connectors import ConnectorRegistry
 
 from ._certs import rsa_keypair
@@ -114,3 +114,52 @@ def test_a_missing_key_file_is_a_typed_failure(tmp_path):
 
     with pytest.raises(AuthFailure, match="private key"):
         build_assertion(_profile(tmp_path / "absent.pem"), now=_NOW)
+
+
+class _FakeClock:
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
+
+
+def test_a_token_knows_whether_it_is_still_usable():
+    token = Token(value="abc", expires_at=_NOW + timedelta(seconds=300))
+    assert token.usable_at(_NOW)
+    assert not token.usable_at(_NOW + timedelta(seconds=300) - REFRESH_MARGIN + timedelta(seconds=1))
+
+
+def test_the_cache_returns_the_same_token_until_the_refresh_margin(tmp_path):
+    calls = []
+
+    def acquire():
+        calls.append(1)
+        return Token(value=f"t{len(calls)}", expires_at=_NOW + timedelta(seconds=300))
+
+    cache = TokenCache()
+    first = cache.get("example-med", acquire, now=_NOW)
+    second = cache.get("example-med", acquire, now=_NOW + timedelta(seconds=60))
+    assert first.value == second.value == "t1"
+    assert len(calls) == 1
+
+
+def test_the_cache_reacquires_inside_the_refresh_margin(tmp_path):
+    calls = []
+
+    def acquire():
+        calls.append(1)
+        return Token(value=f"t{len(calls)}", expires_at=_NOW + timedelta(seconds=300))
+
+    cache = TokenCache()
+    cache.get("example-med", acquire, now=_NOW)
+    later = cache.get("example-med", acquire, now=_NOW + timedelta(seconds=299))
+    assert later.value == "t2"
+    assert len(calls) == 2
+
+
+def test_two_connectors_do_not_share_a_cache_entry():
+    cache = TokenCache()
+    a = cache.get("example-med", lambda: Token("a", _NOW + timedelta(seconds=300)), now=_NOW)
+    b = cache.get("other", lambda: Token("b", _NOW + timedelta(seconds=300)), now=_NOW)
+    assert a.value == "a" and b.value == "b"

@@ -133,3 +133,101 @@ def build_assertion(
     signing_input = f"{_segment(header)}.{_segment(claims)}".encode("ascii")
     signature = key.sign(signing_input, padding.PKCS1v15(), _HASHES[profile.auth.algorithm]())
     return f"{signing_input.decode('ascii')}.{_b64u(signature)}"
+
+
+@dataclass(frozen=True)
+class Token:
+    value: str
+    expires_at: datetime
+
+    def usable_at(self, moment: datetime) -> bool:
+        return moment < self.expires_at - REFRESH_MARGIN
+
+
+class TokenCache:
+    """In memory, keyed by connector, and never written to disk.
+
+    A bearer token is a short-lived credential; a disk copy outlives its usefulness and turns a
+    file-read into an authentication bypass. There is no cache that survives the process, and
+    that is the whole design -- preflight acquires one token per connector per run.
+    """
+
+    def __init__(self) -> None:
+        self._tokens: dict[str, Token] = {}
+
+    def get(self, connector_id: str, acquire, *, now: datetime | None = None) -> Token:
+        moment = datetime.now(timezone.utc) if now is None else now
+        held = self._tokens.get(connector_id)
+        if held is not None and held.usable_at(moment):
+            return held
+        fresh = acquire()
+        self._tokens[connector_id] = fresh
+        return fresh
+
+    def forget(self, connector_id: str) -> None:
+        self._tokens.pop(connector_id, None)
+
+
+def acquire_token(
+    registry: ConnectorRegistry,
+    profile: ConnectorProfile,
+    *,
+    now: datetime | None = None,
+) -> Token:
+    """Exchange a signed assertion for a bearer token."""
+    moment = datetime.now(timezone.utc) if now is None else now
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": build_assertion(profile, now=moment),
+            "scope": " ".join(profile.auth.scopes),
+        }
+    ).encode("ascii")
+
+    response = fetch(
+        registry,
+        profile,
+        profile.token_url,
+        method="POST",
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        payload = json.loads(response.text())
+    except json.JSONDecodeError as exc:
+        raise AuthFailure(
+            f"{profile.connector_id}: token endpoint returned {response.status} with a "
+            "body that is not JSON"
+        ) from exc
+
+    if response.status != 200:
+        # Named separately because the two need different reactions from an operator: ours is a
+        # registration or key problem and no retry helps, theirs may clear on its own.
+        error = str(payload.get("error", "unspecified"))
+        whose = "our client id or signing key" if error in {
+            "invalid_client", "invalid_grant", "unauthorized_client"
+        } else "the authorization server"
+        raise AuthFailure(
+            f"{profile.connector_id}: token request failed with {response.status} "
+            f"{error!r} -- this points at {whose}"
+        )
+
+    access = payload.get("access_token")
+    if not isinstance(access, str) or not access:
+        raise AuthFailure(f"{profile.connector_id}: token response carried no access_token")
+
+    expires_in = payload.get("expires_in", 300)
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        raise AuthFailure(f"{profile.connector_id}: token response expires_in is not a positive integer")
+
+    # Never logged, never returned in a message. The value goes into the cache and nowhere else.
+    logger.info(
+        "acquired a bearer token for %s, valid %ss, scopes %s",
+        profile.connector_id, expires_in, " ".join(profile.auth.scopes),
+    )
+    return Token(value=access, expires_at=moment + timedelta(seconds=expires_in))
