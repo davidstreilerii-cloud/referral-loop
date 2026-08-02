@@ -167,6 +167,13 @@ class TokenCache:
     A bearer token is a short-lived credential; a disk copy outlives its usefulness and turns a
     file-read into an authentication bypass. There is no cache that survives the process, and
     that is the whole design -- preflight acquires one token per connector per run.
+
+    Unused in this sub-project, deliberately. Preflight makes exactly one token request per
+    connector per run, so there is nothing for a cache to save. It exists because the read
+    client in the next sub-project issues many requests against one token and would otherwise
+    re-authenticate per call -- the same reasoning that keeps `vendor` in the connector profile
+    while nothing branches on it. If that client lands and does not use this, delete it rather
+    than leave it implying a capability nothing provides.
     """
 
     def __init__(self) -> None:
@@ -180,9 +187,6 @@ class TokenCache:
         fresh = acquire()
         self._tokens[connector_id] = fresh
         return fresh
-
-    def forget(self, connector_id: str) -> None:
-        self._tokens.pop(connector_id, None)
 
 
 def acquire_token(

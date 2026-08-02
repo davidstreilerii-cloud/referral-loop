@@ -15,30 +15,40 @@ from referral_loop.connect.egress import (
 )
 
 
-def _registry(**top) -> ConnectorRegistry:
-    data = {
-        "connectors": [
-            {
-                "connector_id": "example-med",
-                "organization": "Example Medical Center",
-                "vendor": "epic",
-                "fhir_base_url": "https://fhir.example-med.example/api/FHIR/R4",
-                "token_url": "https://auth.example-med.example/oauth2/token",
-                "fhir_version": ["4.0.1"],
-                "auth": {
-                    "mode": "smart-backend-services",
-                    "client_id": "abc",
-                    "private_key_file": "/etc/k.pem",
-                    "key_id": "k1",
-                    "algorithm": "RS384",
-                    "scopes": ["system/Patient.read"],
-                },
-                "authorities": [],
-            }
-        ]
+def _example_med_connector(**overrides) -> dict:
+    connector = {
+        "connector_id": "example-med",
+        "organization": "Example Medical Center",
+        "vendor": "epic",
+        "fhir_base_url": "https://fhir.example-med.example/api/FHIR/R4",
+        "token_url": "https://auth.example-med.example/oauth2/token",
+        "fhir_version": ["4.0.1"],
+        "auth": {
+            "mode": "smart-backend-services",
+            "client_id": "abc",
+            "private_key_file": "/etc/k.pem",
+            "key_id": "k1",
+            "algorithm": "RS384",
+            "scopes": ["system/Patient.read"],
+        },
+        "authorities": [],
     }
+    connector.update(overrides)
+    return connector
+
+
+def _registry(**top) -> ConnectorRegistry:
+    data = {"connectors": [_example_med_connector()]}
     data.update(top)
     return ConnectorRegistry.from_mapping(data)
+
+
+def _registry_with_ca(ca_path: str) -> ConnectorRegistry:
+    """Same example-med connector as `_registry`, plus the `tls.ca_file` `_tls_context` reads to pin
+    an SSLContext instead of falling back to the system trust store."""
+    return ConnectorRegistry.from_mapping(
+        {"connectors": [_example_med_connector(tls={"ca_file": ca_path})]}
+    )
 
 
 def test_a_configured_host_is_allowed():
@@ -165,3 +175,46 @@ def test_a_redirect_to_an_allowed_host_is_still_refused():
 
 def test_the_response_cap_is_declared_and_bounded():
     assert 0 < MAX_RESPONSE_BYTES <= 64 * 1024 * 1024
+
+
+def test_the_outbound_tls_context_pins_exactly_the_configured_ca(tmp_path):
+    """Asserted against the SSLContext, not through a handshake, because a handshake with a
+    correctly-trusted certificate passes either way.
+
+    The inbound half of this codebase already learned it: test_peer_identity's
+    test_the_server_trusts_exactly_the_configured_ca_and_nothing_else exists because relaxing
+    verify_mode left every handshake test green. Dropping `cafile=` here would silently fall
+    back to the system trust store -- hundreds of roots instead of the one the connector named
+    -- and every test in this suite would still pass.
+    """
+    import ssl
+
+    from referral_loop.connect.egress import _tls_context
+
+    from ._certs import localhost_cert
+
+    certfile, _keyfile, ca_file = localhost_cert(tmp_path)
+    profile = _registry_with_ca(str(ca_file)).get("example-med")
+    context = _tls_context(profile)
+
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert context.minimum_version is ssl.TLSVersion.TLSv1_2
+    assert len(context.get_ca_certs()) == 1, (
+        "expected exactly the configured CA to be trusted; a larger number means cafile was "
+        f"ignored and the system trust store was loaded instead ({len(context.get_ca_certs())} roots)"
+    )
+
+
+def test_no_ca_file_falls_back_to_the_system_trust_store_rather_than_no_verification(tmp_path):
+    """The fallback has to be *more* trust, never none. A context with an empty trust store
+    would fail closed and look like a configuration bug; one with verification off would fail
+    open and look like nothing at all."""
+    import ssl
+
+    from referral_loop.connect.egress import _tls_context
+
+    context = _tls_context(_registry().get("example-med"))
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert len(context.get_ca_certs()) > 1, "expected the system trust store"

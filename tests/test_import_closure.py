@@ -157,6 +157,34 @@ def test_only_the_egress_module_imports_a_network_library():
     )
 
 
+def test_fetch_is_the_only_place_in_egress_that_opens_a_connection():
+    """The closure test above polices which file may import urllib.request. This polices how
+    many call sites inside that file reach the network.
+
+    check_allowed runs in fetch, so "egress is bounded to configured connectors" is true only
+    while fetch is the sole caller of .open(). build_opener is public and returns a generic
+    opener bound to no checked destination -- a pagination or streaming helper added later
+    inside egress.py, the one file allowed to touch urllib.request, would pass every other
+    test in this suite while breaking the README's central claim.
+    """
+    tree = ast.parse((_SRC / "connect" / "egress.py").read_text(encoding="utf-8"))
+    openers: dict[str, list[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "open"
+            ):
+                openers.setdefault(node.name, []).append(inner.lineno)
+    assert set(openers) == {"fetch"}, (
+        "only fetch may open a connection, because only fetch calls check_allowed first; "
+        f"found .open() in {openers}"
+    )
+
+
 def test_the_suite_is_exercising_this_checkout_and_not_an_installed_copy():
     """A pip-installed copy of the monorepo satisfies `import referral_loop...` just as
     well as src/ does, so a green suite proves nothing about which tree ran. This is the
