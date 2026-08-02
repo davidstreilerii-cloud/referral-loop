@@ -80,7 +80,7 @@ PUBKEY_ENV = "REFERRAL_PACK_PUBKEY"
 # an operator as a traceback.
 _ED25519_PUBLIC_KEY_BYTES = 32
 
-MODES = ("listen", "filedrop", "worklist", "eval", "purge", "stats")
+MODES = ("listen", "filedrop", "worklist", "eval", "purge", "stats", "connectors")
 
 # `eval` exit codes. Distinct from _refuse's 2, because "this pack must not ship"
 # and "this process could not start" send an operator to different places.
@@ -412,6 +412,35 @@ def _run_stats(args) -> int:
     return 0
 
 
+def _run_connectors(args: argparse.Namespace) -> int:
+    """Preflight every configured connector.
+
+    Deliberately prints the report to stdout and returns a code rather than raising: an
+    operator setting up three sites wants all three verdicts, and the exit code is for the
+    script that wrapped the command.
+
+    Cross-checks connector ids against the peer registry when `--peers` names one. That check
+    is the only caller of warn_on_peer_collisions, and it says so when it does *not* run --
+    a silent skip would make the warning look like a clean bill of health when it is actually
+    an absence of evidence, which is the same reasoning the README applies to the image tests
+    that skip when no Docker daemon is reachable.
+    """
+    from .connect.connectors import load_connector_registry
+    from .connect.preflight import format_report, preflight
+    from .peers import load_peer_registry
+
+    registry = load_connector_registry(args.connectors)
+
+    if args.peers:
+        registry.warn_on_peer_collisions(load_peer_registry(args.peers).peer_ids)
+    else:
+        print("peer id cross-check: skipped, no --peers given\n")
+
+    reports = preflight(registry)
+    print(format_report(reports))
+    return 0 if all(r.ok for r in reports) else 1
+
+
 def _run_worklist(stack: BootedStack, host: str, port: int) -> int:
     """Serve the coordinator worklist. Loopback by refusal, not by convention.
 
@@ -470,8 +499,11 @@ def _bound(make, *, what: str):
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
+        # "no network egress" was true until connect/ existed. Narrowed rather than dropped:
+        # the property that remains is enforced by an allowlist and an AST closure test, and
+        # --help is the more authoritative of the two places this claim lives.
         description="Deterministic HL7 v2 referral-loop tracker. On-premise, no model "
-                    "calls, no network egress.",
+                    "calls, and egress only to endpoints named in the connector file.",
         epilog=(
             f"Required environment: {PUBKEY_ENV} (pack signing public key, hex), "
             "PHI_ENCRYPTION_VERIFIED=1 or OS-detected encryption at rest, "
@@ -488,10 +520,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "--baseline-pack-dir. purge: enforce the site's retention policy, "
              "which it refuses to run without. stats: report row counts and "
              "approximate on-disk size per table, including the tables retention "
-             "deliberately never touches.",
+             "deliberately never touches. "
+             "connectors: check every configured FHIR endpoint -- reachability and "
+             "credentials are proven separately -- and exit nonzero if any failed.",
     )
     parser.add_argument("--db", default="data/referral_loops.db",
                         help="SQLite file on an encrypted volume (default: %(default)s)")
+    parser.add_argument("--connectors", default="connectors.json",
+                        help="connectors mode: JSON file of outbound FHIR endpoints "
+                             "(default: %(default)s)")
     parser.add_argument("--pack-dir", default=str(DEFAULT_PACK_DIR),
                         help="directory holding pack.json and pack.sig (default: the shipped pack)")
     parser.add_argument("--drop-dir", default="data/dropbox",
@@ -560,15 +597,19 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Answered before the pack key is even looked for, deliberately. Neither
-    # purge nor stats loads a pack, and an operator whose retention period is
-    # unset -- or who just wants to see how big their database has gotten --
-    # needs to hear that rather than a message about a signing key. See
-    # _run_purge and _run_stats for which gates each runs and why the other
-    # two do not apply to either of them.
-    if args.mode in ("purge", "stats"):
+    # Answered before the pack key is even looked for, deliberately. Neither purge nor stats
+    # loads a pack, and an operator whose retention period is unset -- or who just wants to see
+    # how big their database has gotten -- needs to hear that rather than a message about a
+    # signing key. connectors joins them for the same reason and a stronger one: preflight
+    # touches no database, no pack and no PHI, so not one of the three boot gates is relevant
+    # to what it does. See _run_purge, _run_stats and _run_connectors for which gates each runs.
+    if args.mode in ("purge", "stats", "connectors"):
         try:
-            return _run_purge(args) if args.mode == "purge" else _run_stats(args)
+            if args.mode == "purge":
+                return _run_purge(args)
+            if args.mode == "stats":
+                return _run_stats(args)
+            return _run_connectors(args)
         except (ReferralLoopError, RuntimeError) as exc:
             return _refuse(str(exc))
 
