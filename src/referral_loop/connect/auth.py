@@ -42,6 +42,22 @@ REFRESH_MARGIN = timedelta(seconds=60)
 
 _HASHES = {"RS256": hashes.SHA256, "RS384": hashes.SHA384}
 
+# RFC 6749 section 5.2, the codes that mean the fault is on our side. Every one of them is a
+# problem with what we sent or how we are registered, and no retry fixes any of them.
+# `invalid_scope` is the reason this list is not just the obvious three: a scope typo is a
+# configuration error an operator has to go and correct, and reporting it as the remote's
+# problem invites them to wait out something that will never clear.
+_OUR_FAULT = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+    }
+)
+
 
 class AuthFailure(ReferralLoopError):
     """The credential flow failed.
@@ -210,9 +226,15 @@ def acquire_token(
         # Named separately because the two need different reactions from an operator: ours is a
         # registration or key problem and no retry helps, theirs may clear on its own.
         error = str(payload.get("error", "unspecified"))
-        whose = "our client id or signing key" if error in {
-            "invalid_client", "invalid_grant", "unauthorized_client"
-        } else "the authorization server"
+        if error in _OUR_FAULT:
+            whose = "our client id, signing key, or configured scopes"
+        elif response.status >= 500:
+            whose = "the authorization server"
+        else:
+            # Neither list matched. Say so rather than picking one: guessing "theirs" tells an
+            # operator to wait out something that may never clear, and guessing "ours" sends
+            # them to re-check a configuration that is fine.
+            whose = f"an unrecognised error code at status {response.status}"
         raise AuthFailure(
             f"{profile.connector_id}: token request failed with {response.status} "
             f"{error!r} -- this points at {whose}"

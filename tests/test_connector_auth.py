@@ -10,8 +10,17 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from referral_loop.connect.auth import ASSERTION_LIFETIME, REFRESH_MARGIN, Token, TokenCache, build_assertion
+from referral_loop.connect.auth import (
+    ASSERTION_LIFETIME,
+    REFRESH_MARGIN,
+    AuthFailure,
+    Token,
+    TokenCache,
+    acquire_token,
+    build_assertion,
+)
 from referral_loop.connect.connectors import ConnectorRegistry
+from referral_loop.connect.egress import Response
 
 from ._certs import rsa_keypair
 
@@ -110,8 +119,6 @@ def test_two_assertions_differ_under_a_frozen_clock(tmp_path):
 
 
 def test_a_missing_key_file_is_a_typed_failure(tmp_path):
-    from referral_loop.connect.auth import AuthFailure
-
     with pytest.raises(AuthFailure, match="private key"):
         build_assertion(_profile(tmp_path / "absent.pem"), now=_NOW)
 
@@ -155,3 +162,47 @@ def test_two_connectors_do_not_share_a_cache_entry():
     a = cache.get("example-med", lambda: Token("a", _NOW + timedelta(seconds=300)), now=_NOW)
     b = cache.get("other", lambda: Token("b", _NOW + timedelta(seconds=300)), now=_NOW)
     assert a.value == "a" and b.value == "b"
+
+
+def test_invalid_scope_is_attributed_to_us_not_the_authorization_server(tmp_path, monkeypatch):
+    """A 400 invalid_scope is a scope typo in the connector file, not a remote outage.
+
+    Driven with a monkeypatched `fetch` rather than the TLS fixture in tests/_fhirserver.py --
+    acquire_token calls `fetch` as a name bound into this module, so replacing it exercises the
+    real status/error-code branch in acquire_token without a socket or a certificate. There is
+    no claim here about egress or TLS; that is what test_preflight.py's fixture-backed tests
+    already cover.
+    """
+    key_path, _ = rsa_keypair(tmp_path)
+    registry = ConnectorRegistry.from_mapping(
+        {
+            "connectors": [
+                {
+                    "connector_id": "example-med",
+                    "organization": "Example Medical Center",
+                    "vendor": "epic",
+                    "fhir_base_url": "https://fhir.example-med.example/api/FHIR/R4",
+                    "token_url": "https://auth.example-med.example/oauth2/token",
+                    "fhir_version": ["4.0.1"],
+                    "auth": {
+                        "mode": "smart-backend-services",
+                        "client_id": "client-abc",
+                        "private_key_file": str(key_path),
+                        "key_id": "example-med-2026",
+                        "algorithm": "RS384",
+                        "scopes": ["system/Patient.read"],
+                    },
+                    "authorities": [],
+                }
+            ]
+        }
+    )
+    profile = registry.get("example-med")
+
+    def fake_fetch(*_args, **_kwargs):
+        return Response(status=400, body=b'{"error": "invalid_scope"}')
+
+    monkeypatch.setattr("referral_loop.connect.auth.fetch", fake_fetch)
+
+    with pytest.raises(AuthFailure, match="our client id, signing key, or configured scopes"):
+        acquire_token(registry, profile, now=_NOW)
