@@ -33,26 +33,61 @@ import referral_loop.errors
 print(json.dumps(sorted(sys.modules)))
 """
 
+_CORE_PROBE = (
+    "import referral_loop.core, referral_loop.core.states, referral_loop.core.models;"
+    "import json,sys; print(json.dumps(sorted(sys.modules)))"
+)
 
-def _run_probe() -> set[str]:
-    """Import referral_loop in a clean interpreter, return everything it loaded.
+
+def _modules_in_a_clean_interpreter(probe: str) -> set[str]:
+    """Run `probe` in a clean interpreter, return everything it loaded.
 
     Surfaces stderr on failure rather than using check=True: a real ImportError
     inside the probe would otherwise arrive as an opaque non-zero exit with the
     actual traceback swallowed.
     """
     proc = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
     )
     if proc.returncode != 0:
         pytest.fail(f"probe failed (exit {proc.returncode}):\n{proc.stderr}")
     return set(json.loads(proc.stdout))
 
 
+# core/ is the domain layer. The whole layering argument in the design spec rests on it
+# taking plain objects and returning plain objects, so that the same rubric is callable
+# from an MLLP listener, a CDS Hooks service and a batch job without duplication. A single
+# convenience import of the store is all it takes to lose that, and it would be invisible
+# in review.
+CORE_FORBIDDEN = (
+    "referral_loop.store",
+    "referral_loop.registry",
+    "referral_loop.listener",
+    "referral_loop.mllp",
+    "referral_loop.mllp_server",
+    "referral_loop.matcher",
+    "referral_loop.worklist",
+    "referral_loop.audit",
+    "referral_loop.pack",
+    "referral_loop.fhir",
+    "referral_loop.migration",
+    "sqlite3",
+    "flask",
+    "jinja2",
+    "cryptography",
+)
+
+
 def test_referral_import_closure_in_a_clean_interpreter():
-    loaded = _run_probe()
+    loaded = _modules_in_a_clean_interpreter(_PROBE)
     leaked = sorted(m for m in loaded if any(m == f or m.startswith(f + ".") for f in FORBIDDEN))
     assert leaked == [], f"referral_loop pulled in forbidden modules: {leaked}"
+
+
+def test_the_domain_core_imports_no_protocol_persistence_or_projection_code():
+    loaded = _modules_in_a_clean_interpreter(_CORE_PROBE)
+    leaked = [m for m in loaded if any(m == f or m.startswith(f + ".") for f in CORE_FORBIDDEN)]
+    assert not leaked, f"core/ reached outside the domain layer: {leaked}"
 
 
 def test_anthropic_is_not_in_the_closure_and_that_is_the_point():
@@ -69,7 +104,7 @@ def test_anthropic_is_not_in_the_closure_and_that_is_the_point():
     importing a module is not a model call. The behavioural claim is spec 13,
     which poisons anthropic and runs the whole suite against it.
     """
-    assert "anthropic" not in _run_probe(), (
+    assert "anthropic" not in _modules_in_a_clean_interpreter(_PROBE), (
         "referral_loop pulled in a model client; v1 makes no model calls, and "
         "spec 13 proves that behaviourally only for the clients it knows to poison."
     )
