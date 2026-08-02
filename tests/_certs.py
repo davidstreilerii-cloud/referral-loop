@@ -8,6 +8,7 @@ makes a failure look environmental. tests/_pack.py is the existing precedent for
 from __future__ import annotations
 
 import datetime as dt
+import ipaddress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,10 +41,10 @@ def _window():
     return now - dt.timedelta(days=1), now + dt.timedelta(days=1)
 
 
-def _self_signed(common_name: str):
+def _self_signed(common_name: str, *, san=()):
     key = _key()
     start, end = _window()
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_subject(common_name))
         .issuer_name(_subject(common_name))
@@ -52,9 +53,10 @@ def _self_signed(common_name: str):
         .not_valid_before(start)
         .not_valid_after(end)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
     )
-    return key, cert
+    if san:
+        builder = builder.add_extension(x509.SubjectAlternativeName(list(san)), critical=False)
+    return key, builder.sign(key, hashes.SHA256())
 
 
 def _issued(ca_key, ca_cert, common_name: str, *, san=()):
@@ -96,6 +98,28 @@ def _write(directory: Path, stem: str, key, cert) -> Material:
         )
     )
     return Material(cert_path, key_path, cert.fingerprint(hashes.SHA256()).hex())
+
+
+def localhost_cert(tmp_path):
+    """A self-signed cert for `localhost`, returned as (certfile, keyfile, ca_file).
+
+    Self-signed, so the certificate is its own CA and `ca_file` is the same bytes as
+    `certfile` -- the connector's tls.ca_file then trusts exactly this one server and nothing
+    else, which is closer to a pinned deployment than loading a test CA into the system store.
+
+    A SAN for `localhost` and 127.0.0.1 both, because egress.py sets check_hostname and the URL
+    the tests build uses the hostname spelling.
+
+    Built from the same _self_signed/_write primitives the peer-identity root CA uses above,
+    passing the san= that _issued already accepted -- one certificate builder in this file,
+    not two.
+    """
+    key, cert = _self_signed(
+        "localhost",
+        san=(x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))),
+    )
+    material = _write(tmp_path, "server", key, cert)
+    return material.cert, material.key, material.cert
 
 
 def rsa_keypair(tmp_path, name: str = "signing"):
