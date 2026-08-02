@@ -115,6 +115,49 @@ def test_anthropic_is_not_in_the_closure_and_that_is_the_point():
     )
 
 
+import ast
+
+_SRC = Path(__file__).resolve().parents[1] / "src" / "referral_loop"
+
+# The single permitted egress site. This is the property the README's narrowed claim rests on --
+# "no model calls, and egress only to configured connectors" -- and it is a claim about which
+# file contains the import, not about which modules a probe happened to load. So this reads
+# source rather than sys.modules; an import-probe cannot express it.
+EGRESS_MODULE = "connect/egress.py"
+# socket is deliberately absent: mllp_server.py imports it directly for the inbound listener's
+# socketserver-based TCP server, which is legitimate and has nothing to do with egress. Adding
+# mllp_server.py to a per-file exemption list instead would have been worse -- an allowlist of
+# exempt files is how this test stops meaning anything -- so the module is dropped from the set
+# that applies to every file rather than one file being excused from the set.
+_NETWORK_MODULES = {"urllib.request", "urllib.error", "http.client", "ftplib"}
+
+
+def _imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            found.add(node.module)
+    return found
+
+
+def test_only_the_egress_module_imports_a_network_library():
+    offenders = {}
+    for path in sorted(_SRC.rglob("*.py")):
+        relative = path.relative_to(_SRC).as_posix()
+        if relative == EGRESS_MODULE:
+            continue
+        leaked = sorted(_imported_modules(path) & _NETWORK_MODULES)
+        if leaked:
+            offenders[relative] = leaked
+    assert not offenders, (
+        f"egress must stay confined to {EGRESS_MODULE}; these also import a network "
+        f"library: {offenders}"
+    )
+
+
 def test_the_suite_is_exercising_this_checkout_and_not_an_installed_copy():
     """A pip-installed copy of the monorepo satisfies `import referral_loop...` just as
     well as src/ does, so a green suite proves nothing about which tree ran. This is the
