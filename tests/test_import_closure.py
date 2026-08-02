@@ -71,6 +71,11 @@ CORE_FORBIDDEN = (
     "referral_loop.pack",
     "referral_loop.fhir",
     "referral_loop.migration",
+    # The domain layer must not reach the network any more than it reaches the store.
+    # core/ has to stay callable from a batch job with no connector configured at all.
+    "referral_loop.connect",
+    "urllib.request",
+    "ssl",
     "sqlite3",
     "flask",
     "jinja2",
