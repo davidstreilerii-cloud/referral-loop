@@ -300,3 +300,18 @@ def test_no_collision_is_silent(caplog):
     with caplog.at_level("WARNING"):
         assert reg.warn_on_peer_collisions(("example-ris",)) == ()
     assert caplog.text == ""
+
+
+def test_an_unknown_scheme_is_a_typed_refusal_not_a_keyerror():
+    """check_allowed calls endpoint_of on whatever URL it is handed. A KeyError there escapes
+    every except clause in fetch, so a hostile redirect target would crash the process instead
+    of being refused."""
+    with pytest.raises(ConnectorConfigError, match="scheme"):
+        endpoint_of("ftp://evil.example/pub")
+
+
+def test_a_scheme_with_an_explicit_port_is_still_refused_if_unknown():
+    """The explicit port would sidestep the dict lookup entirely, so the scheme has to be
+    checked on its own rather than only where the default port is needed."""
+    with pytest.raises(ConnectorConfigError, match="scheme"):
+        endpoint_of("ftp://evil.example:21/pub")

@@ -92,6 +92,15 @@ def endpoint_of(url: str) -> tuple[str, str, int]:
     port-explicit spelling of an allowed host read as a different one.
     """
     parts = urlsplit(url)
+    if parts.scheme not in _DEFAULT_PORTS:
+        # Typed rather than the KeyError the dict lookup below would otherwise raise. At load
+        # time _url has already refused anything but http/https, so this is unreachable from
+        # config -- but check_allowed calls this on whatever URL it is handed, and the read
+        # client will one day hand it a `next` link out of a Bundle. A KeyError there escapes
+        # every except clause in fetch and surfaces as a crash rather than a refusal.
+        raise _refuse(
+            f"{url!r} has scheme {parts.scheme!r}; only http and https have a known default port"
+        )
     host = (parts.hostname or "").lower()
     port = parts.port or _DEFAULT_PORTS[parts.scheme]
     return (parts.scheme, host, port)
