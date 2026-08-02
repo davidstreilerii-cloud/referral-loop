@@ -183,6 +183,7 @@ def test_a_well_formed_profile_loads():
     [
         "connector_id",
         "organization",
+        "vendor",
         "fhir_base_url",
         "token_url",
         "fhir_version",
@@ -545,7 +546,10 @@ def _profile_from(entry: object, *, allow_plaintext: bool) -> ConnectorProfile:
     return ConnectorProfile(
         connector_id=raw_id,
         organization=_text(_require(entry, "organization", what), f"{what} organization", _MAX_ORGANIZATION),
-        vendor=_text(entry.get("vendor", "unspecified"), f"{what} vendor", _MAX_VENDOR),
+        # Required despite being inert in A. A site profile that cannot say what it is talking
+        # to is missing the point, and one exempt row would falsify the rule the whole table
+        # rests on -- that nothing here is assumed on the operator's behalf.
+        vendor=_text(_require(entry, "vendor", what), f"{what} vendor", _MAX_VENDOR),
         fhir_base_url=_url(_require(entry, "fhir_base_url", what), f"{what} fhir_base_url", allow_plaintext=allow_plaintext),
         token_url=_url(_require(entry, "token_url", what), f"{what} token_url", allow_plaintext=allow_plaintext),
         fhir_version=versions,
