@@ -244,6 +244,60 @@ class Referral:
 `Hold` carries a reason and the actor who applied it. It is **orthogonal to state**, not a state —
 see §6.
 
+### 5.1 The second aggregate — `InboundArtifact`
+
+Added 2026-08-02, following the §6.5 correction. An inbound document that matched no referral is
+not a referral in a funny state; it is a different thing with a different lifecycle, different
+retention, and a different FHIR projection.
+
+```python
+@dataclass(frozen=True)
+class InboundArtifact:
+    id:            ArtifactId
+    received_from: PartyRef          # the authenticated peer, never a self-asserted facility
+    patient:       PatientRef | None # often absent — that is the whole problem
+    content_hash:  str               # links to the archived raw payload
+    kind:          ArtifactKind      # RESULT | DOCUMENT | SCHEDULE_NOTICE
+    state:         ArtifactState     # UNMATCHED | ATTACHED | DISMISSED
+    received_at:   datetime
+    observed_at:   datetime | None   # the clinical time the artifact claims
+```
+
+`ArtifactState` is three values, and the transitions are `UNMATCHED → {ATTACHED, DISMISSED}`. Both
+exits are terminal. A referral never enters these; an artifact never enters the eleven.
+
+**What the split buys, concretely:**
+
+1. **The `attached_from` exemption disappears.** Today `attach_orphan` routes a coordinator's
+   decision through `record_result` with no `MSH-7`, which forced a carve-out in the H2 ordering
+   guard that needed its own safety argument (§11.6). Attaching becomes a `Transition` on the
+   *referral* with `assertion_source = HUMAN` and an `Evidence` referencing the artifact — the
+   shape §8.1 already defines.
+2. **`_EXACT_TIER_STATES` stops needing `ATTACHED`.** The matcher's candidate set is referrals;
+   an attached artifact is not a candidate for anything.
+3. **Retention rules stop being a special case.** `_NEVER_DELETABLE` already treats `ORPHAN`
+   differently from the referral states; with two tables that is two policies, not one policy with
+   an exception.
+4. **The FHIR projection gets its natural split.** The referral is `Task` + `ServiceRequest`; the
+   artifact is `DocumentReference`. Today an orphan would have to project as a `Task` with no
+   `ServiceRequest` behind it, which is not a thing.
+
+### 5.2 Plan split and the interop fork point
+
+Slice 1's implementation is split in two, because an interoperability branch forks between them.
+
+- **Plan 2a — purely additive.** Adds `core/` (models, states) and `fhir/` (the projection and its
+  CodeSystem) alongside the existing code. Touches neither `registry.py` nor `store.py`. The
+  existing nine-state machine keeps running unchanged; a temporary `migration.py` maps `Loop` to
+  `Referral` so the two vocabularies are provably equivalent. Nothing can break, and the suite
+  stays green.
+- **Interop branch forks here.** Slices 3 and 4 (FHIR data layer, CDS Hooks, MCP, SMART) build on
+  the canonical model and add only new directories, so they cannot conflict with 2b's work in
+  `registry.py` and `store.py`.
+- **Plan 2b — the migration.** `Transition` objects, `machine.apply()` with the `RECONCILED`
+  guarantee, the single-transaction store apply, `fhir/provenance.py`, and the ingest remapping.
+  Deletes `migration.py` when the old vocabulary is gone.
+
 ---
 
 ## 6. State machine
