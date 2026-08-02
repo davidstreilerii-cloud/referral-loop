@@ -183,6 +183,7 @@ def test_a_well_formed_profile_loads():
     [
         "connector_id",
         "organization",
+        "vendor",
         "fhir_base_url",
         "token_url",
         "fhir_version",
@@ -433,6 +434,15 @@ def endpoint_of(url: str) -> tuple[str, str, int]:
     port-explicit spelling of an allowed host read as a different one.
     """
     parts = urlsplit(url)
+    if parts.scheme not in _DEFAULT_PORTS:
+        # Typed rather than the KeyError the dict lookup below would otherwise raise. At load
+        # time _url has already refused anything but http/https, so this is unreachable from
+        # config -- but check_allowed calls this on whatever URL it is handed, and the read
+        # client will one day hand it a `next` link out of a Bundle. A KeyError there escapes
+        # every except clause in fetch and surfaces as a crash rather than a refusal.
+        raise _refuse(
+            f"{url!r} has scheme {parts.scheme!r}; only http and https have a known default port"
+        )
     host = (parts.hostname or "").lower()
     port = parts.port or _DEFAULT_PORTS[parts.scheme]
     return (parts.scheme, host, port)
@@ -545,7 +555,10 @@ def _profile_from(entry: object, *, allow_plaintext: bool) -> ConnectorProfile:
     return ConnectorProfile(
         connector_id=raw_id,
         organization=_text(_require(entry, "organization", what), f"{what} organization", _MAX_ORGANIZATION),
-        vendor=_text(entry.get("vendor", "unspecified"), f"{what} vendor", _MAX_VENDOR),
+        # Required despite being inert in A. A site profile that cannot say what it is talking
+        # to is missing the point, and one exempt row would falsify the rule the whole table
+        # rests on -- that nothing here is assumed on the operator's behalf.
+        vendor=_text(_require(entry, "vendor", what), f"{what} vendor", _MAX_VENDOR),
         fhir_base_url=_url(_require(entry, "fhir_base_url", what), f"{what} fhir_base_url", allow_plaintext=allow_plaintext),
         token_url=_url(_require(entry, "token_url", what), f"{what} token_url", allow_plaintext=allow_plaintext),
         fhir_version=versions,
@@ -769,6 +782,8 @@ Spec §5.2 and §5.3. The four overridden defaults are the substance of this mod
 
 from __future__ import annotations
 
+import urllib.request
+
 import pytest
 
 from referral_loop.connect.connectors import ConnectorRegistry
@@ -875,16 +890,32 @@ def test_plaintext_to_a_host_not_named_in_plaintext_hosts_is_refused():
         check_allowed(registry, "http://other.local/api")
 
 
-def test_the_opener_carries_no_proxy_handler(monkeypatch):
+def test_the_opener_ignores_proxy_environment_variables(monkeypatch):
     """urllib reads http_proxy/https_proxy from the environment by default. On a hospital
     network that is frequently set, and honouring it routes PHI and credentials through a host
-    nobody put in the registry."""
+    nobody put in the registry.
+
+    The assertion is that **no** ProxyHandler survives in the chain, which is subtler than it
+    looks and is worth stating. Passing `ProxyHandler({})` to build_opener does two things:
+    build_opener sees an instance of ProxyHandler among the handlers and therefore skips
+    installing its own environment-reading default, and then add_handler discards the empty one
+    because a ProxyHandler built from an empty mapping registers no *_open methods and
+    add_handler only keeps handlers that register at least one. Both steps have to happen for
+    the environment to be ignored.
+
+    Which is exactly why this test asserts zero rather than one: with the environment set, if
+    someone deletes the `ProxyHandler({})` argument as apparently useless, build_opener installs
+    its default, that default reads http_proxy, it registers http_open/https_open, add_handler
+    keeps it -- and this test goes from zero to one and fails. The empty handler looks inert and
+    is load-bearing."""
     monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
     monkeypatch.setenv("http_proxy", "http://proxy.internal:3128")
     opener = build_opener(_registry().get("example-med"))
-    proxies = [h for h in opener.handlers if h.__class__.__name__ == "ProxyHandler"]
-    assert len(proxies) == 1, "expected exactly one ProxyHandler"
-    assert proxies[0].proxies == {}, f"proxy handler is not empty: {proxies[0].proxies}"
+    proxies = [h for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert proxies == [], (
+        "a ProxyHandler in the chain means the environment was consulted: "
+        f"{[p.proxies for p in proxies]}"
+    )
 
 
 def test_the_opener_refuses_redirects():
@@ -1035,8 +1066,20 @@ def build_opener(profile: ConnectorProfile) -> urllib.request.OpenerDirector:
     TLS context means a shared opener would need keying anyway.
     """
     return urllib.request.build_opener(
-        # Empty rather than absent: build_opener installs a ProxyHandler reading the environment
-        # if none is supplied, so passing nothing is not the same as passing this.
+        # DO NOT DELETE THIS AS DEAD WEIGHT. It looks inert and is load-bearing, by a two-step
+        # mechanism worth spelling out because the obvious reading is wrong.
+        #
+        # build_opener installs its own ProxyHandler -- which reads http_proxy/https_proxy from
+        # the environment -- unless an instance of ProxyHandler is among the handlers passed in.
+        # Passing this one suppresses that default. Then add_handler drops this one too, because
+        # a ProxyHandler built from an empty mapping registers no *_open methods and add_handler
+        # keeps only handlers that register at least one.
+        #
+        # So the opener ends up with no ProxyHandler whatsoever, which is the goal: on a hospital
+        # network https_proxy is frequently set, and honouring it would route PHI and credentials
+        # through a host nobody put in the registry. Remove this argument and the default comes
+        # back. tests/test_egress.py asserts the chain is proxy-free with the environment set,
+        # which is what fails if someone tidies this away.
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=_tls_context(profile)),
         _RefuseRedirects(),
@@ -1418,6 +1461,22 @@ REFRESH_MARGIN = timedelta(seconds=60)
 
 _HASHES = {"RS256": hashes.SHA256, "RS384": hashes.SHA384}
 
+# RFC 6749 section 5.2, the codes that mean the fault is on our side. Every one of them is a
+# problem with what we sent or how we are registered, and no retry fixes any of them.
+# `invalid_scope` is the reason this list is not just the obvious three: a scope typo is a
+# configuration error an operator has to go and correct, and reporting it as the remote's
+# problem invites them to wait out something that will never clear.
+_OUR_FAULT = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+    }
+)
+
 
 class AuthFailure(ReferralLoopError):
     """The credential flow failed.
@@ -1517,6 +1576,10 @@ def build_assertion(
 Run: `cd "$REPO" && ./.venv/Scripts/python.exe -m pytest tests/test_connector_auth.py -v`
 Expected: PASS
 
+**Known transient lint state.** The import block above is the *finished* module's, so five names — `urllib.parse`, `dataclass`, `ConnectorRegistry`, `fetch`, and `timedelta` in the test file — are unused until Task 6 adds `Token`, `TokenCache` and `acquire_token`. `ruff check` reports F401 on each until then.
+
+This is a flaw in how the plan was split, recorded rather than hidden: a commit should stand on its own, and this one does not pass lint. It is left as-is because Task 6 immediately follows and resolves all five, and removing-then-re-adding the same imports one task later is churn in the history for no gain. **Task 6 must verify `ruff check src/referral_loop/connect/` is clean before it commits** — that is what converts this from an unnoticed defect into a bounded one. If Task 6 is not going to run next, fix the imports here instead.
+
 - [ ] **Step 7: Commit**
 
 ```bash
@@ -1552,17 +1615,9 @@ Spec §6.2 and §6.3.
 Append to `tests/test_connector_auth.py`:
 
 ```python
-from referral_loop.connect.auth import REFRESH_MARGIN, Token, TokenCache
+Merge `REFRESH_MARGIN`, `Token` and `TokenCache` into the **existing top-of-file import** from `referral_loop.connect.auth` — do not add a second import statement partway down, which is an `E402` and will fail the ruff gate. Then append:
 
-
-class _FakeClock:
-    def __init__(self, start: datetime) -> None:
-        self.now = start
-
-    def advance(self, delta: timedelta) -> None:
-        self.now += delta
-
-
+```python
 def test_a_token_knows_whether_it_is_still_usable():
     token = Token(value="abc", expires_at=_NOW + timedelta(seconds=300))
     assert token.usable_at(_NOW)
@@ -1688,9 +1743,15 @@ def acquire_token(
         # Named separately because the two need different reactions from an operator: ours is a
         # registration or key problem and no retry helps, theirs may clear on its own.
         error = str(payload.get("error", "unspecified"))
-        whose = "our client id or signing key" if error in {
-            "invalid_client", "invalid_grant", "unauthorized_client"
-        } else "the authorization server"
+        if error in _OUR_FAULT:
+            whose = "our client id, signing key, or configured scopes"
+        elif response.status >= 500:
+            whose = "the authorization server"
+        else:
+            # Neither list matched. Say so rather than picking one: guessing "theirs" tells an
+            # operator to wait out something that may never clear, and guessing "ours" sends
+            # them to re-check a configuration that is fine.
+            whose = f"an unrecognised error code at status {response.status}"
         raise AuthFailure(
             f"{profile.connector_id}: token request failed with {response.status} "
             f"{error!r} -- this points at {whose}"
@@ -1967,7 +2028,7 @@ import pytest
 from referral_loop.connect.connectors import ConnectorRegistry
 from referral_loop.connect.preflight import format_report, preflight
 
-from ._certs import rsa_keypair, localhost_cert
+from ._certs import localhost_cert, rsa_keypair
 from ._fhirserver import ServerBehaviour, fhir_server
 
 
@@ -2375,7 +2436,53 @@ def test_a_valid_file_with_an_unreachable_host_exits_nonzero(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "example-med" in out
     assert "FAIL" in out
+
+
+def test_the_peer_cross_check_says_when_it_did_not_run(tmp_path, monkeypatch, capsys):
+    """A silent skip would read as a clean bill of health rather than an absence of evidence
+    -- the same reasoning the README applies to the image tests that skip without Docker."""
+    monkeypatch.delenv("REFERRAL_PACK_PUBKEY", raising=False)
+    path = _connector_file(tmp_path)
+    main(["connectors", "--connectors", str(path)])
+    assert "peer id cross-check: skipped" in capsys.readouterr().out
+
+
+def test_a_connector_id_shared_with_a_configured_peer_warns(tmp_path, monkeypatch, capsys, caplog):
+    """This is the only caller of warn_on_peer_collisions. Without it the whole warning path
+    is unreachable and an operator with a real collision never hears about it."""
+    monkeypatch.delenv("REFERRAL_PACK_PUBKEY", raising=False)
+    path = _connector_file(tmp_path, connector_id="example-ris")
+    peers = tmp_path / "peers.json"
+    peers.write_text(
+        json.dumps(
+            {
+                "transport": "mtls",
+                "tls": {
+                    "certfile": str(tmp_path / "s.crt"),
+                    "keyfile": str(tmp_path / "s.key"),
+                    "client_ca_file": str(tmp_path / "ca.crt"),
+                },
+                "peers": [
+                    {
+                        "peer_id": "example-ris",
+                        "organization": "Example Radiology",
+                        "certificate_sha256": ["a" * 64],
+                        "authorities": ["result"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        main(["connectors", "--connectors", str(path), "--peers", str(peers)])
+    assert "example-ris" in caplog.text
+    assert "peer id cross-check: skipped" not in capsys.readouterr().out
 ```
+
+`_connector_file(tmp_path, connector_id="example-med")` is a helper you should extract from the body of `test_a_valid_file_with_an_unreachable_host_exits_nonzero` above — it writes the same JSON with a throwaway key file, parametrised by `connector_id`. Do not write the JSON literal a third time.
+
+**If `load_peer_registry` refuses this peers file** — it validates TLS file paths that do not exist here — then instead of constructing a real peers file, monkeypatch `referral_loop.cli.load_peer_registry` is *not* acceptable (it is a function-local import). In that case, build the peer registry fixture the way `tests/test_peer_identity.py` already does it, reusing its helpers, and say in your report that you did so.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -2433,11 +2540,25 @@ def _run_connectors(args: argparse.Namespace) -> int:
     Deliberately prints the report to stdout and returns a code rather than raising: an
     operator setting up three sites wants all three verdicts, and the exit code is for the
     script that wrapped the command.
+
+    Cross-checks connector ids against the peer registry when `--peers` names one. That check
+    is the only caller of warn_on_peer_collisions, and it says so when it does *not* run --
+    a silent skip would make the warning look like a clean bill of health when it is actually
+    an absence of evidence, which is the same reasoning the README applies to the image tests
+    that skip when no Docker daemon is reachable.
     """
     from .connect.connectors import load_connector_registry
     from .connect.preflight import format_report, preflight
+    from .peers import load_peer_registry
 
     registry = load_connector_registry(args.connectors)
+
+    if args.peers:
+        # peer_ids is a @property on PeerRegistry, not a method. No parentheses.
+        registry.warn_on_peer_collisions(load_peer_registry(args.peers).peer_ids)
+    else:
+        print("peer id cross-check: skipped, no --peers given\n")
+
     reports = preflight(registry)
     print(format_report(reports))
     return 0 if all(r.ok for r in reports) else 1
@@ -2672,6 +2793,7 @@ second one appears."
 - [ ] The bearer token appears in no report string
 - [ ] Every connector is checked before exit; exit nonzero if any failed
 - [ ] `connectors` runs ahead of the pack-key lookup
+- [ ] `warn_on_peer_collisions` has a real caller — `_run_connectors` cross-checks against `--peers`, and says so when it skips
 - [ ] Full suite green with pre-existing count unmoved; `ruff` and `mypy` clean
 - [ ] `git diff` over `registry.py`, `store.py`, `listener.py`, `matcher.py`, `peers.py` is empty
 - [ ] The CLI has been run and its output shown

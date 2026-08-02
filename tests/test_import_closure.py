@@ -8,6 +8,7 @@ closure the interpreter's whole closure rather than this test's share of it.
 
 Same principle as spec test 7: assert on the real end state, not on a proxy.
 """
+import ast
 import json
 import subprocess
 import sys
@@ -71,6 +72,11 @@ CORE_FORBIDDEN = (
     "referral_loop.pack",
     "referral_loop.fhir",
     "referral_loop.migration",
+    # The domain layer must not reach the network any more than it reaches the store.
+    # core/ has to stay callable from a batch job with no connector configured at all.
+    "referral_loop.connect",
+    "urllib.request",
+    "ssl",
     "sqlite3",
     "flask",
     "jinja2",
@@ -107,6 +113,75 @@ def test_anthropic_is_not_in_the_closure_and_that_is_the_point():
     assert "anthropic" not in _modules_in_a_clean_interpreter(_PROBE), (
         "referral_loop pulled in a model client; v1 makes no model calls, and "
         "spec 13 proves that behaviourally only for the clients it knows to poison."
+    )
+
+
+_SRC = Path(__file__).resolve().parents[1] / "src" / "referral_loop"
+
+# The single permitted egress site. This is the property the README's narrowed claim rests on --
+# "no model calls, and egress only to configured connectors" -- and it is a claim about which
+# file contains the import, not about which modules a probe happened to load. So this reads
+# source rather than sys.modules; an import-probe cannot express it.
+EGRESS_MODULE = "connect/egress.py"
+# socket is deliberately absent: mllp_server.py imports it directly for the inbound listener's
+# socketserver-based TCP server, which is legitimate and has nothing to do with egress. Adding
+# mllp_server.py to a per-file exemption list instead would have been worse -- an allowlist of
+# exempt files is how this test stops meaning anything -- so the module is dropped from the set
+# that applies to every file rather than one file being excused from the set.
+_NETWORK_MODULES = {"urllib.request", "urllib.error", "http.client", "ftplib"}
+
+
+def _imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            found.add(node.module)
+    return found
+
+
+def test_only_the_egress_module_imports_a_network_library():
+    offenders = {}
+    for path in sorted(_SRC.rglob("*.py")):
+        relative = path.relative_to(_SRC).as_posix()
+        if relative == EGRESS_MODULE:
+            continue
+        leaked = sorted(_imported_modules(path) & _NETWORK_MODULES)
+        if leaked:
+            offenders[relative] = leaked
+    assert not offenders, (
+        f"egress must stay confined to {EGRESS_MODULE}; these also import a network "
+        f"library: {offenders}"
+    )
+
+
+def test_fetch_is_the_only_place_in_egress_that_opens_a_connection():
+    """The closure test above polices which file may import urllib.request. This polices how
+    many call sites inside that file reach the network.
+
+    check_allowed runs in fetch, so "egress is bounded to configured connectors" is true only
+    while fetch is the sole caller of .open(). build_opener is public and returns a generic
+    opener bound to no checked destination -- a pagination or streaming helper added later
+    inside egress.py, the one file allowed to touch urllib.request, would pass every other
+    test in this suite while breaking the README's central claim.
+    """
+    tree = ast.parse((_SRC / "connect" / "egress.py").read_text(encoding="utf-8"))
+    openers: dict[str, list[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "open"
+            ):
+                openers.setdefault(node.name, []).append(inner.lineno)
+    assert set(openers) == {"fetch"}, (
+        "only fetch may open a connection, because only fetch calls check_allowed first; "
+        f"found .open() in {openers}"
     )
 
 
