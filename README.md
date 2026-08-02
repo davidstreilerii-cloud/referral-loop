@@ -3,9 +3,17 @@
 Inbound referral loop closure over HL7 v2. Tracks a referral from order to
 returned documentation, and surfaces the ones that never came back.
 
-Deterministic: no model calls, no network egress. The image contains no ML stack
-and no model client, and `tests/test_install_closure.py` asserts that against the
-built image rather than against the Dockerfile.
+Deterministic: no model calls. The image contains no ML stack and no model client,
+and `tests/test_install_closure.py` asserts that against the built image rather than
+against the Dockerfile.
+
+Egress is bounded rather than absent. Until `connect/` existed this said "no network
+egress", which was prose — nothing in the suite forbade a socket. What replaced it is
+narrower and actually enforced: **the only outbound destinations are the ones named in
+the connector file**, `connect/egress.py` is the one module permitted to import
+`urllib.request`, and `tests/test_import_closure.py` fails the build if a second one
+appears. A deployment that configures no connectors makes no outbound connections at
+all, and `listen` and `filedrop` never import the package.
 
 ## What it does
 
@@ -29,7 +37,7 @@ is a different claim, and nothing in v1 observes it.
     export PHI_ENCRYPTION_VERIFIED=1   # or run on an OS-detected encrypted volume
     referral-loop listen --db data/referral_loops.db --peers peers.json
 
-Modes: `listen`, `filedrop`, `worklist`, `eval`, `purge`, `stats`.
+Modes: `listen`, `filedrop`, `worklist`, `eval`, `purge`, `stats`, `connectors`.
 
 `listen` requires mutual TLS. `--peers` names a **JSON** file that carries both
 the TLS material and the peer map, because "which CA may sign a client
@@ -72,6 +80,56 @@ identity, and a warning on every start. A file-based registry can opt out the
 same way, but only by saying `"allow_plaintext": true` *and* listing the source
 addresses it will accept — two independent statements, so neither is reachable by
 a typo in the other.
+
+### Outbound FHIR connectors
+
+`connectors` mode checks every endpoint in a connector file and exits nonzero if any
+failed:
+
+    referral-loop connectors --connectors connectors.json
+
+```json
+{
+  "connectors": [
+    {
+      "connector_id": "example-med",
+      "organization": "Example Medical Center",
+      "vendor": "epic",
+      "fhir_base_url": "https://fhir.example-med.example/api/FHIR/R4",
+      "token_url": "https://fhir.example-med.example/oauth2/token",
+      "fhir_version": ["4.0.1"],
+      "auth": {
+        "mode": "smart-backend-services",
+        "client_id": "<registered client id>",
+        "private_key_file": "/etc/referral/example-med-signing.pem",
+        "key_id": "example-med-2026",
+        "algorithm": "RS384",
+        "scopes": ["system/Patient.read", "system/DocumentReference.read"]
+      },
+      "authorities": [],
+      "tls": { "ca_file": "/etc/referral/example-med-ca.crt" }
+    }
+  ]
+}
+```
+
+No field has a default. A missing `token_url`, `client_id` or `fhir_version` refuses the
+run — there is no "assume R4", and no deriving the token endpoint from the server's own
+discovery document, because that would let the remote choose where a signed credential is
+valid.
+
+`private_key_file` is a path and the loader refuses PEM content pasted into it. A config
+file gets committed and pasted into tickets; the signing key is the whole proof of our
+identity to the remote.
+
+`authorities` uses the same three names as `peers.json` — `merge`, `cancel`, `result` —
+and for the same reason. A FHIR endpoint whose documents can close a loop is asserting
+what an MLLP peer asserts, and a rule that survives only one transport was never a rule.
+A read-only connector grants none, but the field is not optional.
+
+Preflight makes **two** proofs and reports them apart, because `/metadata` is
+unauthenticated on Epic: fetching it proves reachability, TLS and version, and proves
+nothing at all about whether our credentials work.
 
 ## Required configuration
 
