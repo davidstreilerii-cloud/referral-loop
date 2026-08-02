@@ -79,11 +79,15 @@ And one thing has to be *bounded*: where this process may open a socket at all.
 
 ### 2.1 The claim this breaks, and how it is narrowed
 
-`README.md` opens with:
+The claim is in **two** places, and both have to move together:
 
-> Deterministic: no model calls, no network egress.
+- `README.md`, first line of the description: *"Deterministic: no model calls, no network egress."*
+- `cli.py`'s `ArgumentParser(description=...)`: *"Deterministic HL7 v2 referral-loop tracker.
+  On-premise, no model calls, no network egress."* — which is what `--help` prints.
 
-The second half stops being true when `connect/` exists. It is also, today, only half-defended:
+The second half stops being true when `connect/` exists. Updating only the README would leave the
+binary itself asserting the old property to every operator who runs `--help`, which is the more
+authoritative of the two. It is also, today, only half-defended:
 `tests/test_install_closure.py` asserts against the built image that no ML distribution and no
 model client is installed, but **nothing anywhere forbids a network library or an outbound
 socket.** "No network egress" is prose.
@@ -123,9 +127,21 @@ Three, of which exactly one is production code:
 
 | file | change |
 |---|---|
-| `src/referral_loop/cli.py` | one new mode, `connectors`. The only `src/` file outside the new package that changes |
+| `src/referral_loop/cli.py` | one new mode, `connectors`; narrow the `--help` egress claim per §2.1. The only `src/` file outside the new package that changes |
 | `tests/test_import_closure.py` | add `referral_loop.connect` to `CORE_FORBIDDEN`; add the egress closure test (§8.1) |
+| `tests/test_peer_identity.py` | extract its inline x509 generation to `tests/_certs.py` and import it back; no test logic changes |
 | `README.md` | narrow the egress claim per §2.1; document the new mode and its config file |
+
+The `test_peer_identity.py` change is an extraction, not a rewrite. §8.4 needs certificates for the
+local FHIR server and that file already generates them; Plan 2a's Task 1 sets the rule this follows
+— *if the helper is inline rather than named, extract it; do not write a second one*. `tests/_pack.py`
+is the existing precedent for an underscore-prefixed shared test helper.
+
+`connectors` joins `purge` and `stats` in the early-return group in `main()`, ahead of the pack key
+lookup and `boot()`. The comment already there gives the reason and it applies unchanged: an
+operator whose connector file is malformed needs to hear *that*, not a message about a signing key.
+Preflight touches no database, no pack and no PHI, so none of the three boot gates is relevant to
+it.
 
 Nothing else in `src/` is touched. `registry.py`, `store.py`, `listener.py`, `matcher.py` and
 `peers.py` are not modified by this unit.
@@ -238,9 +254,11 @@ configuration file is committed, pasted into tickets, and readable by everyone w
 the signing key is the entire proof of our identity to the remote. This matches
 `REFERRAL_PACK_PUBKEY` coming from the environment rather than shipping beside the pack.
 
-The key file's permissions are checked at load on POSIX and the check is skipped with a logged
-notice on Windows, where the equivalent ACL check is not a one-liner and a wrong answer would be
-worse than an honest absence.
+The key file's permissions are checked at load on POSIX — a **warning**, not a refusal. Refusing
+would strand a deployment whose key is mode 0644 behind an error it cannot fix without a shell on
+the box, which is a worse failure than the one being prevented. On Windows the check is skipped
+with a logged notice rather than silently: the ACL equivalent is not a one-liner, and a check that
+quietly does nothing on the platform someone develops on is worse than an honest absence.
 
 ### 4.3 Why the token endpoint is configured, not discovered
 
@@ -253,8 +271,11 @@ credential to a host of the server's choosing, and the assertion is replayable u
 Configuring the token URL means the destination of our credential is a local decision, checked
 against the allowlist like everything else.
 
-Preflight *may* fetch the discovery document and **report a mismatch** against the configured
-value — that is useful signal — but a mismatch is reported, never followed.
+Preflight does **not** fetch the discovery document at all in A. Reporting a mismatch against the
+configured value would be useful signal, but it is a second network round trip in service of a
+warning, and the field it would check is one an operator copied from the same documentation the
+client id came from. It moves to B if a real endpoint makes it earn its place — recorded here so
+the omission reads as a decision rather than an oversight.
 
 ### 4.4 Deliberately not in A
 
@@ -342,11 +363,15 @@ Sign with `cryptography` — already a dependency, which is why RS384 costs noth
 `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`, the assertion, and
 the configured scopes.
 
-**All timestamps come from `clock.py`, not `datetime.now()`**, so `exp` and the cache refresh
-margin are both deterministically testable. `clock.py` exists because three ingest sites consumed
-an unbounded timestamp and produced three distinct clinical failures; the reason to route through
-it here is narrower — testability — but routing around it would be the start of a second time
-policy.
+**Every function here that needs the current time takes `now: datetime | None = None`, defaulting
+to `datetime.now(timezone.utc)` when absent.** This is the convention `clock.py` already uses for
+`is_future_dated` and `is_readable_clock`, and it is what makes `exp` and the cache refresh margin
+deterministically testable.
+
+`clock.py` itself is *not* used here, and the distinction matters: it is a validation module — it
+answers "is this timestamp trustworthy" about attacker-supplied HL7 timestamps — not a time source.
+It exposes no `now()`. Borrowing its parameter convention is right; routing a JWT `exp` through a
+guard built for `MSH-7` skew would be a category error.
 
 `jti` uniqueness comes from `secrets.token_hex`, not from the clock. A clock-derived `jti` collides
 under a frozen clock in tests, which is exactly when the tests would stop catching replay.
@@ -373,10 +398,14 @@ Exit non-zero if any connector failed either proof.
 | `ConnectorConfigError` | the file is wrong | refuse the boot, exit 2, matching the existing gates |
 | `EgressRefused` | the allowlist said no | never retried; it is a configuration bug, not a transient |
 | `AuthFailure` | token acquisition failed | distinguishes `invalid_client` — our key or id is wrong — from 5xx, which is theirs |
-| `VersionMismatch` | the endpoint's `fhirVersion` is not in our accepted list | refuse the connector, not the boot |
 | `ConnectorUnreachable` | network or TLS failure | reported; other connectors still checked |
 
 All subclass the existing `ReferralLoopError`.
+
+**A FHIR version disagreement is deliberately not an exception.** It is a result — one connector
+failed one of its two proofs — and preflight's contract is to check every connector and report.
+An exception would be a control-flow signal for something the caller has to render as data
+anyway, and the first thing any handler would do is convert it back into a `ProofResult`.
 
 **The assertion JWT and the bearer token are redacted at the logging boundary, not at the call
 sites.** A call site that forgets is the entire failure mode, and there will eventually be a call
@@ -417,9 +446,14 @@ a threaded TLS server. Reuse that machinery for a fake FHIR server serving a Cap
 and a token endpoint, and run full preflight against it — both proofs, over real TLS, through the
 real opener.
 
-Injected failures: wrong `fhirVersion`; `invalid_client` from the token endpoint; a redirect to an
-off-allowlist host; a discovery document whose token endpoint disagrees with the configured one
-(§4.3 — reported, not followed).
+Injected failures: wrong `fhirVersion`; `invalid_client` from the token endpoint; a redirect on the
+metadata endpoint; and a redirect on the token endpoint, which is the one that would leak a signed
+assertion.
+
+Two of these carry the design's main claims and should be read as the load-bearing tests: a wrong
+`fhirVersion` must fail **reach while credential still passes**, and `invalid_client` must fail
+**credential while reach still passes**. If either failure collapses both proofs, the two-proof
+design has been implemented as one proof wearing two labels.
 
 ### 8.5 Sandbox
 
