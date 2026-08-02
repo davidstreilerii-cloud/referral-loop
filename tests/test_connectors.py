@@ -57,6 +57,7 @@ def test_a_well_formed_profile_loads():
     [
         "connector_id",
         "organization",
+        "vendor",
         "fhir_base_url",
         "token_url",
         "fhir_version",
