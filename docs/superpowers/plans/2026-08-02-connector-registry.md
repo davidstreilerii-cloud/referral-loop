@@ -2379,7 +2379,53 @@ def test_a_valid_file_with_an_unreachable_host_exits_nonzero(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "example-med" in out
     assert "FAIL" in out
+
+
+def test_the_peer_cross_check_says_when_it_did_not_run(tmp_path, monkeypatch, capsys):
+    """A silent skip would read as a clean bill of health rather than an absence of evidence
+    -- the same reasoning the README applies to the image tests that skip without Docker."""
+    monkeypatch.delenv("REFERRAL_PACK_PUBKEY", raising=False)
+    path = _connector_file(tmp_path)
+    main(["connectors", "--connectors", str(path)])
+    assert "peer id cross-check: skipped" in capsys.readouterr().out
+
+
+def test_a_connector_id_shared_with_a_configured_peer_warns(tmp_path, monkeypatch, capsys, caplog):
+    """This is the only caller of warn_on_peer_collisions. Without it the whole warning path
+    is unreachable and an operator with a real collision never hears about it."""
+    monkeypatch.delenv("REFERRAL_PACK_PUBKEY", raising=False)
+    path = _connector_file(tmp_path, connector_id="example-ris")
+    peers = tmp_path / "peers.json"
+    peers.write_text(
+        json.dumps(
+            {
+                "transport": "mtls",
+                "tls": {
+                    "certfile": str(tmp_path / "s.crt"),
+                    "keyfile": str(tmp_path / "s.key"),
+                    "client_ca_file": str(tmp_path / "ca.crt"),
+                },
+                "peers": [
+                    {
+                        "peer_id": "example-ris",
+                        "organization": "Example Radiology",
+                        "certificate_sha256": ["a" * 64],
+                        "authorities": ["result"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        main(["connectors", "--connectors", str(path), "--peers", str(peers)])
+    assert "example-ris" in caplog.text
+    assert "peer id cross-check: skipped" not in capsys.readouterr().out
 ```
+
+`_connector_file(tmp_path, connector_id="example-med")` is a helper you should extract from the body of `test_a_valid_file_with_an_unreachable_host_exits_nonzero` above — it writes the same JSON with a throwaway key file, parametrised by `connector_id`. Do not write the JSON literal a third time.
+
+**If `load_peer_registry` refuses this peers file** — it validates TLS file paths that do not exist here — then instead of constructing a real peers file, monkeypatch `referral_loop.cli.load_peer_registry` is *not* acceptable (it is a function-local import). In that case, build the peer registry fixture the way `tests/test_peer_identity.py` already does it, reusing its helpers, and say in your report that you did so.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -2437,11 +2483,24 @@ def _run_connectors(args: argparse.Namespace) -> int:
     Deliberately prints the report to stdout and returns a code rather than raising: an
     operator setting up three sites wants all three verdicts, and the exit code is for the
     script that wrapped the command.
+
+    Cross-checks connector ids against the peer registry when `--peers` names one. That check
+    is the only caller of warn_on_peer_collisions, and it says so when it does *not* run --
+    a silent skip would make the warning look like a clean bill of health when it is actually
+    an absence of evidence, which is the same reasoning the README applies to the image tests
+    that skip when no Docker daemon is reachable.
     """
     from .connect.connectors import load_connector_registry
     from .connect.preflight import format_report, preflight
+    from .peers import load_peer_registry
 
     registry = load_connector_registry(args.connectors)
+
+    if args.peers:
+        registry.warn_on_peer_collisions(load_peer_registry(args.peers).peer_ids())
+    else:
+        print("peer id cross-check: skipped, no --peers given\n")
+
     reports = preflight(registry)
     print(format_report(reports))
     return 0 if all(r.ok for r in reports) else 1
@@ -2676,6 +2735,7 @@ second one appears."
 - [ ] The bearer token appears in no report string
 - [ ] Every connector is checked before exit; exit nonzero if any failed
 - [ ] `connectors` runs ahead of the pack-key lookup
+- [ ] `warn_on_peer_collisions` has a real caller — `_run_connectors` cross-checks against `--peers`, and says so when it skips
 - [ ] Full suite green with pre-existing count unmoved; `ruff` and `mypy` clean
 - [ ] `git diff` over `registry.py`, `store.py`, `listener.py`, `matcher.py`, `peers.py` is empty
 - [ ] The CLI has been run and its output shown
