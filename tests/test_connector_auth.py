@@ -116,14 +116,6 @@ def test_a_missing_key_file_is_a_typed_failure(tmp_path):
         build_assertion(_profile(tmp_path / "absent.pem"), now=_NOW)
 
 
-class _FakeClock:
-    def __init__(self, start: datetime) -> None:
-        self.now = start
-
-    def advance(self, delta: timedelta) -> None:
-        self.now += delta
-
-
 def test_a_token_knows_whether_it_is_still_usable():
     token = Token(value="abc", expires_at=_NOW + timedelta(seconds=300))
     assert token.usable_at(_NOW)

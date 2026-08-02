@@ -1560,6 +1560,10 @@ def build_assertion(
 Run: `cd "$REPO" && ./.venv/Scripts/python.exe -m pytest tests/test_connector_auth.py -v`
 Expected: PASS
 
+**Known transient lint state.** The import block above is the *finished* module's, so five names — `urllib.parse`, `dataclass`, `ConnectorRegistry`, `fetch`, and `timedelta` in the test file — are unused until Task 6 adds `Token`, `TokenCache` and `acquire_token`. `ruff check` reports F401 on each until then.
+
+This is a flaw in how the plan was split, recorded rather than hidden: a commit should stand on its own, and this one does not pass lint. It is left as-is because Task 6 immediately follows and resolves all five, and removing-then-re-adding the same imports one task later is churn in the history for no gain. **Task 6 must verify `ruff check src/referral_loop/connect/` is clean before it commits** — that is what converts this from an unnoticed defect into a bounded one. If Task 6 is not going to run next, fix the imports here instead.
+
 - [ ] **Step 7: Commit**
 
 ```bash
@@ -1595,17 +1599,9 @@ Spec §6.2 and §6.3.
 Append to `tests/test_connector_auth.py`:
 
 ```python
-from referral_loop.connect.auth import REFRESH_MARGIN, Token, TokenCache
+Merge `REFRESH_MARGIN`, `Token` and `TokenCache` into the **existing top-of-file import** from `referral_loop.connect.auth` — do not add a second import statement partway down, which is an `E402` and will fail the ruff gate. Then append:
 
-
-class _FakeClock:
-    def __init__(self, start: datetime) -> None:
-        self.now = start
-
-    def advance(self, delta: timedelta) -> None:
-        self.now += delta
-
-
+```python
 def test_a_token_knows_whether_it_is_still_usable():
     token = Token(value="abc", expires_at=_NOW + timedelta(seconds=300))
     assert token.usable_at(_NOW)
