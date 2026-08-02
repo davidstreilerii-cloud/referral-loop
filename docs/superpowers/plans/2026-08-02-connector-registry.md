@@ -773,6 +773,8 @@ Spec §5.2 and §5.3. The four overridden defaults are the substance of this mod
 
 from __future__ import annotations
 
+import urllib.request
+
 import pytest
 
 from referral_loop.connect.connectors import ConnectorRegistry
@@ -879,16 +881,32 @@ def test_plaintext_to_a_host_not_named_in_plaintext_hosts_is_refused():
         check_allowed(registry, "http://other.local/api")
 
 
-def test_the_opener_carries_no_proxy_handler(monkeypatch):
+def test_the_opener_ignores_proxy_environment_variables(monkeypatch):
     """urllib reads http_proxy/https_proxy from the environment by default. On a hospital
     network that is frequently set, and honouring it routes PHI and credentials through a host
-    nobody put in the registry."""
+    nobody put in the registry.
+
+    The assertion is that **no** ProxyHandler survives in the chain, which is subtler than it
+    looks and is worth stating. Passing `ProxyHandler({})` to build_opener does two things:
+    build_opener sees an instance of ProxyHandler among the handlers and therefore skips
+    installing its own environment-reading default, and then add_handler discards the empty one
+    because a ProxyHandler built from an empty mapping registers no *_open methods and
+    add_handler only keeps handlers that register at least one. Both steps have to happen for
+    the environment to be ignored.
+
+    Which is exactly why this test asserts zero rather than one: with the environment set, if
+    someone deletes the `ProxyHandler({})` argument as apparently useless, build_opener installs
+    its default, that default reads http_proxy, it registers http_open/https_open, add_handler
+    keeps it -- and this test goes from zero to one and fails. The empty handler looks inert and
+    is load-bearing."""
     monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
     monkeypatch.setenv("http_proxy", "http://proxy.internal:3128")
     opener = build_opener(_registry().get("example-med"))
-    proxies = [h for h in opener.handlers if h.__class__.__name__ == "ProxyHandler"]
-    assert len(proxies) == 1, "expected exactly one ProxyHandler"
-    assert proxies[0].proxies == {}, f"proxy handler is not empty: {proxies[0].proxies}"
+    proxies = [h for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert proxies == [], (
+        "a ProxyHandler in the chain means the environment was consulted: "
+        f"{[p.proxies for p in proxies]}"
+    )
 
 
 def test_the_opener_refuses_redirects():
@@ -1039,8 +1057,20 @@ def build_opener(profile: ConnectorProfile) -> urllib.request.OpenerDirector:
     TLS context means a shared opener would need keying anyway.
     """
     return urllib.request.build_opener(
-        # Empty rather than absent: build_opener installs a ProxyHandler reading the environment
-        # if none is supplied, so passing nothing is not the same as passing this.
+        # DO NOT DELETE THIS AS DEAD WEIGHT. It looks inert and is load-bearing, by a two-step
+        # mechanism worth spelling out because the obvious reading is wrong.
+        #
+        # build_opener installs its own ProxyHandler -- which reads http_proxy/https_proxy from
+        # the environment -- unless an instance of ProxyHandler is among the handlers passed in.
+        # Passing this one suppresses that default. Then add_handler drops this one too, because
+        # a ProxyHandler built from an empty mapping registers no *_open methods and add_handler
+        # keeps only handlers that register at least one.
+        #
+        # So the opener ends up with no ProxyHandler whatsoever, which is the goal: on a hospital
+        # network https_proxy is frequently set, and honouring it would route PHI and credentials
+        # through a host nobody put in the registry. Remove this argument and the default comes
+        # back. tests/test_egress.py asserts the chain is proxy-free with the environment set,
+        # which is what fails if someone tidies this away.
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=_tls_context(profile)),
         _RefuseRedirects(),
