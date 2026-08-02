@@ -2554,7 +2554,8 @@ def _run_connectors(args: argparse.Namespace) -> int:
     registry = load_connector_registry(args.connectors)
 
     if args.peers:
-        registry.warn_on_peer_collisions(load_peer_registry(args.peers).peer_ids())
+        # peer_ids is a @property on PeerRegistry, not a method. No parentheses.
+        registry.warn_on_peer_collisions(load_peer_registry(args.peers).peer_ids)
     else:
         print("peer id cross-check: skipped, no --peers given\n")
 
