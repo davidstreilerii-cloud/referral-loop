@@ -113,6 +113,12 @@ checkout:
 |---|---|
 | `REFERRAL_AUDIT_DB` | the audit database path. Its default is package-relative, which resolves correctly in a source checkout and lands beside `site-packages` — read-only — when installed. Audit write failures are swallowed by design, so unset the symptom is an empty audit trail rather than an error. The Dockerfile sets it. |
 
+### Optional, and best left alone: the published CodeSystem canonical
+
+| variable | |
+|---|---|
+| `REFERRAL_BUSINESS_STATUS_URL` | the canonical url of the `Task.businessStatus` CodeSystem this software publishes. Defaults to `https://referral-loop.health/fhir/CodeSystem/referral-business-status`. **Overriding it costs you interoperability:** a canonical url identifies the vocabulary, not the site, so two hospitals that each publish these eleven codes under their own url hand receiving organisations two code systems that cannot be recognised as the same one — the exact ambiguity publishing a CodeSystem is meant to remove. Leave it unset unless a policy forbids asserting a vendor-owned identifier, and set it *before* any external system stores its first Coding, because after that a change is a rename of something already in someone else's database. A site with no domain of its own can use a `urn:uuid:` form. An empty or malformed value refuses the boot rather than publishing a broken canonical. |
+
 ## Tests
 
     python -m pytest tests/ -q                 # everything

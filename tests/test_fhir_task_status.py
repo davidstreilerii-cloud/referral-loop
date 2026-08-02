@@ -8,10 +8,20 @@ model would have no justification over adopting Task.status as the vocabulary di
 tests are that justification, expressed as something that can fail.
 """
 
+import importlib
+import os
+from pathlib import Path
+
 import pytest
 
 from referral_loop.core.states import Hold, ReferralState
-from referral_loop.fhir.codesystems import BUSINESS_STATUS
+from referral_loop.errors import ReferralLoopError
+from referral_loop.fhir import codesystems
+from referral_loop.fhir.codesystems import (
+    BUSINESS_STATUS,
+    BUSINESS_STATUS_URL_ENV,
+    DEFAULT_BUSINESS_STATUS_URL,
+)
 from referral_loop.fhir.task_status import R4_TASK_STATUS, project
 
 _HOLD = Hold(reason="x", actor="y")
@@ -174,10 +184,18 @@ def test_a_business_status_is_emitted_for_every_state_under_hold_and_they_are_al
 
 def test_the_codesystem_is_a_resource_with_a_stable_canonical_and_a_version():
     """The canonical url is the identity every stored Coding refers back to. Renaming it
-    after publication silently invalidates them all, so it is pinned as a literal: changing
-    it should require editing a test that says why."""
+    after publication silently invalidates them all, so the *shipped default* is still
+    pinned as a literal: changing it should require editing a test that says why.
+
+    What is no longer pinned is `BUSINESS_STATUS["url"]` against that literal -- a site may
+    override it (see the block at the bottom of this file). The default is what an
+    unconfigured deployment publishes, and that is the value this pins."""
     assert BUSINESS_STATUS["resourceType"] == "CodeSystem"
-    assert BUSINESS_STATUS["url"] == "https://referral-loop.health/fhir/CodeSystem/referral-business-status"
+    assert (
+        DEFAULT_BUSINESS_STATUS_URL
+        == "https://referral-loop.health/fhir/CodeSystem/referral-business-status"
+    )
+    assert BUSINESS_STATUS["url"] == DEFAULT_BUSINESS_STATUS_URL
     assert BUSINESS_STATUS["version"] == "1.0.0"
     assert BUSINESS_STATUS["content"] == "complete"
 
@@ -188,3 +206,151 @@ def test_every_concept_carries_a_definition():
     for concept in BUSINESS_STATUS["concept"]:
         assert concept["display"].strip()
         assert concept["definition"].strip()
+
+
+# --- the canonical is configurable, and the default is the interoperable one --------------
+#
+# The override is read once, at import, so these tests reload the module. The fixture puts
+# both the environment and the module back afterwards: a leaked override would leave every
+# later test in this session asserting against a canonical no deployment actually publishes.
+
+
+@pytest.fixture
+def published_under():
+    """Reload codesystems.py with the override set (or unset), then restore both."""
+    original = os.environ.get(BUSINESS_STATUS_URL_ENV)
+
+    def _load(value: str | None):
+        if value is None:
+            os.environ.pop(BUSINESS_STATUS_URL_ENV, None)
+        else:
+            os.environ[BUSINESS_STATUS_URL_ENV] = value
+        return importlib.reload(codesystems)
+
+    yield _load
+
+    if original is None:
+        os.environ.pop(BUSINESS_STATUS_URL_ENV, None)
+    else:
+        os.environ[BUSINESS_STATUS_URL_ENV] = original
+    importlib.reload(codesystems)
+
+
+def test_the_shipped_default_is_published_when_nothing_is_configured(published_under):
+    """Unset is the case that has to work, because it is the case that interoperates. Two
+    sites that both leave this alone publish the same canonical, and a receiver can tell
+    that their `seen` codes are the same concept."""
+    mod = published_under(None)
+    assert mod.BUSINESS_STATUS_URL == DEFAULT_BUSINESS_STATUS_URL
+    assert mod.BUSINESS_STATUS["url"] == DEFAULT_BUSINESS_STATUS_URL
+
+
+def test_a_site_override_is_honoured_and_reaches_the_published_resource(published_under):
+    """Not just the constant -- the CodeSystem a receiver is handed. A resource that kept
+    the default while the constant moved would be the drift this is meant to prevent."""
+    override = "https://fhir.example-hospital.org/CodeSystem/referral-business-status"
+    mod = published_under(override)
+    assert mod.BUSINESS_STATUS_URL == override
+    assert mod.BUSINESS_STATUS["url"] == override
+    assert mod.BUSINESS_STATUS["url"] != DEFAULT_BUSINESS_STATUS_URL
+
+
+def test_a_urn_uuid_override_is_honoured(published_under):
+    """A site with no domain it can promise to keep has one legitimate way to mint a
+    canonical, and it is this. `urn:uuid:` has no host and no path in the http sense, so a
+    validator written only against https would reject the one form such a site can use."""
+    override = "urn:uuid:53fefa32-fcbb-4ff8-8a92-55ee120877b7"
+    mod = published_under(override)
+    assert mod.BUSINESS_STATUS_URL == override
+    assert mod.BUSINESS_STATUS["url"] == override
+
+
+def test_a_urn_oid_override_is_honoured(published_under):
+    """The other urn form a hospital plausibly already has an assigned arc under."""
+    override = "urn:oid:2.16.840.1.113883.3.9999.1"
+    mod = published_under(override)
+    assert mod.BUSINESS_STATUS["url"] == override
+
+
+def test_the_shipped_default_passes_the_check_applied_to_an_override(published_under):
+    """Otherwise the validator could be arbitrarily strict and nobody would notice, because
+    the default reaches the resource without going through it."""
+    mod = published_under(DEFAULT_BUSINESS_STATUS_URL)
+    assert mod.BUSINESS_STATUS["url"] == DEFAULT_BUSINESS_STATUS_URL
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="whitespace-only"),
+        pytest.param("\t\n", id="tab-and-newline"),
+    ],
+)
+def test_an_empty_override_refuses_at_import(published_under, override):
+    """An empty value is somebody's `export REFERRAL_BUSINESS_STATUS_URL=$SOME_UNSET_VAR`.
+    Falling back to the default there would be defensible; publishing an empty canonical
+    would not, and treating it as "unset" hides that the deployment's config is broken."""
+    with pytest.raises(ReferralLoopError) as exc:
+        published_under(override)
+    assert BUSINESS_STATUS_URL_ENV in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param("not a url", id="prose"),
+        pytest.param("referral-loop.health/fhir/CodeSystem/x", id="no-scheme"),
+        pytest.param("/fhir/CodeSystem/referral-business-status", id="relative-path"),
+        pytest.param("https:", id="scheme-only"),
+        pytest.param("urn:", id="urn-with-no-namespace"),
+        pytest.param("https://example.org/cs with a space", id="embedded-space"),
+        pytest.param("https://example.org/cs|1.0.0", id="version-pipe"),
+    ],
+)
+def test_a_malformed_override_refuses_at_import(published_under, override):
+    """A canonical that is not a URI is not a canonical. Refusing at import names the
+    variable; publishing it means a receiving system stores Codings against a system
+    identifier that resolves to nothing and matches nothing."""
+    with pytest.raises(ReferralLoopError) as exc:
+        published_under(override)
+    assert BUSINESS_STATUS_URL_ENV in str(exc.value)
+
+
+def test_surrounding_whitespace_is_stripped_rather_than_refused(published_under):
+    """A trailing space in a .env file is never a decision, and `RetentionPolicy.from_env`
+    strips its values the same way. Whitespace *inside* the url is a different case and is
+    refused above -- there is no url it could have been."""
+    mod = published_under("  https://fhir.example-hospital.org/CodeSystem/x\n")
+    assert mod.BUSINESS_STATUS["url"] == "https://fhir.example-hospital.org/CodeSystem/x"
+
+
+def test_the_refusal_is_not_something_every_override_gets(published_under):
+    """The two refusal tests above prove nothing if the validator rejects everything."""
+    mod = published_under("https://fhir.example-hospital.org/CodeSystem/x")
+    assert mod.BUSINESS_STATUS["url"] == "https://fhir.example-hospital.org/CodeSystem/x"
+
+
+def test_the_canonical_is_written_out_exactly_once_in_the_source_tree():
+    """One source of truth, checked as a property of the tree rather than trusted.
+
+    `task_status.py` emits no `system` today -- it returns bare code strings -- so there is
+    nothing to keep in step yet. The moment an emitter does need one, the way it will be
+    written is a second copy of the literal next to the Coding, and the two constants will
+    then drift the first time a site sets the override: the CodeSystem published under the
+    site's canonical, the Codings emitted under ours. This fails on the copy, before the
+    drift exists to be found."""
+    src = Path(__file__).resolve().parent.parent / "src" / "referral_loop"
+    counted = {
+        path.relative_to(src).as_posix(): path.read_text(encoding="utf-8").count(
+            DEFAULT_BUSINESS_STATUS_URL
+        )
+        for path in src.rglob("*.py")
+    }
+    occurrences = {name: n for name, n in counted.items() if n}
+    assert occurrences == {"fhir/codesystems.py": 1}, (
+        "the canonical url is written out more than once, so an override reaches one copy "
+        f"and not the other: {occurrences}. The second copy is the drift; there is exactly "
+        "one assignment, DEFAULT_BUSINESS_STATUS_URL, and everything else reads "
+        "BUSINESS_STATUS_URL."
+    )
