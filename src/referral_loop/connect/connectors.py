@@ -253,7 +253,7 @@ class ConnectorRegistry:
         for p in self.connectors:
             if p.connector_id == connector_id:
                 return p
-        raise _refuse(f"no connector named {connector_id!r}")
+        raise _refuse(f"no connector named {connector_id!r}; configured: {self.connector_ids()}")
 
     def connector_ids(self) -> tuple[str, ...]:
         return tuple(p.connector_id for p in self.connectors)

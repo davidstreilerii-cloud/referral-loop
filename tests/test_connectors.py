@@ -10,6 +10,7 @@ import pytest
 from referral_loop.connect.connectors import (
     ConnectorConfigError,
     ConnectorRegistry,
+    endpoint_of,
     load_connector_registry,
 )
 
@@ -205,3 +206,67 @@ def test_load_refuses_malformed_json(tmp_path: Path):
     path.write_text("{ not json", encoding="utf-8")
     with pytest.raises(ConnectorConfigError, match="JSON"):
         load_connector_registry(path)
+
+
+def test_the_connector_id_pattern_has_not_drifted_from_the_peer_id_pattern():
+    """Two modules, one constraint, and connectors.py says so in a comment. peers.py is not
+    modified by this sub-project, so the pattern cannot be shared without touching it -- this
+    asserts the equality instead, so tightening one side cannot silently leave the other behind."""
+    from referral_loop.connect.connectors import _CONNECTOR_ID_RE
+    from referral_loop.peers import _PEER_ID_RE
+
+    assert _CONNECTOR_ID_RE.pattern == _PEER_ID_RE.pattern
+
+
+def test_authorities_must_be_present_even_when_empty():
+    broken = _profile()
+    del broken["authorities"]
+    with pytest.raises(ConnectorConfigError, match="authorities"):
+        _registry(broken)
+
+
+def test_a_ca_file_is_read_when_given():
+    reg = _registry(_profile(tls={"ca_file": "/etc/referral/example-med-ca.crt"}))
+    assert reg.get("example-med").ca_file == Path("/etc/referral/example-med-ca.crt")
+
+
+def test_no_tls_block_means_the_system_trust_store():
+    assert _registry().get("example-med").ca_file is None
+
+
+def test_a_malformed_tls_block_refuses():
+    with pytest.raises(ConnectorConfigError, match="tls"):
+        _registry(_profile(tls="/etc/ca.crt"))
+
+
+def test_an_endpoint_makes_the_default_port_explicit():
+    assert endpoint_of("https://fhir.example-med.example/api") == ("https", "fhir.example-med.example", 443)
+
+
+def test_an_explicit_default_port_normalises_to_the_same_endpoint():
+    """The allowlist compares these triples. A string comparison would let a port-explicit
+    spelling of an allowed host read as a different destination."""
+    assert endpoint_of("https://h/a") == endpoint_of("https://h:443/b")
+
+
+def test_a_nondefault_port_is_a_different_endpoint():
+    assert endpoint_of("https://h:8443/a") != endpoint_of("https://h/a")
+
+
+def test_a_host_is_lowercased_in_an_endpoint():
+    assert endpoint_of("https://FHIR.EXAMPLE-MED.EXAMPLE/api")[1] == "fhir.example-med.example"
+
+
+def test_the_allowlist_covers_both_the_api_and_the_token_host():
+    reg = _registry(
+        _profile(
+            fhir_base_url="https://fhir.example-med.example/api/FHIR/R4",
+            token_url="https://auth.example-med.example/oauth2/token",
+        )
+    )
+    assert reg.endpoints() == frozenset(
+        {
+            ("https", "fhir.example-med.example", 443),
+            ("https", "auth.example-med.example", 443),
+        }
+    )
