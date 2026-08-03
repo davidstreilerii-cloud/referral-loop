@@ -26,9 +26,10 @@ from datetime import datetime
 from urllib.parse import quote
 
 from ..errors import ReferralLoopError
-from .auth import acquire_token
+from .auth import TokenCache, acquire_token
 from .connectors import ConnectorProfile, ConnectorRegistry
-from .egress import Response
+from .egress import EgressRefused, Response
+from .resources import READABLE_TYPES, DocumentSearch, FetchedResource, ResourceMalformed, validate
 from .retry import fetch_retrying
 
 logger = logging.getLogger(__name__)
@@ -83,8 +84,13 @@ def _authorized_get(
     registry: ConnectorRegistry,
     profile: ConnectorProfile,
     url: str,
+    *,
+    cache: TokenCache,
 ) -> Mapping[str, object]:
-    token = acquire_token(registry, profile)
+    # One token per search rather than one per request. A twenty-page walk would otherwise sign
+    # twenty JWTs and make twenty token calls against an authorization server that just issued a
+    # perfectly good credential -- and TokenCache existed with no caller until this used it.
+    token = cache.get(profile.connector_id, lambda: acquire_token(registry, profile))
     response = fetch_retrying(
         registry,
         profile,
@@ -138,11 +144,12 @@ def resolve_patient(
     profile: ConnectorProfile,
     *,
     mrn: str,
+    cache: TokenCache | None = None,
 ) -> str:
     """Hop 1. Returns the remote's Patient id, or raises -- never returns nothing."""
     system = profile.mrn_system
     url = patient_search_url(profile, mrn)  # raises ConnectorCannotResolvePatients if undeclared
-    found = _entries(_authorized_get(registry, profile, url))
+    found = _entries(_authorized_get(registry, profile, url, cache=cache or TokenCache()))
 
     if not found:
         raise PatientNotFoundAtConnector(
@@ -159,3 +166,139 @@ def resolve_patient(
     if not isinstance(patient_id, str) or not patient_id:
         raise FhirRequestFailed(f"{profile.connector_id}: resolved Patient carries no id")
     return patient_id
+
+
+# A page budget for the whole call, not per resource type, so two types cannot quietly double
+# it. Exceeding it raises: a truncated search that reports "nothing further" is the same false
+# negative as never having searched.
+MAX_PAGES = 20
+MAX_RESOURCES = 500
+
+
+class PaginationRefused(ReferralLoopError):
+    """A next link led somewhere it should not, or the walk ran past its budget."""
+
+
+def _next_url(bundle: Mapping[str, object]) -> str | None:
+    links = bundle.get("link")
+    if not isinstance(links, list):
+        return None
+    for link in links:
+        if isinstance(link, dict) and link.get("relation") == "next":
+            url = link.get("url")
+            return url if isinstance(url, str) and url else None
+    return None
+
+
+def _walk(
+    registry: ConnectorRegistry,
+    profile: ConnectorProfile,
+    first_url: str,
+    *,
+    budget: list[int],
+    cache: TokenCache,
+) -> tuple[list[tuple[Mapping[str, object], int]], list[str], int]:
+    """Follow next links, returning (resources, urls_visited, pages).
+
+    `budget` is a one-element list shared across both resource-type walks, so the cap applies to
+    the call rather than to each type.
+    """
+    collected: list[tuple[Mapping[str, object], int]] = []
+    visited: list[str] = []
+    url: str | None = first_url
+    pages = 0
+
+    while url is not None:
+        if budget[0] <= 0:
+            raise PaginationRefused(
+                f"{profile.connector_id}: exceeded {MAX_PAGES} pages. Refusing rather than "
+                "returning a truncated result, which would read as 'nothing further'."
+            )
+        if url in visited:
+            raise PaginationRefused(
+                f"{profile.connector_id}: next link points at itself ({url}); pagination loop"
+            )
+
+        # check_allowed runs inside fetch, so a next link off the allowlist refuses here rather
+        # than being followed. It is a URL the remote chose.
+        try:
+            payload = _authorized_get(registry, profile, url, cache=cache)
+        except EgressRefused as exc:
+            raise PaginationRefused(
+                f"{profile.connector_id}: next link left the allowlist: {exc}"
+            ) from exc
+
+        visited.append(url)
+        budget[0] -= 1
+        pages += 1
+        # Paired with the page it came from, so FetchedResource.page is the real page rather
+        # than arithmetic over an index -- provenance that is guessed is not provenance.
+        collected.extend((resource, pages) for resource in _entries(payload))
+        if len(collected) > MAX_RESOURCES:
+            raise PaginationRefused(
+                f"{profile.connector_id}: more than {MAX_RESOURCES} resources; refusing rather "
+                "than truncating"
+            )
+        url = _next_url(payload)
+
+    return collected, visited, pages
+
+
+def find_candidate_documents(
+    registry: ConnectorRegistry,
+    profile: ConnectorProfile,
+    *,
+    mrn: str,
+    since: datetime,
+    until: datetime | None = None,
+) -> DocumentSearch:
+    """Hop 1 then hop 2, for both readable resource types."""
+    cache = TokenCache()
+    patient_id = resolve_patient(registry, profile, mrn=mrn, cache=cache)
+
+    window = f"&date=ge{since.date().isoformat()}"
+    if until is not None:
+        window += f"&date=le{until.date().isoformat()}"
+
+    budget = [MAX_PAGES]
+    resources: list[FetchedResource] = []
+    # The real hop-1 URL, not a reconstruction: provenance that is approximated is not
+    # provenance, and this is the string a coordinator reads to see what was actually asked.
+    urls: list[str] = [patient_search_url(profile, mrn)]
+    skipped = 0
+    pages_walked = 0
+
+    for kind in READABLE_TYPES:
+        first = (
+            f"{profile.fhir_base_url}/{kind}"
+            f"?patient={quote('Patient/' + patient_id, safe='')}{window}"
+        )
+        found, visited, pages = _walk(registry, profile, first, budget=budget, cache=cache)
+        urls.extend(visited)
+        pages_walked += pages
+        for raw, page in found:
+            try:
+                validate(raw)
+            except ResourceMalformed as exc:
+                # Skipped and counted, not fatal. One malformed resource must not hide the
+                # others -- and the count returns on the result rather than only in a log.
+                logger.warning("%s: discarding a malformed resource: %s", profile.connector_id, exc)
+                skipped += 1
+                continue
+            resources.append(
+                FetchedResource(
+                    resource_type=kind,
+                    resource=raw,
+                    connector_id=profile.connector_id,
+                    query_url=first,
+                    page=page,
+                )
+            )
+
+    return DocumentSearch(
+        resources=tuple(resources),
+        patient_id=patient_id,
+        pages_walked=pages_walked,
+        skipped_malformed=skipped,
+        query_urls=tuple(urls),
+    )

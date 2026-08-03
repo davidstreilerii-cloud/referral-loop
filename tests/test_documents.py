@@ -8,14 +8,24 @@ import pytest
 
 from referral_loop.connect.connectors import ConnectorRegistry
 from referral_loop.connect.documents import (
+    MAX_PAGES,
     ConnectorCannotResolvePatients,
+    PaginationRefused,
     PatientAmbiguousAtConnector,
     PatientNotFoundAtConnector,
+    find_candidate_documents,
     resolve_patient,
 )
 
 from ._certs import localhost_cert, rsa_keypair
-from ._fhirserver import ServerBehaviour, bundle, fhir_server, patient
+from ._fhirserver import (
+    ServerBehaviour,
+    bundle,
+    diagnostic_report,
+    document_reference,
+    fhir_server,
+    patient,
+)
 
 _SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -124,3 +134,108 @@ def test_the_mrn_does_not_reach_the_logs_on_failure(certs, tmp_path, caplog):
             with pytest.raises(Exception):
                 resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
     assert "MRN1" not in caplog.text, "the MRN reached the logs via diagnostics"
+
+
+def _patient_bundle():
+    return {"/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": bundle(patient("p1"))}
+
+
+def test_both_resource_types_are_queried(certs, tmp_path):
+    """A consult note arrives as a DocumentReference and a lab result as a DiagnosticReport,
+    which is the FHIR analogue of the ORU the HL7 path already closes on. Querying one would
+    miss every diagnostic referral."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(document_reference("d1"))
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(diagnostic_report("r1"))
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        got = find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+    assert {r.resource_type for r in got.resources} == {"DocumentReference", "DiagnosticReport"}
+    assert got.patient_id == "p1"
+
+
+def test_a_resolved_patient_with_nothing_filed_returns_empty(certs, tmp_path):
+    """The one case where empty is the right answer, and the reason the other three raise."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        got = find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+    assert got.resources == ()
+    assert got.patient_id == "p1"
+
+
+def test_a_next_link_off_the_allowlist_refuses_loudly(certs, tmp_path):
+    """A next link is chosen by the remote. Refusing quietly would hand back a truncated result
+    set wearing the costume of a complete one."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        document_reference("d1"), next_url="https://evil.example/page2"
+    )
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="evil.example"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_a_self_referential_next_link_refuses(certs, tmp_path):
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    with fhir_server(certfile, keyfile) as (base, _b):
+        page = f"{base}/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"
+        bundles = _patient_bundle()
+        bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+            document_reference("d1"), next_url=page
+        )
+        bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+        _b.bundles.update(bundles)
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="itself|loop"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_the_page_cap_raises_rather_than_truncating(certs, tmp_path):
+    """The cap is the reason MAX_PAGES is exported. A server that always hands back a next link
+    would otherwise walk forever against a host we do trust -- and stopping quietly at the cap
+    would report 'nothing further' over a search that was cut off, which is the same false
+    negative as never having searched."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    with fhir_server(certfile, keyfile) as (base, behaviour):
+        behaviour.bundles.update(_patient_bundle())
+        # A chain longer than the budget: every page points at another, none is ever the last.
+        behaviour.bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+            document_reference("d0"), next_url=f"{base}/DocumentReference?page=1"
+        )
+        for page in range(1, MAX_PAGES + 3):
+            behaviour.bundles[f"/DocumentReference?page={page}"] = bundle(
+                document_reference(f"d{page}"),
+                next_url=f"{base}/DocumentReference?page={page + 1}",
+            )
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="pages"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_a_malformed_resource_is_skipped_and_counted(certs, tmp_path):
+    """One bad resource must not hide the good ones -- the posture UnparseableSegmentError
+    already takes for a bad HL7 segment -- but the count comes back, not a log line."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        document_reference("d1"), {"resourceType": "DocumentReference", "id": "broken"}
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        got = find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+    assert len(got.resources) == 1
+    assert got.skipped_malformed == 1
