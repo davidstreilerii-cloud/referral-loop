@@ -436,6 +436,17 @@ def _run_connectors(args: argparse.Namespace) -> int:
     else:
         print("peer id cross-check: skipped, no --peers given\n")
 
+    unqueryable = [c.connector_id for c in registry.connectors if not c.is_queryable]
+    if unqueryable:
+        # Stated at configuration time rather than discovered by a query returning nothing.
+        # These connectors can prove they are reachable and that our credentials work, and
+        # cannot be asked about a patient at all.
+        print(
+            "preflight-only (no identifier_systems.mrn, cannot be queried for documents): "
+            + ", ".join(unqueryable)
+            + "\n"
+        )
+
     reports = preflight(registry)
     print(format_report(reports))
     return 0 if all(r.ok for r in reports) else 1
