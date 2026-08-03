@@ -14,10 +14,25 @@
 
 ## Baseline
 
-- **Always the repo venv:** `./.venv/Scripts/python.exe`. A stale global `healthcare-rag` shadows this tree.
+- **Work in the isolated worktree: `$WORKTREE`**, not `$REPO`. It has its own `.venv` — always `./.venv/Scripts/python.exe` from the worktree root, never bare `python` and never the main tree's venv.
 - Branch `fhir-read-client`, forked from `main` after sub-project A merged.
-- Before starting: `./.venv/Scripts/python.exe -m pytest tests/ -q -m "not docker" 2>&1 | tail -3`. Record it. **The full suite takes ~8 minutes — run it only in Task 9.** Every other task runs its own files.
-- **A second agent is active in this repo**, executing Plan 2b (`docs/superpowers/plans/2026-08-02-transition-provenance.md`) on `main`. It touches `core/`, `registry.py`, `store.py`, `migration.py` and `fhir/`. **This plan touches none of those.** Do not merge or rebase mid-plan; verify `git branch --show-current` reads `fhir-read-client` immediately before every commit and abort if it does not.
+- **Baseline, measured in the worktree 2026-08-02: `1549 passed, 2 skipped, 11 deselected`**, `ruff` and `mypy` clean.
+- **The full suite takes ~8.5 minutes — run it only in Task 9.** Every other task runs its own files.
+
+### Why a worktree, and why it needs its own venv
+
+A second agent is executing Plan 2b (`core/`, `registry.py`, `store.py`, `migration.py`, `fhir/`) in `$REPO`. This plan touches none of those files, but a branch is an isolated *ref*, not an isolated *workspace* — there is one working directory per checkout. While both ran in the same tree, that agent committed `87fb806` onto this feature branch and left uncommitted `core/machine.py` edits sitting in the tree, which measured as a two-test difference in the baseline.
+
+The separate venv is not optional. `referral-loop` is installed editable, and the main tree's `.pth` points at `$REPO/src` — running the main venv's python from the worktree would import the *other* tree's source and test the wrong code while appearing to work.
+
+Verify isolation if anything looks strange:
+
+```bash
+cd "$WORKTREE"
+./.venv/Scripts/python.exe -c "import referral_loop; print(referral_loop.__file__)"
+```
+
+Must print a path under `referral-loop-B`. Verify `git branch --show-current` reads `fhir-read-client` immediately before every commit and abort if it does not.
 
 ## The property everything here defends
 
