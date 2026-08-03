@@ -54,9 +54,22 @@ class ConnectorUnreachable(ReferralLoopError):
 class Response:
     status: int
     body: bytes
+    # A tuple of pairs rather than a dict, so the dataclass stays hashable and immutable in
+    # fact as well as in decorator. Lookup goes through header() because HTTP header names are
+    # case-insensitive and servers disagree about casing -- a direct dict lookup on
+    # "Retry-After" misses a server sending "retry-after", and the symptom is not an error, it
+    # is a retry that silently ignores the interval it was told to wait.
+    headers: tuple[tuple[str, str], ...] = ()
 
     def text(self) -> str:
         return self.body.decode("utf-8", errors="replace")
+
+    def header(self, name: str) -> str | None:
+        wanted = name.lower()
+        for key, value in self.headers:
+            if key.lower() == wanted:
+                return value
+        return None
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -147,12 +160,20 @@ def fetch(
     opener = build_opener(profile)
     try:
         with opener.open(request, timeout=timeout) as raw:
-            return Response(status=raw.status, body=_read_capped(raw, url))
+            return Response(
+                status=raw.status,
+                body=_read_capped(raw, url),
+                headers=tuple(raw.headers.items()),
+            )
     except urllib.error.HTTPError as exc:
         # A 4xx is a response, not a transport failure, and its body carries the reason -- the
         # token endpoint returns invalid_client as a 400 with JSON. Callers need to read it.
         with exc:
-            return Response(status=exc.code, body=_read_capped(exc, url))
+            return Response(
+                status=exc.code,
+                body=_read_capped(exc, url),
+                headers=tuple(exc.headers.items()),
+            )
     except EgressRefused:
         raise
     except (urllib.error.URLError, ssl.SSLError, OSError) as exc:

@@ -218,3 +218,24 @@ def test_no_ca_file_falls_back_to_the_system_trust_store_rather_than_no_verifica
     assert context.verify_mode is ssl.CERT_REQUIRED
     assert context.check_hostname is True
     assert len(context.get_ca_certs()) > 1, "expected the system trust store"
+
+
+def test_a_response_exposes_headers_case_insensitively():
+    """HTTP header names are case-insensitive and servers disagree about casing. A plain dict
+    lookup on "Retry-After" silently misses a server that sends "retry-after", and the symptom
+    is not an error -- it is a retry that ignores the interval it was given."""
+    from referral_loop.connect.egress import Response
+
+    r = Response(status=429, body=b"", headers=(("Retry-After", "12"), ("Content-Type", "x")))
+    assert r.header("retry-after") == "12"
+    assert r.header("RETRY-AFTER") == "12"
+    assert r.header("Retry-After") == "12"
+    assert r.header("absent") is None
+
+
+def test_a_response_defaults_to_no_headers():
+    """Existing call sites construct Response(status=..., body=...) positionally and by keyword;
+    adding a required field would break them."""
+    from referral_loop.connect.egress import Response
+
+    assert Response(status=200, body=b"{}").header("anything") is None
