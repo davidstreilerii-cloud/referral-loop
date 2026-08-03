@@ -1085,7 +1085,7 @@ from datetime import datetime
 from urllib.parse import quote
 
 from ..errors import ReferralLoopError
-from .auth import acquire_token
+from .auth import TokenCache, acquire_token
 from .connectors import ConnectorProfile, ConnectorRegistry
 from .egress import Response
 from .retry import fetch_retrying
@@ -1142,8 +1142,13 @@ def _authorized_get(
     registry: ConnectorRegistry,
     profile: ConnectorProfile,
     url: str,
+    *,
+    cache: TokenCache,
 ) -> Mapping[str, object]:
-    token = acquire_token(registry, profile)
+    # One token per search rather than one per request. A twenty-page walk would otherwise sign
+    # twenty JWTs and make twenty token calls against an authorization server that just issued a
+    # perfectly good credential -- and TokenCache existed with no caller until this used it.
+    token = cache.get(profile.connector_id, lambda: acquire_token(registry, profile))
     response = fetch_retrying(
         registry,
         profile,
@@ -1197,11 +1202,12 @@ def resolve_patient(
     profile: ConnectorProfile,
     *,
     mrn: str,
+    cache: TokenCache | None = None,
 ) -> str:
     """Hop 1. Returns the remote's Patient id, or raises -- never returns nothing."""
     system = profile.mrn_system
     url = patient_search_url(profile, mrn)  # raises ConnectorCannotResolvePatients if undeclared
-    found = _entries(_authorized_get(registry, profile, url))
+    found = _entries(_authorized_get(registry, profile, url, cache=cache or TokenCache()))
 
     if not found:
         raise PatientNotFoundAtConnector(
@@ -1264,14 +1270,11 @@ Spec §5.
 Append to `tests/test_documents.py`:
 
 ```python
-from referral_loop.connect.documents import (
-    MAX_PAGES,
-    PaginationRefused,
-    find_candidate_documents,
-)
-from ._fhirserver import diagnostic_report, document_reference
+Merge these names into the **existing top-of-file import blocks** — `MAX_PAGES`, `PaginationRefused` and `find_candidate_documents` into the existing `referral_loop.connect.documents` import, and `diagnostic_report`, `document_reference` into the existing `._fhirserver` import. Do not append a second import statement partway down the file: that is an `E402` and an `I001`, and the ruff gate in Step 6 will refuse it.
 
+Then append:
 
+```python
 def _patient_bundle():
     return {"/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": bundle(patient("p1"))}
 
@@ -1337,6 +1340,29 @@ def test_a_self_referential_next_link_refuses(certs, tmp_path):
             find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
 
 
+def test_the_page_cap_raises_rather_than_truncating(certs, tmp_path):
+    """The cap is the reason MAX_PAGES is exported. A server that always hands back a next link
+    would otherwise walk forever against a host we do trust -- and stopping quietly at the cap
+    would report 'nothing further' over a search that was cut off, which is the same false
+    negative as never having searched."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    with fhir_server(certfile, keyfile) as (base, behaviour):
+        behaviour.bundles.update(_patient_bundle())
+        # A chain longer than the budget: every page points at another, none is ever the last.
+        behaviour.bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+            document_reference("d0"), next_url=f"{base}/DocumentReference?page=1"
+        )
+        for page in range(1, MAX_PAGES + 3):
+            behaviour.bundles[f"/DocumentReference?page={page}"] = bundle(
+                document_reference(f"d{page}"),
+                next_url=f"{base}/DocumentReference?page={page + 1}",
+            )
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="pages"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
 def test_a_malformed_resource_is_skipped_and_counted(certs, tmp_path):
     """One bad resource must not hide the good ones -- the posture UnparseableSegmentError
     already takes for a bad HL7 segment -- but the count comes back, not a log line."""
@@ -1391,7 +1417,8 @@ def _walk(
     first_url: str,
     *,
     budget: list[int],
-) -> tuple[list[Mapping[str, object]], list[str], int]:
+    cache: TokenCache,
+) -> tuple[list[tuple[Mapping[str, object], int]], list[str], int]:
     """Follow next links, returning (resources, urls_visited, pages).
 
     `budget` is a one-element list shared across both resource-type walks, so the cap applies to
@@ -1416,7 +1443,7 @@ def _walk(
         # check_allowed runs inside fetch, so a next link off the allowlist refuses here rather
         # than being followed. It is a URL the remote chose.
         try:
-            payload = _authorized_get(registry, profile, url)
+            payload = _authorized_get(registry, profile, url, cache=cache)
         except EgressRefused as exc:
             raise PaginationRefused(
                 f"{profile.connector_id}: next link left the allowlist: {exc}"
@@ -1447,7 +1474,8 @@ def find_candidate_documents(
     until: datetime | None = None,
 ) -> DocumentSearch:
     """Hop 1 then hop 2, for both readable resource types."""
-    patient_id = resolve_patient(registry, profile, mrn=mrn)
+    cache = TokenCache()
+    patient_id = resolve_patient(registry, profile, mrn=mrn, cache=cache)
 
     window = f"&date=ge{since.date().isoformat()}"
     if until is not None:
@@ -1466,7 +1494,7 @@ def find_candidate_documents(
             f"{profile.fhir_base_url}/{kind}"
             f"?patient={quote('Patient/' + patient_id, safe='')}{window}"
         )
-        found, visited, pages = _walk(registry, profile, first, budget=budget)
+        found, visited, pages = _walk(registry, profile, first, budget=budget, cache=cache)
         urls.extend(visited)
         pages_walked += pages
         for raw, page in found:
