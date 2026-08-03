@@ -221,3 +221,70 @@ def test_a_process_killed_before_the_transition_table_lands_leaves_the_archive_i
         "transition_events", "transition_events_no_delete", "transition_events_no_update"}, (
         "the reopen did not finish the job the crashed boot started")
     assert reopened.transition_count("R1") == 0
+
+
+# --------------------------------------------------- what BEGIN IMMEDIATE buys
+
+def test_begin_immediate_takes_the_write_lock_at_the_start_and_a_plain_begin_does_not(
+    tmp_path,
+):
+    """The semantics the writer's transaction mode relies on, established directly.
+
+    No threads and no sleeps: two connections and an explicit order, deterministic on any
+    box. A deferred BEGIN acquires nothing until its first write, so both writers would
+    read the same MAX(seq), both compute N+1, and the second would take SQLITE_BUSY on
+    lock upgrade -- leaving the caller to be correct about busy-retry. BEGIN IMMEDIATE
+    moves the contention to the start, where blocking is all it costs.
+    """
+    db = tmp_path / "loops.db"
+    LoopStore(db)
+
+    holder = sqlite3.connect(db, isolation_level=None)
+    contender = sqlite3.connect(db, isolation_level=None, timeout=0.05)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            contender.execute("BEGIN IMMEDIATE")
+
+        # The same contention under a deferred BEGIN is not detected at all: it opens
+        # happily and only discovers the conflict when it tries to write.
+        contender.execute("BEGIN")
+        contender.execute("ROLLBACK")
+
+        holder.execute("COMMIT")
+        contender.execute("BEGIN IMMEDIATE")
+        contender.execute("COMMIT")
+    finally:
+        holder.close()
+        contender.close()
+
+
+def test_the_writer_opens_its_transaction_immediate_rather_than_deferred():
+    """Asserted on the source, because the behavioural difference cannot be observed
+    without concurrency.
+
+    The test above proves what the two modes mean; this proves which one the writer
+    issues. A behavioural test would need a second thread to watch the loser block and
+    then compute seq = N+2, and this suite has no threading -- a flaky lock test would
+    buy less than it cost. Together the pair is what makes the docstring's claim checkable
+    rather than argued.
+    """
+    import ast
+    import inspect
+    from pathlib import Path
+
+    source = Path(inspect.getfile(LoopStore)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    writer = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_write_transition"
+    )
+    literals = [
+        node.value for node in ast.walk(writer)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and node.value.upper().startswith("BEGIN")
+    ]
+    assert literals == ["BEGIN IMMEDIATE"], (
+        f"the transition writer must open IMMEDIATE, not deferred; found {literals}"
+    )

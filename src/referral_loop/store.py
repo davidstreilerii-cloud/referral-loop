@@ -1227,13 +1227,17 @@ class LoopStore:
         raises; test_two_writers_racing_on_one_referral_do_not_both_win holds that, and
         removing the constraint turns it red.
 
-        BEGIN IMMEDIATE is defence in depth on top of it -- it takes the write lock at the
-        start so the stale read is less likely to happen at all, rather than being caught
-        after the fact. That is **not** currently proven by a test: no test in this suite
-        exercises two real connections concurrently, and downgrading this to a plain BEGIN
-        leaves the whole file green. Stated rather than implied, because a docstring
-        asserting a protection the suite does not check is a species of defect this
-        codebase has already been audited for four times.
+        **BEGIN IMMEDIATE is what stops the caller having to be correct about busy-retry.**
+        It takes the write lock at the start, so a second writer blocks there and reads the
+        chain only after the first has committed -- computing seq = N+2. Under a deferred
+        BEGIN both writers read N, both compute N+1, and the loser takes SQLITE_BUSY on
+        lock upgrade, which the caller must then retry correctly to stay safe.
+
+        Both matter and only one is load-bearing for correctness. The constraint is what
+        makes a wrong retry impossible rather than merely unlikely; this makes the retry
+        rare. Held by two tests, because the seq difference cannot be observed without
+        concurrency: one establishes the lock semantics on two raw connections, the other
+        asserts on this function's source that the mode issued here is IMMEDIATE.
 
         Numbering is derived here rather than supplied, because a caller that chose its own
         seq would be choosing it from a read it made outside this transaction -- which is
