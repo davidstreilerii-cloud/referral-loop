@@ -1078,3 +1078,53 @@ def test_cancel_still_demands_a_readable_clock_once_a_loop_has_a_watermark(regis
     with pytest.raises(StaleMessageError):
         registry.cancel(loop_id, control_id="W-CAN", message_at=None)
     assert registry.get(loop_id).state is LoopState.SCHEDULED
+
+
+_RESULT_REFUSING_STATES = frozenset({
+    LoopState.CANCELLED, LoopState.ORPHAN, LoopState.DISMISSED, LoopState.ATTACHED,
+})
+_HANDLED_OBX11 = ("P", "F", "C")
+# Absent, empty, unrecognised, and a wrong-case variant of a handled one. The allowlist
+# must refuse all four: `obx11 not in (P, F, C)` is the guard, and a denylist here would
+# admit every value nobody anticipated.
+_UNHANDLED_OBX11 = ("", " ", "X", "f")
+
+
+@pytest.mark.parametrize("obx11", _HANDLED_OBX11 + _UNHANDLED_OBX11)
+@pytest.mark.parametrize("state", [s for s in LoopState if s is not LoopState.CLOSED])
+def test_record_result_accepts_only_handled_statuses_on_non_terminal_loops(
+    registry, state, obx11
+):
+    """`record_result`'s guards as they behave today, pinned before Task 5 routes it.
+
+    Two axes crossed deliberately: which states may receive a result, and which OBX-11
+    values are handled at all. Routing moves only the first into core.machine -- the
+    status allowlist is a question about a message's content, not about state legality,
+    and it stays here for the same reason _refuse_if_stale does.
+
+    Note what this does *not* cover, because it is a different layer: the weakest-OBX-11
+    rule and the fail-safe-to-preliminary behaviour live in listener._result_status
+    (listener.py:1139), which reads every OBX segment before ever calling this method.
+    `record_result` takes a single already-resolved status. Those guarantees are pinned by
+    test_listener.py:753 and :764, and routing cannot reach them.
+    """
+    loop_id = _loop_in(registry, state)
+    accepted = state not in _RESULT_REFUSING_STATES and obx11 in _HANDLED_OBX11
+
+    if accepted:
+        registry.record_result(loop_id, obx11=obx11, control_id="R-NEW", message_at=T2)
+        assert registry.get(loop_id).state is not state or state is LoopState.RESULTED
+    else:
+        with pytest.raises(ReferralLoopError):
+            registry.record_result(loop_id, obx11=obx11, control_id="R-NEW", message_at=T2)
+        assert registry.get(loop_id).state is state, "a refused result moved the loop"
+
+
+def test_an_unhandled_status_is_refused_before_the_state_is_even_consulted(registry):
+    """The allowlist is not reachable only from the states that accept results. A loop in
+    a perfectly resultable state must still refuse a status nobody anticipated, or the
+    guard is a property of the state rather than of the message."""
+    loop_id = _loop_in(registry, LoopState.OPEN)
+    with pytest.raises(ReferralLoopError, match="Unhandled OBX-11"):
+        registry.record_result(loop_id, obx11="Z", control_id="R-NEW")
+    assert registry.get(loop_id).state is LoopState.OPEN
