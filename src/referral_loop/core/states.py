@@ -49,6 +49,31 @@ class ArtifactState(str, Enum):
     DISMISSED = "dismissed"
 
 
+class DocumentationStatus(str, Enum):
+    """What condition a referral's returned documentation is in.
+
+    DOCUMENTED on its own conflates a referral documented by a preliminary read with one
+    documented by a final read, and those are clinically different: one is closeable and
+    one is emphatically not. The nine-state design carried the difference in OBX-11
+    because its state vocabulary could not express it, and reached back into the event log
+    to fetch it whenever a coordinator tried to acknowledge.
+
+    An attribute rather than two states, for the same reason Hold is one (spec 6.2): the
+    distinction bites at exactly one edge -- DOCUMENTED -> RECONCILED -- and splitting the
+    state would double the lifecycle to say something true only there. On the aggregate
+    rather than in the log, because that is what lets machine.apply() refuse a preliminary
+    reconciliation while staying a pure function of the referral and the transition.
+
+    Values are HL7 table 0085, matching the P/F/C that registry.py already acts on, so the
+    store's fold over resulted events maps across without a translation table that could
+    drift from either side.
+    """
+
+    PRELIMINARY = "P"
+    FINAL = "F"
+    CORRECTED = "C"
+
+
 @dataclass(frozen=True)
 class Hold:
     """Suspension, carried alongside the state rather than replacing it.

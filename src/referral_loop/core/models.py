@@ -16,7 +16,7 @@ from datetime import datetime
 from enum import Enum
 from typing import NewType
 
-from .states import ArtifactState, Hold, ReferralState
+from .states import ArtifactState, DocumentationStatus, Hold, ReferralState
 
 # Two identifier spaces, not one with two names. An attach names a referral *and* an
 # artifact, and if the ids were interchangeable an attach that swapped its two arguments
@@ -99,6 +99,22 @@ class Referral:
     hold: Hold | None
     state_occurred_at: datetime
     seq: int
+    # What condition the returned documentation is in, when any has returned. Carried here
+    # rather than fetched from the event log so that machine.apply() can refuse
+    # reconciling a preliminary read while remaining a pure function of this object and a
+    # Transition -- see DocumentationStatus for why it is an attribute and not two states.
+    #
+    # Defaulted, and last in the field list, deliberately: core/models.py is the point the
+    # interop branch builds on and migration.py constructs a Referral without it. A
+    # defaulted field appended to a frozen dataclass is backward compatible; inserting one
+    # anywhere else would reorder an existing positional argument and break another
+    # branch's build with no warning.
+    #
+    # The store is the only writer. It is a fold over the resulted/reopened chain ranked by
+    # clinical time with an arrival tiebreak -- the ordering registry._latest_result_event
+    # already computes, and in which the security audit found and fixed a real inversion.
+    # Nothing in core/ re-derives it.
+    documentation: DocumentationStatus | None = None
 
     def with_hold(self, hold: Hold) -> Referral:
         """Suspend, keeping the state. Spec 6.2.

@@ -19,13 +19,50 @@ Two enforcement points, checked in this order and no other:
    enforced by refusing a reserved event type at the store. On the transition it survives
    someone making the state reachable.
 
-2. **`LEGAL_TRANSITIONS`, the from-state table.**
+2. **Spec rule 1, the preliminary prohibition.** A move into `RECONCILED` is permitted
+   only when the referral's `documentation` is `FINAL` or `CORRECTED`. An allowlist, not
+   a denylist: a referral documented by a read carrying no status at all -- a restored
+   log, a foreign writer, a future code path -- must not reconcile merely because its
+   status is not literally preliminary. `registry.py` enforces this today as
+   `_ACKNOWLEDGEABLE_STATUSES` and makes the same allowlist argument in the same words.
+
+3. **`LEGAL_TRANSITIONS`, the from-state table.**
 
 The order is load-bearing rather than incidental. `RECONCILED` is legal only from
 `DOCUMENTED`, so checking legality first would mean every other state refused a
 system-asserted reconciliation as an illegal edge and the safety refusal was never
 reached -- leaving it exercised for the first time in production on the day someone adds
 an edge. Checked first, it is the reason the state-space sweep says anything at all.
+
+The two guarantees are ordered against each other for a reason too: "the system may not
+reconcile" holds whatever the documentation says, while the documentation guard stops
+applying the moment a final arrives, so the human guard is reported when both fire.
+
+## What is deliberately not here: the ordering axis
+
+The clinical watermark and `_refuse_if_stale` stay at the ingest boundary in
+`registry.py`. That is their correct home rather than a concession, and the distinction is
+worth stating because it reads like an oversight to anyone who did not watch it get
+decided:
+
+* `_refuse_if_stale` asks **"should I apply this message at all?"** -- a question about a
+  *message*, answered before there is a transition to judge, from the message's `MSH-7`
+  and a fold over the loop's event log.
+* `apply()` asks **"is this state change legal?"** -- a question about *state*, answered
+  from the aggregate and the transition alone.
+
+Two different questions with two different inputs. Collapsing them would put a clock and
+an event-log fold inside a pure function in order to answer something that was never the
+machine's question, and it would make every transition untestable without a store.
+
+The same boundary owns the destructive/non-destructive distinction. `_refuse_if_stale`
+fails open for `schedule` and demands a readable clock for `cancel` and `record_result`;
+that is the ingest mapper deciding how much evidence a message must carry before it may
+build a `Transition` at all. It is deliberately not a field on `Transition` -- a caller
+that declared its own destructiveness could declare itself harmless.
+
+`documentation` is on the other side of that line, which is why it is on the aggregate:
+it is a fact *about the referral*, not about the message that carried it.
 """
 
 from __future__ import annotations
@@ -36,8 +73,18 @@ from typing import Mapping
 
 from ..errors import ReferralLoopError
 from .models import Referral, ReferralId
-from .states import ReferralState
+from .states import DocumentationStatus, ReferralState
 from .transitions import AssertionSource, Transition
+
+# The documentation a coordinator may reconcile on. An allowlist, and the distinction
+# matters at exactly one value: `documentation is None` -- a referral documented by an
+# event that carried no status -- must be refused, and a guard written as
+# "not PRELIMINARY" would reconcile it. registry.py makes this argument in the same words
+# about the same rule, and tests/test_registry_safety.py:125 pins it.
+_RECONCILABLE_DOCUMENTATION = frozenset({
+    DocumentationStatus.FINAL,
+    DocumentationStatus.CORRECTED,
+})
 
 
 class RejectionReason(str, Enum):
@@ -51,6 +98,10 @@ class RejectionReason(str, Enum):
     """
 
     RECONCILE_REQUIRES_A_HUMAN = "reconcile_requires_a_human"
+    # The descendant of audit.RefusalCode.PRELIMINARY_NOT_ACKNOWLEDGEABLE, named to match
+    # it so a Phase 2 audit row written from either enforcement point reads the same to
+    # the risk officer who asks about this refusal by name.
+    PRELIMINARY_NOT_RECONCILABLE = "preliminary_not_reconcilable"
     NOT_A_LEGAL_TRANSITION = "not_a_legal_transition"
 
 
@@ -212,6 +263,20 @@ def apply(referral: Referral, transition: Transition) -> Referral:
             RejectionReason.RECONCILE_REQUIRES_A_HUMAN,
             f"only a human at this site reconciles a referral; {transition.assertion_source.value} "
             "is evidence toward that, not the coordinator's confirmation of it (spec 6.3)",
+        )
+
+    if (
+        transition.to_state is ReferralState.RECONCILED
+        and referral.documentation not in _RECONCILABLE_DOCUMENTATION
+    ):
+        raise TransitionRejected(
+            referral.id,
+            referral.state,
+            transition.to_state,
+            RejectionReason.PRELIMINARY_NOT_RECONCILABLE,
+            "a referral is reconcilable only on documentation that is final or corrected; "
+            f"this one's is {referral.documentation.value if referral.documentation else 'absent'} "
+            "(spec rule 1)",
         )
 
     if transition.to_state not in LEGAL_TRANSITIONS[referral.state]:

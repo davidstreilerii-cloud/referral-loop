@@ -2,7 +2,12 @@
 
 import pytest
 
-from referral_loop.core.states import ArtifactState, Hold, ReferralState
+from referral_loop.core.states import (
+    ArtifactState,
+    DocumentationStatus,
+    Hold,
+    ReferralState,
+)
 
 
 def test_the_referral_lifecycle_has_eleven_states():
@@ -38,3 +43,23 @@ def test_a_hold_records_who_applied_it_and_why():
     assert h.reason and h.actor
     with pytest.raises(Exception):
         h.reason = "changed"  # frozen
+
+
+def test_documentation_is_a_condition_and_not_a_state():
+    """The gap the nine-state design papered over with OBX-11.
+
+    A referral documented by a preliminary read and one documented by a final read are
+    clinically different -- one is closeable and one is emphatically not -- and DOCUMENTED
+    on its own cannot tell them apart. Modelling it as two states would double the
+    lifecycle for one distinction that matters at exactly one edge, so it is an attribute
+    carried alongside the state, for the same reason Hold is (spec 6.2).
+    """
+    assert {s.name for s in DocumentationStatus} == {"PRELIMINARY", "FINAL", "CORRECTED"}
+    assert not hasattr(ReferralState, "PRELIMINARILY_DOCUMENTED")
+
+
+def test_the_documentation_vocabulary_is_the_hl7_table_the_registry_already_acts_on():
+    """HL7 table 0085 P/F/C, which registry.py names PRELIMINARY/FINAL/CORRECTED. The
+    values match so Phase 2's fold over resulted events maps without a translation table
+    that could disagree with itself."""
+    assert [s.value for s in DocumentationStatus] == ["P", "F", "C"]

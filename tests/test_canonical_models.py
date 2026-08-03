@@ -1,9 +1,15 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
 from referral_loop.core.models import ArtifactKind, InboundArtifact, PartyRef, PatientRef, Referral
-from referral_loop.core.states import ArtifactState, Hold, ReferralState
+from referral_loop.core.states import (
+    ArtifactState,
+    DocumentationStatus,
+    Hold,
+    ReferralState,
+)
 
 
 def _ref() -> Referral:
@@ -155,3 +161,30 @@ def test_the_clock_check_would_notice_a_clock():
     # ...and that a mention in prose alone does not trip it, which is the case that
     # produced this helper in the first place.
     assert "datetime.now" not in _code_without_prose('"""never calls datetime.now()."""\nx = 1\n')
+
+
+def test_a_referral_carries_the_condition_of_its_documentation():
+    """The fact the machine needs in order to refuse reconciling a preliminary read,
+    living on the aggregate rather than being fetched from the event log. apply() stays
+    pure only because this is here."""
+    assert _ref().documentation is None
+    documented = replace(_ref(), state=ReferralState.DOCUMENTED,
+                         documentation=DocumentationStatus.FINAL)
+    assert documented.documentation is DocumentationStatus.FINAL
+
+
+def test_documentation_defaults_so_the_interop_fork_point_still_builds():
+    """core/models.py is the tagged point the interop branch builds on, and migration.py
+    constructs a Referral without this field. A defaulted field appended to the end of a
+    frozen dataclass is backward compatible; anything else would break a build on another
+    branch without warning, which the plan's coordination note forbids."""
+    import inspect
+
+    signature = inspect.signature(Referral)
+    parameters = list(signature.parameters)
+    assert parameters[-1] == "documentation", (
+        "documentation must be last, or adding it reorders an existing positional field"
+    )
+    assert signature.parameters["documentation"].default is None
+    # Constructed with no mention of the field at all -- the migration.py call shape.
+    assert _ref().documentation is None

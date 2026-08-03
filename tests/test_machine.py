@@ -20,7 +20,7 @@ from referral_loop.core.machine import (
     apply,
 )
 from referral_loop.core.models import PartyRef, PatientRef, Referral, ReferralId, Specialty
-from referral_loop.core.states import Hold, ReferralState
+from referral_loop.core.states import DocumentationStatus, Hold, ReferralState
 from referral_loop.core.transitions import (
     ActorRef,
     AssertionSource,
@@ -39,7 +39,8 @@ _LATER = datetime(2026, 8, 3, tzinfo=timezone.utc)
 _SENTINEL_MRN = "ZZSENTINELMRNEEE"
 
 
-def _referral(state: ReferralState, *, hold: Hold | None = None, seq: int = 7) -> Referral:
+def _referral(state: ReferralState, *, hold: Hold | None = None, seq: int = 7,
+              documentation: DocumentationStatus | None = None) -> Referral:
     return Referral(
         id=ReferralId("REF-1"),
         patient=PatientRef(mrn=_SENTINEL_MRN, aliases=()),
@@ -53,6 +54,7 @@ def _referral(state: ReferralState, *, hold: Hold | None = None, seq: int = 7) -
         hold=hold,
         state_occurred_at=_NOW,
         seq=seq,
+        documentation=documentation,
     )
 
 
@@ -85,7 +87,8 @@ def test_the_system_cannot_reconcile_a_referral_on_its_own():
 
 
 def test_a_human_may_reconcile_the_same_referral():
-    referral = _referral(state=ReferralState.DOCUMENTED)
+    referral = _referral(state=ReferralState.DOCUMENTED,
+                         documentation=DocumentationStatus.FINAL)
     human = _t(to_state=ReferralState.RECONCILED, assertion_source=AssertionSource.HUMAN)
     assert apply(referral, human).state is ReferralState.RECONCILED
 
@@ -139,7 +142,8 @@ def test_the_guard_is_checked_before_the_table_so_it_cannot_be_hidden_by_it():
 def test_a_human_reconciliation_still_has_to_be_a_legal_move():
     """The guard is a floor, not a bypass. A coordinator cannot reconcile a referral that
     was never documented -- there is nothing for them to have looked at."""
-    referral = _referral(state=ReferralState.SCHEDULED)
+    referral = _referral(state=ReferralState.SCHEDULED,
+                         documentation=DocumentationStatus.FINAL)
     with pytest.raises(TransitionRejected) as caught:
         apply(referral, _t(to_state=ReferralState.RECONCILED,
                            assertion_source=AssertionSource.HUMAN))
@@ -170,7 +174,8 @@ def test_the_happy_path_of_section_six_one_walks_end_to_end():
         ReferralState.SCHEDULED, ReferralState.SEEN, ReferralState.DOCUMENTED,
         ReferralState.RECONCILED,
     ]
-    referral = _referral(state=ReferralState.DRAFT, seq=0)
+    referral = _referral(state=ReferralState.DRAFT, seq=0,
+                         documentation=DocumentationStatus.FINAL)
     for step in path:
         referral = apply(referral, _t(to_state=step, assertion_source=AssertionSource.HUMAN))
         assert referral.state is step
@@ -222,15 +227,21 @@ _ILLEGAL_PAIRS = [
 
 @pytest.mark.parametrize(("from_state", "to_state"), _LEGAL_PAIRS)
 def test_every_legal_transition_is_reachable(from_state, to_state):
-    """A table entry no call can exercise is documentation, not a rule."""
-    referral = _referral(state=from_state)
+    """A table entry no call can exercise is documentation, not a rule.
+
+    Held at FINAL documentation so this sweep isolates the legality axis: the spec rule 1
+    guard is a separate question with its own tests below, and a fixture that tripped it
+    would make this sweep silently stop testing the table.
+    """
+    referral = _referral(state=from_state, documentation=DocumentationStatus.FINAL)
     moved = apply(referral, _t(to_state=to_state, assertion_source=AssertionSource.HUMAN))
     assert moved.state is to_state
 
 
 @pytest.mark.parametrize(("from_state", "to_state"), _ILLEGAL_PAIRS)
 def test_every_illegal_transition_is_refused(from_state, to_state):
-    referral = _referral(state=from_state)
+    """FINAL documentation for the same reason as the sweep above."""
+    referral = _referral(state=from_state, documentation=DocumentationStatus.FINAL)
     with pytest.raises(TransitionRejected) as caught:
         apply(referral, _t(to_state=to_state, assertion_source=AssertionSource.HUMAN))
     assert caught.value.reason is RejectionReason.NOT_A_LEGAL_TRANSITION
@@ -418,7 +429,8 @@ def test_the_two_refusals_are_told_apart_by_a_code_and_not_by_their_message():
     'TransitionRejected' says neither. The message that would say which is the one thing
     that must not be copied into an audit row."""
     assert {r.name for r in RejectionReason} == {
-        "RECONCILE_REQUIRES_A_HUMAN", "NOT_A_LEGAL_TRANSITION"}
+        "RECONCILE_REQUIRES_A_HUMAN", "PRELIMINARY_NOT_RECONCILABLE",
+        "NOT_A_LEGAL_TRANSITION"}
 
 
 # ------------------------------------------------------------------------ hold
@@ -507,3 +519,92 @@ def test_the_machine_does_not_care_what_evidence_says_only_who_asserted_it():
     with pytest.raises(TransitionRejected) as caught:
         apply(referral, certain)
     assert caught.value.reason is RejectionReason.RECONCILE_REQUIRES_A_HUMAN
+
+
+# ------------------------------------------------- reconciling a preliminary read
+
+
+def test_a_preliminary_document_cannot_be_reconciled():
+    """Spec rule 1, and the reason `documentation` is on the aggregate at all.
+
+    A preliminary that later corrects is the malpractice scenario: reconciling on it takes
+    the referral off `resulted_unacknowledged()` before the read that supersedes it has
+    arrived. registry.py enforces this today as `_ACKNOWLEDGEABLE_STATUSES`, by fetching
+    the latest OBX-11 from the event log; here it is decided on the aggregate alone, which
+    is what keeps apply() pure and keeps state legality to one enforcement point.
+    """
+    referral = _referral(state=ReferralState.DOCUMENTED,
+                         documentation=DocumentationStatus.PRELIMINARY)
+    with pytest.raises(TransitionRejected) as caught:
+        apply(referral, _t(to_state=ReferralState.RECONCILED,
+                           assertion_source=AssertionSource.HUMAN))
+    assert caught.value.reason is RejectionReason.PRELIMINARY_NOT_RECONCILABLE
+
+
+@pytest.mark.parametrize("status", [DocumentationStatus.FINAL, DocumentationStatus.CORRECTED])
+def test_a_final_or_corrected_document_may_be_reconciled_by_a_human(status):
+    referral = _referral(state=ReferralState.DOCUMENTED, documentation=status)
+    moved = apply(referral, _t(to_state=ReferralState.RECONCILED,
+                               assertion_source=AssertionSource.HUMAN))
+    assert moved.state is ReferralState.RECONCILED
+
+
+def test_a_referral_with_no_documentation_at_all_cannot_be_reconciled():
+    """The allowlist, not the denylist -- and this is the case that tells them apart.
+
+    registry.py already refuses this and says why at tests/test_registry_safety.py:125:
+    "Rule 1 as an allowlist, not a denylist. A resulted event carrying no OBX-11 -- a
+    restored log, a foreign writer, a future code path -- must not resolve the loop just
+    because its status is not literally 'P'." A guard written as `is PRELIMINARY` would
+    reconcile on None and regress
+    test_acknowledgement_is_unreachable_with_no_result_at_all.
+    """
+    referral = _referral(state=ReferralState.DOCUMENTED, documentation=None)
+    with pytest.raises(TransitionRejected) as caught:
+        apply(referral, _t(to_state=ReferralState.RECONCILED,
+                           assertion_source=AssertionSource.HUMAN))
+    assert caught.value.reason is RejectionReason.PRELIMINARY_NOT_RECONCILABLE
+
+
+@pytest.mark.parametrize("status", [None, DocumentationStatus.PRELIMINARY])
+def test_the_reconcilable_set_is_an_allowlist_swept_over_everything_outside_it(status):
+    referral = _referral(state=ReferralState.DOCUMENTED, documentation=status)
+    for source in AssertionSource:
+        with pytest.raises(TransitionRejected):
+            apply(referral, _t(to_state=ReferralState.RECONCILED, assertion_source=source))
+
+
+def test_the_human_guarantee_outranks_the_documentation_guard():
+    """Both refuse a system-asserted reconciliation of a preliminary. The reported reason
+    is the human one, because 'the system may not reconcile' holds whatever the
+    documentation says, while the documentation guard would stop applying the moment a
+    final arrived."""
+    referral = _referral(state=ReferralState.DOCUMENTED,
+                         documentation=DocumentationStatus.PRELIMINARY)
+    with pytest.raises(TransitionRejected) as caught:
+        apply(referral, _t(to_state=ReferralState.RECONCILED,
+                           assertion_source=AssertionSource.SYSTEM_INFERRED))
+    assert caught.value.reason is RejectionReason.RECONCILE_REQUIRES_A_HUMAN
+
+
+def test_the_documentation_guard_binds_only_the_edge_into_reconciled():
+    """A preliminary read is a perfectly ordinary referral in every other respect. A guard
+    that refused all movement would strand it: the correction that supersedes it arrives as
+    DOCUMENTED -> DOCUMENTED, and refusing that would make the preliminary permanent."""
+    referral = _referral(state=ReferralState.DOCUMENTED,
+                         documentation=DocumentationStatus.PRELIMINARY)
+    for target in (ReferralState.DOCUMENTED,):
+        assert apply(referral, _t(to_state=target,
+                                  assertion_source=AssertionSource.RECEIVING_ORG)).state is target
+
+
+def test_apply_never_writes_the_documentation_field():
+    """The store owns it. It is a fold over the resulted/reopened chain ranked by clinical
+    time, which registry._latest_result_event already computes and which the security audit
+    fixed a real ordering inversion in; the machine reads that fold and never re-derives
+    it. So apply() passes it through untouched and there is exactly one writer."""
+    referral = _referral(state=ReferralState.DOCUMENTED,
+                         documentation=DocumentationStatus.PRELIMINARY)
+    moved = apply(referral, _t(to_state=ReferralState.DOCUMENTED,
+                               assertion_source=AssertionSource.RECEIVING_ORG))
+    assert moved.documentation is DocumentationStatus.PRELIMINARY
