@@ -172,6 +172,8 @@ _RESULT_EVENTS = frozenset({"resulted", "reopened"})
 # coordinator chose. ATTACHED is here for the same reason as ORPHAN: the record
 # is a result, not an expectation, and a result landing on one would resurrect a
 # retired orphan into the acknowledgement queue.
+# SUPERSEDED (Plan 2b Task 5): `record_result` now asks core.machine, and nothing
+# reads this. Same treatment and same reason as _SCHEDULABLE_FROM above.
 _NO_RESULT_FROM = frozenset({LoopState.ORPHAN, LoopState.DISMISSED, LoopState.ATTACHED})
 
 # The only state a match may be undone from. Not ACKNOWLEDGED, deliberately: see
@@ -789,21 +791,43 @@ class Registry:
         with self._lock:
             loop = self.get(loop_id)
 
-            if loop.state is LoopState.CANCELLED:
-                raise ReferralLoopError(
-                    f"Result arrived for CANCELLED loop {loop_id}; route to orphan queue and flag"
-                )
+            # The CANCELLED refusal that stood here is now the machine's: CANCELLED is
+            # terminal in LEGAL_TRANSITIONS, so the edge does not exist. Its message
+            # carried operational guidance the generic refusal does not -- "route to
+            # orphan queue and flag" -- and no test pinned that text. Deliberately not
+            # kept as a second check in front of the machine: it would agree today and
+            # silently disagree the day the table changes, which is the two-enforcement-
+            # points failure this task exists to remove. Under spec 6.5 a result arriving
+            # for a cancelled referral is an InboundArtifact, and the orphan routing is
+            # the ingest layer's decision to make on the refusal, not this method's to
+            # embed in an error string.
 
-            if loop.state in _NO_RESULT_FROM:
-                # ORPHAN -> RESULTED -> ACKNOWLEDGED would retire a result nobody
-                # ordered through the ordinary worklist, leaving the orphan queue
-                # the gap flywheel counts without any coordinator attaching it.
-                # An orphan is retired by attach_orphan (Task 15) or dismissed
-                # explicitly. DISMISSED is terminal and stays terminal.
-                raise ReferralLoopError(
-                    f"Loop {loop_id} is in state {loop.state}; results are not recorded "
-                    "against orphaned or dismissed records. Attach it to a real loop instead."
-                )
+            # The state guard, now asked of core.machine. It replaces both the CANCELLED
+            # refusal above and _NO_RESULT_FROM: CANCELLED is terminal in the table, and
+            # ORPHAN/DISMISSED/ATTACHED leave the referral vocabulary under spec 6.5 and
+            # are refused by _refuse_illegal_transition's own conversion. What that used
+            # to say in prose -- that ORPHAN -> RESULTED -> ACKNOWLEDGED would retire a
+            # result nobody ordered through the ordinary worklist -- is now a property of
+            # the two aggregates rather than a list this method has to remember.
+            #
+            # The OBX-11 allowlist below deliberately does NOT move. It is the same
+            # two-axis split that keeps _refuse_if_stale here: the machine answers "is
+            # this state change legal", from the aggregate; whether a message's status is
+            # one this system handles is a question about the *message*, answered before
+            # there is a transition worth judging. Collapsing them would put message
+            # parsing inside a pure function.
+            #
+            # HUMAN when a coordinator attached this, RECEIVING_ORG when it came off the
+            # wire. `attached_from` is set only by attach_orphan, whose only non-test
+            # caller is the coordinator worklist -- so it is exactly the signal spec 6.5
+            # describes for an attachment being a human's assertion on the referral.
+            self._refuse_illegal_transition(
+                loop,
+                ReferralState.DOCUMENTED,
+                AssertionSource.HUMAN if attached_from else AssertionSource.RECEIVING_ORG,
+                _ENGINE_ACTOR_REF,
+                message_at or _now(),
+            )
 
             if obx11 not in (PRELIMINARY, FINAL, CORRECTED):
                 raise ReferralLoopError(f"Unhandled OBX-11 status: {obx11!r}")
