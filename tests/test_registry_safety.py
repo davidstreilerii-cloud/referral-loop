@@ -967,3 +967,69 @@ def test_orphan_detail_cannot_override_the_explicit_mrn(registry):
     orphan_id = registry.orphan(control_id="C1", mrn="MRN1", detail={"mrn": "MRN-WRONG"})
     assert registry.get(orphan_id).mrn == "MRN1"
     assert registry.get(orphan_id).state is LoopState.ORPHAN
+
+
+# ------------------------------------ Plan 2b Task 5: what routing must not change
+
+
+def _loop_in(registry, state: LoopState) -> str:
+    """A loop in `state`, built the way real traffic reaches it.
+
+    Every LoopState except CLOSED, which is unreachable by construction (spec test 5) and
+    so cannot be swept over here -- the tests above prove it stays that way.
+    """
+    if state is LoopState.ORPHAN:
+        return registry.orphan(control_id="S-ORU", mrn="MRN9", detail={"result_status": "F"})
+    if state is LoopState.DISMISSED:
+        orphan_id = registry.orphan(control_id="S-ORU", mrn="MRN9", detail={"result_status": "F"})
+        registry.dismiss_orphan(orphan_id, actor="a", role="r", reason="misrouted")
+        return orphan_id
+    if state is LoopState.ATTACHED:
+        orphan_id = registry.orphan(control_id="S-ORU", mrn="MRN9", detail={"result_status": "F"})
+        target = registry.open_loop(mrn="MRN9", modality="CT", control_id="S-ORM")
+        registry.attach_orphan(orphan_id, target, actor="a", role="r")
+        return orphan_id
+
+    loop_id = registry.open_loop(mrn="MRN9", modality="CT", control_id="S-ORM")
+    if state is LoopState.OPEN:
+        return loop_id
+    if state is LoopState.SCHEDULED:
+        registry.schedule(loop_id, control_id="S-SIU")
+        return loop_id
+    if state is LoopState.CANCELLED:
+        registry.cancel(loop_id, control_id="S-CAN", message_at=T1)
+        return loop_id
+    registry.record_result(loop_id, obx11="F", control_id="S-ORU")
+    if state is LoopState.RESULTED:
+        return loop_id
+    if state is LoopState.ACKNOWLEDGED:
+        registry.acknowledge(loop_id, actor="a", role="r", control_id="S-ACK")
+        return loop_id
+    raise AssertionError(f"no construction for {state}")
+
+
+_SCHEDULE_ACCEPTS = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
+
+
+@pytest.mark.parametrize("state", [s for s in LoopState if s is not LoopState.CLOSED])
+def test_schedule_accepts_exactly_two_states_and_refuses_the_rest(registry, state):
+    """The `schedule` guard as it behaves today, pinned before Plan 2b routes it through
+    machine.apply(). Task 5 preserves what it accepts and what it refuses; it may not
+    preserve anything it was never asked about, so the sweep asks about all of them.
+
+    The refusal type is asserted, not merely that something raised. Three of these states
+    leave the referral vocabulary entirely under spec 6.5, and `migration.to_referral`
+    raises ValueError for them -- which would satisfy a bare `raises(Exception)` while
+    changing what listener.py answers on the wire, because it catches ReferralLoopError
+    one clause above a bare Exception.
+    """
+    loop_id = _loop_in(registry, state)
+    assert registry.get(loop_id).state is state
+
+    if state in _SCHEDULE_ACCEPTS:
+        registry.schedule(loop_id, control_id="S-NEW")
+        assert registry.get(loop_id).state is LoopState.SCHEDULED
+    else:
+        with pytest.raises(ReferralLoopError):
+            registry.schedule(loop_id, control_id="S-NEW")
+        assert registry.get(loop_id).state is state, "a refused schedule moved the loop"
