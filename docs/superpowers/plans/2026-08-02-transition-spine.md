@@ -53,6 +53,13 @@ claims to hold it goes red, restore. Two rules for those runs, both learned the 
 Both hazards above are the same species: they make the code that runs differ from the
 code on disk, silently, and both present as logic bugs. Neither is one.
 
+- **Verify the mutation changes behaviour before reading its result.** A mutation can be
+  syntactically valid and semantically null, and a null mutation produces a GREEN that
+  is indistinguishable from a weak test. Both instances in this plan were of that
+  shape: `[*[], {...}]` is `[{...}]`, and a needle that matched a neighbouring branch
+  left the intended one untouched. Checking that the mutant actually behaves
+  differently -- even once, by hand -- catches these where inspection did not.
+
 A mutation run that reports GREEN has **two** explanations, and only one of them is "the
 test does not discriminate". The other is "I mutated the wrong thing" — a needle that
 matched a neighbouring branch, or an edit whose label and content disagree. Both happened
