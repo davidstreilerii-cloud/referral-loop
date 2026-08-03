@@ -80,6 +80,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .core.states import ReferralState
+from .core.transitions import Evidence, Transition
 from .errors import (
     CircularMergeError,
     LoopNotFoundError,
@@ -264,6 +266,47 @@ CREATE TABLE IF NOT EXISTS labels (
 );
 CREATE INDEX IF NOT EXISTS idx_labels_outcome ON labels(outcome);
 
+-- The canonical transition log (design spec section 9.1). One row per accepted
+-- Transition, carrying who asserted the change -- which loop_events cannot say,
+-- because it predates the distinction between a coordinator, a counterparty's
+-- message and this system's own inference.
+--
+-- UNIQUE(referral_id, seq) does two jobs. It makes the chain gapless by
+-- construction, so MAX(seq) == COUNT(*) per referral is an invariant rather
+-- than a hope; and it is optimistic concurrency, so two MLLP connections
+-- applying to the same referral cannot both win -- one loses the insert and
+-- retries, where without it the second would silently reuse the first's seq.
+--
+-- `referral_id` holds what the rest of this schema calls `loop_id`, and the
+-- values are identical UUIDs; only the vocabulary differs, and migration.py
+-- proves the mapping is total. It is named for where the model is going rather
+-- than where it is because this table is append-only: renaming a column on an
+-- append-only table later is exactly the _widen_key hazard -- drop triggers,
+-- rename, copy, drop the aside -- and the log holding the provenance record is
+-- the worst place to hit it. Plan 2c's swap is then a projection change, not a
+-- rebuild of this table. Do not "fix" the inconsistency.
+--
+-- `rationale` is coordinator free text, held under the same posture as
+-- loop_events.detail rather than a new one: the event log carries the reason
+-- and retention purges it, while audit.py deliberately records only
+-- `reason_recorded` because the audit trail is not purged the same way.
+CREATE TABLE IF NOT EXISTS transition_events (
+    event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    referral_id      TEXT NOT NULL,
+    seq              INTEGER NOT NULL,
+    to_state         TEXT NOT NULL,
+    assertion_source TEXT NOT NULL,
+    actor_kind       TEXT NOT NULL,
+    actor_id         TEXT NOT NULL,
+    occurred_at      TEXT NOT NULL,
+    recorded_at      TEXT NOT NULL,
+    evidence         TEXT NOT NULL,
+    hold_action      TEXT,
+    rationale        TEXT,
+    UNIQUE (referral_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_transition_events_referral ON transition_events(referral_id);
+
 -- Append-only enforcement lives in the schema, not in the connection.
 -- _authorizer only binds to connections LoopStore itself opens; any other
 -- process opening this file would bypass it entirely. These triggers travel
@@ -291,6 +334,10 @@ CREATE TRIGGER IF NOT EXISTS labels_no_delete BEFORE DELETE ON labels
 BEGIN SELECT RAISE(ABORT, 'labels is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS labels_no_update BEFORE UPDATE ON labels
 BEGIN SELECT RAISE(ABORT, 'labels is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS transition_events_no_delete BEFORE DELETE ON transition_events
+BEGIN SELECT RAISE(ABORT, 'transition_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS transition_events_no_update BEFORE UPDATE ON transition_events
+BEGIN SELECT RAISE(ABORT, 'transition_events is append-only'); END;
 """
 
 _APPLIED_MESSAGES_DDL = """
@@ -547,6 +594,28 @@ _EVENT_STATE = {
 _RESERVED_V2_EVENTS = {"closed"}
 
 
+def _evidence_json(evidence: tuple[Evidence, ...]) -> str:
+    """Evidence as its references, never its content.
+
+    Evidence.ref is a content hash, a resource reference or a rule id by construction --
+    an identifier for something archived elsewhere. Serialising the objects wholesale is
+    what keeps that true here: there is no field on Evidence that carries narrative, so
+    there is none to leak into an append-only table.
+    """
+    return json.dumps(
+        [
+            {
+                "kind": item.kind.value,
+                "ref": item.ref,
+                "confidence": item.confidence,
+                "spans": [[s.start, s.end] for s in (item.spans or ())],
+            }
+            for item in evidence
+        ],
+        sort_keys=True,
+    )
+
+
 def _authorizer(action_code: int, arg1, arg2, *_args):
     """Block UPDATE and DELETE on loop_events. Raw archive stays immutable too.
 
@@ -560,6 +629,7 @@ def _authorizer(action_code: int, arg1, arg2, *_args):
         "mrn_alias_events",
         "applied_messages",
         "labels",
+        "transition_events",
     ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
@@ -1146,6 +1216,114 @@ class LoopStore:
                 conn.close()
 
     _EVENTS_SQL = "SELECT * FROM loop_events WHERE loop_id = ? ORDER BY event_id"
+
+    def append_transition(self, referral_id: str, transition: Transition) -> int:
+        """Append one accepted Transition and return the seq it was given.
+
+        Spec 9.2. The read of the previous seq and the insert are one transaction.
+
+        **UNIQUE(referral_id, seq) is the guarantee.** Two connections applying to the same
+        referral cannot both win, because the loser's insert violates the constraint and
+        raises; test_two_writers_racing_on_one_referral_do_not_both_win holds that, and
+        removing the constraint turns it red.
+
+        BEGIN IMMEDIATE is defence in depth on top of it -- it takes the write lock at the
+        start so the stale read is less likely to happen at all, rather than being caught
+        after the fact. That is **not** currently proven by a test: no test in this suite
+        exercises two real connections concurrently, and downgrading this to a plain BEGIN
+        leaves the whole file green. Stated rather than implied, because a docstring
+        asserting a protection the suite does not check is a species of defect this
+        codebase has already been audited for four times.
+
+        Numbering is derived here rather than supplied, because a caller that chose its own
+        seq would be choosing it from a read it made outside this transaction -- which is
+        the race the constraint exists to lose.
+        """
+        with self._lock:
+            return self._write_transition(referral_id, transition, seq=None)
+
+    def _append_transition_at_seq(
+        self, referral_id: str, transition: Transition, seq: int
+    ) -> int:
+        """Append at a caller-chosen seq. Exists so a test can be the losing writer.
+
+        Not for production use: a supplied seq is by definition computed outside this
+        transaction, which is exactly the stale read append_transition refuses to make.
+        """
+        with self._lock:
+            return self._write_transition(referral_id, transition, seq=seq)
+
+    def _write_transition(
+        self, referral_id: str, transition: Transition, *, seq: int | None
+    ) -> int:
+        conn = self._guarded()
+        previous_isolation = conn.isolation_level
+        try:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if seq is None:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) FROM transition_events "
+                        "WHERE referral_id = ?",
+                        (referral_id,),
+                    ).fetchone()
+                    seq = int(row[0]) + 1
+                hold = transition.hold
+                conn.execute(
+                    "INSERT INTO transition_events (referral_id, seq, to_state, "
+                    "assertion_source, actor_kind, actor_id, occurred_at, recorded_at, "
+                    "evidence, hold_action, rationale) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        referral_id,
+                        seq,
+                        transition.to_state.value,
+                        transition.assertion_source.value,
+                        transition.actor.kind,
+                        transition.actor.id,
+                        transition.occurred_at.isoformat(),
+                        transition.recorded_at.isoformat(),
+                        _evidence_json(transition.evidence),
+                        None if hold is None else ("hold" if hold.hold else "release"),
+                        transition.rationale,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                # Including KeyboardInterrupt: a half-written chain is the failure this
+                # transaction exists to prevent, and an interrupt is not a reason to
+                # leave one behind.
+                conn.execute("ROLLBACK")
+                raise
+            return seq
+        except sqlite3.IntegrityError as exc:
+            raise StoreUnavailableError(
+                f"Refusing the transition for {referral_id} at seq {seq}: another writer "
+                f"already holds it. Re-read and retry. ({exc})"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"transition_events write failed: {exc}") from exc
+        finally:
+            conn.isolation_level = previous_isolation
+            conn.close()
+
+    def transition_count(self, referral_id: str) -> int:
+        return int(self._read(
+            "SELECT COUNT(*) FROM transition_events WHERE referral_id = ?",
+            (referral_id,))[0][0])
+
+    def fold_transitions(self, referral_id: str) -> ReferralState | None:
+        """The state this referral's own chain folds to, or None if it has no chain.
+
+        None rather than a default: a referral with no transitions has no state the log
+        ever asserted, and answering DRAFT would invent one. Spec 9.3 invariant 2 compares
+        the projection against this.
+        """
+        rows = self._read(
+            "SELECT to_state FROM transition_events WHERE referral_id = ? ORDER BY seq",
+            (referral_id,))
+        return ReferralState(rows[-1][0]) if rows else None
 
     @staticmethod
     def _attributed_detail(detail: dict) -> dict:
