@@ -313,3 +313,35 @@ def test_a_scheme_with_an_explicit_port_is_still_refused_if_unknown():
     checked on its own rather than only where the default port is needed."""
     with pytest.raises(ConnectorConfigError, match="scheme"):
         endpoint_of("ftp://evil.example:21/pub")
+
+
+def test_a_connector_without_identifier_systems_is_not_queryable():
+    """Absent is allowed -- every connector A shipped is preflight-only -- but it must be
+    visible as an incapability rather than discovered by a query that returns nothing."""
+    assert not _registry().get("example-med").is_queryable
+
+
+def test_a_declared_mrn_system_makes_a_connector_queryable():
+    reg = _registry(_profile(identifier_systems={"mrn": "urn:oid:1.2.840.114350.1.13.99"}))
+    ku = reg.get("example-med")
+    assert ku.is_queryable
+    assert ku.mrn_system == "urn:oid:1.2.840.114350.1.13.99"
+
+
+def test_a_malformed_identifier_systems_block_refuses():
+    with pytest.raises(ConnectorConfigError, match="identifier_systems"):
+        _registry(_profile(identifier_systems="urn:oid:1.2.3"))
+
+
+def test_an_empty_mrn_system_refuses_rather_than_reading_as_absent():
+    """An empty string is a typo, not a declaration. Treating it as absent would turn a broken
+    config into a silently preflight-only connector."""
+    with pytest.raises(ConnectorConfigError, match="mrn"):
+        _registry(_profile(identifier_systems={"mrn": "  "}))
+
+
+def test_an_unknown_identifier_kind_refuses():
+    """Only mrn is consumed today. An unrecognised key is a typo that would otherwise sit in
+    the file looking like it did something."""
+    with pytest.raises(ConnectorConfigError, match="ssn|unknown|identifier"):
+        _registry(_profile(identifier_systems={"ssn": "urn:oid:2.16.840.1.113883.4.1"}))

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,6 +44,10 @@ _MAX_VENDOR = 64
 _MAX_URL = 512
 
 _DEFAULT_PORTS = {"https": 443, "http": 80}
+
+# Only mrn is consumed. A second kind gets added here when something reads it -- an
+# unrecognised key refuses rather than sitting in the file looking like it did something.
+IDENTIFIER_KINDS = ("mrn",)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,7 @@ class ConnectorProfile:
     auth: ConnectorAuth
     authorities: frozenset[str]
     ca_file: Path | None
+    identifier_systems: Mapping[str, str]
 
     def holds(self, authority: str) -> bool:
         return authority in self.authorities
@@ -137,6 +143,21 @@ class ConnectorProfile:
     @property
     def metadata_url(self) -> str:
         return f"{self.fhir_base_url}/metadata"
+
+    @property
+    def mrn_system(self) -> str | None:
+        return self.identifier_systems.get("mrn")
+
+    @property
+    def is_queryable(self) -> bool:
+        """Whether this connector can be asked about one of our patients at all.
+
+        False is a legitimate configuration -- a preflight-only connector proves reachability
+        and credentials and reads nothing. What must not happen is a query against one of these
+        quietly returning an empty result set, which is why documents.py raises instead. See
+        spec 1.3.
+        """
+        return self.mrn_system is not None
 
 
 def _auth_from(entry: object, *, what: str) -> ConnectorAuth:
@@ -210,6 +231,20 @@ def _profile_from(entry: object, *, allow_plaintext: bool) -> ConnectorProfile:
     ca_raw = tls.get("ca_file")
     ca_file = Path(_text(ca_raw, f"{what} tls.ca_file", 512)) if ca_raw is not None else None
 
+    raw_identifiers = entry.get("identifier_systems", {})
+    if not isinstance(raw_identifiers, dict):
+        raise _refuse(f"{what}: identifier_systems must be an object")
+    unknown_kinds = sorted(k for k in raw_identifiers if k not in IDENTIFIER_KINDS)
+    if unknown_kinds:
+        raise _refuse(
+            f"{what}: unknown identifier_systems keys {unknown_kinds}; known are "
+            f"{list(IDENTIFIER_KINDS)}"
+        )
+    identifier_systems = {
+        kind: _text(value, f"{what} identifier_systems.{kind}", _MAX_URL)
+        for kind, value in raw_identifiers.items()
+    }
+
     return ConnectorProfile(
         connector_id=raw_id,
         organization=_text(_require(entry, "organization", what), f"{what} organization", _MAX_ORGANIZATION),
@@ -223,6 +258,7 @@ def _profile_from(entry: object, *, allow_plaintext: bool) -> ConnectorProfile:
         auth=_auth_from(_require(entry, "auth", what), what=what),
         authorities=frozenset(raw_authorities),
         ca_file=ca_file,
+        identifier_systems=identifier_systems,
     )
 
 
