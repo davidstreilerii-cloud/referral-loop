@@ -529,9 +529,9 @@ def test_a_preliminary_document_cannot_be_reconciled():
 
     A preliminary that later corrects is the malpractice scenario: reconciling on it takes
     the referral off `resulted_unacknowledged()` before the read that supersedes it has
-    arrived. registry.py enforces this today as `_ACKNOWLEDGEABLE_STATUSES`, by fetching
-    the latest OBX-11 from the event log; here it is decided on the aggregate alone, which
-    is what keeps apply() pure and keeps state legality to one enforcement point.
+    arrived. registry.py enforced this as `_ACKNOWLEDGEABLE_STATUSES` until Plan 2b Task 5, by
+    fetching the latest OBX-11 from the event log; it is now decided on the aggregate
+    alone, which is what keeps apply() pure and state legality to one enforcement point.
     """
     referral = _referral(state=ReferralState.DOCUMENTED,
                          documentation=DocumentationStatus.PRELIMINARY)

@@ -148,20 +148,20 @@ from .store import LoopStore
 
 logger = logging.getLogger(__name__)
 
+# The OBX-11 values this system acts on at all, as one constant rather than two copies.
+# record_result and attach_orphan both validate against it -- attach_orphan first, on
+# the status it reads off the orphan record, where it yields the distinct
+# UNREADABLE_RESULT_STATUS refusal that the generic one would lose. Neither copy was
+# dead; they could not disagree because they were the same literal, and that was the
+# hazard: one predicate in two places diverges on the next edit.
+_HANDLED_RESULT_STATUSES = frozenset({"P", "F", "C"})
+
 # OBX-11 result status codes we act on. HL7 table 0085.
 PRELIMINARY = "P"
 FINAL = "F"
 CORRECTED = "C"
 
-# States a loop may be acknowledged from.
-_ACKNOWLEDGEABLE_FROM = frozenset({LoopState.RESULTED})
 
-# OBX-11 values a coordinator may acknowledge. An allowlist: rule 1 must not be
-# expressible as "anything that is not a preliminary", because that resolves the
-# loop on every value we failed to anticipate.
-# SUPERSEDED (Plan 2b Task 5): spec rule 1 is now machine.apply()'s documentation
-# allowlist, fed by _documentation's fold. Nothing reads this.
-_ACKNOWLEDGEABLE_STATUSES = frozenset({FINAL, CORRECTED})
 
 # How the machine's refusal reasons land in the audit. The audit's vocabulary predates the
 # machine and is what a risk officer asks about by name, so the mapping goes this way round
@@ -183,17 +183,18 @@ _REFUSAL_FOR = {
 # what the radiologist read.
 _RESULT_EVENTS = frozenset({"resulted", "reopened"})
 
-# Terminal or otherwise result-proof states. A result recorded against any of
-# these would leave the loop on no worklist, or retire it by a route no
-# coordinator chose. ATTACHED is here for the same reason as ORPHAN: the record
-# is a result, not an expectation, and a result landing on one would resurrect a
-# retired orphan into the acknowledgement queue.
-# SUPERSEDED (Plan 2b Task 5): `record_result` now asks core.machine, and nothing
-# reads this. Same treatment and same reason as _SCHEDULABLE_FROM above.
-_NO_RESULT_FROM = frozenset({LoopState.ORPHAN, LoopState.DISMISSED, LoopState.ATTACHED})
 
 # The only state a match may be undone from. Not ACKNOWLEDGED, deliberately: see
 # the module note on undo_match versus reverse_acknowledgement.
+# NOT superseded. The only from-state guard core.machine does not own, and the one
+# still enforcing its own rule -- so it is live code, deliberately not labelled like
+# the five that went. undo_match resists expression as a Transition for a reason that
+# is a finding rather than an obstacle: it detaches a result and mints a replacement
+# orphan, so it is one operation over *two* aggregates, and machine.apply() takes one
+# Referral and returns one. Its referral half would also need DOCUMENTED -> SENT, a
+# backward edge deliberately absent from LEGAL_TRANSITIONS -- adding it to admit this
+# one operation would weaken "a result cannot be un-ordered" for every other caller.
+# Design spec 6.5 shaped, and therefore Plan 2c's.
 _UNMATCHABLE_FROM = frozenset({LoopState.RESULTED})
 
 # Detail key naming the orphan a result was attached from. Its presence is what
@@ -213,18 +214,6 @@ _MATCH_TIER = "match_tier"
 # the two names would refuse real work instead of merely reading nothing.
 _ORPHAN_STATUS_KEYS = ("result_status", "obx11")
 
-# Scheduling and cancellation describe where an order sits in the workflow, so
-# they are only meaningful while the loop is still waiting on a result.
-# Cancelling a RESULTED loop would erase the result from every worklist query --
-# CANCELLED appears in neither open_loops() nor resulted_unacknowledged().
-# SUPERSEDED (Plan 2b Task 5): `schedule` now asks core.machine, and nothing reads this.
-# Kept only until `cancel` routes too, because the plan deletes these frozensets in one
-# step rather than one at a time -- but marked, because an unreferenced constant that
-# looks like a guard is how a reader concludes a method is protected when it is not.
-_SCHEDULABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
-# SUPERSEDED (Plan 2b Task 5): `cancel` now asks core.machine, and nothing reads this.
-# Same treatment and same reason as _SCHEDULABLE_FROM above.
-_CANCELLABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
 
 # The actor a message-driven transition is attributed to. A device rather than a
 # person: the HL7 interface asserted this, and naming a coordinator would put a human
@@ -843,7 +832,8 @@ class Registry:
             # embed in an error string.
 
             # The state guard, now asked of core.machine. It replaces both the CANCELLED
-            # refusal above and _NO_RESULT_FROM: CANCELLED is terminal in the table, and
+            # refusal above and the _NO_RESULT_FROM frozenset that Task 5 deleted:
+            # CANCELLED is terminal in the table, and
             # ORPHAN/DISMISSED/ATTACHED leave the referral vocabulary under spec 6.5 and
             # are refused by _refuse_illegal_transition's own conversion. What that used
             # to say in prose -- that ORPHAN -> RESULTED -> ACKNOWLEDGED would retire a
@@ -869,7 +859,7 @@ class Registry:
                 message_at or _now(),
             )
 
-            if obx11 not in (PRELIMINARY, FINAL, CORRECTED):
+            if obx11 not in _HANDLED_RESULT_STATUSES:
                 raise ReferralLoopError(f"Unhandled OBX-11 status: {obx11!r}")
 
             # Destructive: a result supersedes the read a coordinator
@@ -1170,7 +1160,8 @@ class Registry:
                 target = self.get(target_loop_id)
 
                 if orphan_id == target_loop_id:
-                    # record_result would refuse this anyway (_NO_RESULT_FROM),
+                    # record_result would refuse this anyway -- core.machine has no
+                    # edge out of the artifact states (spec 6.5) --
                     # but with a message about states that sends the reader
                     # looking for the wrong bug.
                     raise ReferralLoopError(
@@ -1189,7 +1180,7 @@ class Registry:
                     )
 
                 obx11 = self._orphan_result_status(orphan_id)
-                if obx11 not in (PRELIMINARY, FINAL, CORRECTED):
+                if obx11 not in _HANDLED_RESULT_STATUSES:
                     scope.refusal = RefusalCode.UNREADABLE_RESULT_STATUS
                     raise ReferralLoopError(
                         f"Orphan {orphan_id} carries no readable OBX-11 (got {obx11!r}); "
@@ -1617,7 +1608,7 @@ class Registry:
         here is a message's, and mixing the two would let a coordinator's undo
         outrank a later result whose MSH-7 is older than the moment they clicked
         -- which would refuse acknowledgement of a genuine final read. Nothing is
-        lost: an undone loop is OPEN, and _ACKNOWLEDGEABLE_FROM is {RESULTED}.
+        lost: an undone loop is OPEN, and core.machine has no SENT -> RECONCILED edge.
         """
         best_key = None
         best: LoopEvent | None = None

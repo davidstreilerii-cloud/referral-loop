@@ -38,9 +38,20 @@ claims to hold it goes red, restore. Two rules for those runs, both learned the 
   silent and it points the wrong way: later tests pass — or fail — against code that is not
   what is on disk. It surfaced here as a full suite failing 26 tests that passed in
   isolation, with `apply()`'s guards demonstrably in the right order on disk.
+- **Never write a regex escape into source through a shell heredoc.** `\\b` arrives as a
+  literal `0x08` backspace byte, so `re.sub(rf"\\b{name}\\b", ...)` compiles fine and matches
+  nothing. It presents as a logic bug and no amount of re-reading the source finds it,
+  because the source *looks* correct in every normal viewer. **`cat -A` is the
+  diagnostic** -- it renders the byte as `^H` -- and building the backslash with
+  `chr(92)` at write time is the fix. Cost several attempts on the worklist
+  translation before it was spotted.
+
 - **Restore by writing the saved text back with Python, not `git checkout -- <file>`.** A
   checkout also discards anything else in the working tree for that path, and it proves the
   file matches the index rather than that the mutation was undone.
+
+Both hazards above are the same species: they make the code that runs differ from the
+code on disk, silently, and both present as logic bugs. Neither is one.
 
 A mutation run that reports GREEN has **two** explanations, and only one of them is "the
 test does not discriminate". The other is "I mutated the wrong thing" — a needle that

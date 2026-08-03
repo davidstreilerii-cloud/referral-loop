@@ -818,7 +818,7 @@ def _refused(registry: Registry, loop_id: str, exc: ReferralLoopError, *,
     string. The PHI proof asserts that rather than trusting it.
 
     `explain_preliminary` adds the safety rule in words, but only when it is
-    actually the rule that fired. `_ACKNOWLEDGEABLE_FROM` is exactly {RESULTED},
+    actually the rule that fired. RECONCILED is reachable only from DOCUMENTED in core.machine's table,
     so a refusal on a RESULTED loop can only have come from the result-status
     allowlist; on any other state it came from the state check, and attaching the
     preliminary explanation there would be a confident lie.
