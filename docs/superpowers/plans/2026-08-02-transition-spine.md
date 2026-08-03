@@ -26,6 +26,32 @@ Stop at the end of Phase 1 and confirm the four protected files are still untouc
 - `core/` currently holds `states.py` (11 `ReferralState`, 3 `ArtifactState`, `Hold`) and `models.py` (`Referral`, `InboundArtifact`, distinct `NewType` ids).
 - Existing state machine: nine-member `LoopState`, twelve event types, legality enforced in `store.append_event` (choke point, refuses reserved and unknown types) plus per-method from-state frozensets in `Registry`.
 
+## Method: proving a test discriminates
+
+Every guarantee in this plan is proven by mutation — break the guard, confirm the test that
+claims to hold it goes red, restore. Two rules for those runs, both learned the hard way:
+
+- **Run mutations with `PYTHONDONTWRITEBYTECODE=1` and purge `__pycache__` first.** A
+  mutation that leaves the file the same size can leave behind a `.pyc` that Python's
+  coarse mtime-and-size check treats as still valid, so the mutant keeps executing for the
+  rest of the session against a source file that no longer contains it. The failure is
+  silent and it points the wrong way: later tests pass — or fail — against code that is not
+  what is on disk. It surfaced here as a full suite failing 26 tests that passed in
+  isolation, with `apply()`'s guards demonstrably in the right order on disk.
+- **Restore by writing the saved text back with Python, not `git checkout -- <file>`.** A
+  checkout also discards anything else in the working tree for that path, and it proves the
+  file matches the index rather than that the mutation was undone.
+
+A mutation run that reports GREEN is not a passing test; it is a test proving something
+other than its own subject. Say which mutation was applied when reporting the result.
+
+## Correction to the baseline above
+
+The **1165** figure is stale. Measured at `f3a45b1` on a clean tree before any Plan 2b work:
+**1264 passed, 13 skipped** — `7827c2d Merge branch 'interop'` is in the history and brought
+tests with it. The invariant to hold is "no pre-existing test changes result", not a number
+to hit; treating 1165 as a target would mean deleting other people's tests.
+
 ## What this plan does not do
 
 `REF^I13`/`I14` and `MDM^T02` ingest. Those are new message types, which is different work from reshaping the ones already handled — Plan 2c. Also not here: deleting `migration.py`. It goes when the last `Loop` consumer does, which is after Plan 2c.
