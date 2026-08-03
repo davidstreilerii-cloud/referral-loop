@@ -204,6 +204,8 @@ _ORPHAN_STATUS_KEYS = ("result_status", "obx11")
 # step rather than one at a time -- but marked, because an unreferenced constant that
 # looks like a guard is how a reader concludes a method is protected when it is not.
 _SCHEDULABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
+# SUPERSEDED (Plan 2b Task 5): `cancel` now asks core.machine, and nothing reads this.
+# Same treatment and same reason as _SCHEDULABLE_FROM above.
 _CANCELLABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
 
 # The actor a message-driven transition is attributed to. A device rather than a
@@ -733,11 +735,22 @@ class Registry:
     def cancel(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
         with self._lock:
             loop = self.get(loop_id)
-            if loop.state not in _CANCELLABLE_FROM:
-                raise ReferralLoopError(
-                    f"Cannot cancel a loop in state {loop.state}: an order that already produced "
-                    "a result cannot be un-ordered, and CANCELLED appears on no worklist"
-                )
+            # RECEIVING_ORG because listener._apply_cancel drives this from SIU^S15 --
+            # the same counterparty scheduler that sends the S12 behind `schedule`. Not
+            # HUMAN: no coordinator at this site clicked anything.
+            #
+            # Recorded as a mismatch to resolve, not resolved here: spec 6.1 glosses
+            # CANCELLED as "referring side withdraws", but an S15 cancels an
+            # *appointment*, which is not the referral being withdrawn. The legacy machine
+            # collapses both onto CANCELLED and this commit preserves that exactly;
+            # separating them is a vocabulary change, not a routing change.
+            self._refuse_illegal_transition(
+                loop,
+                ReferralState.CANCELLED,
+                AssertionSource.RECEIVING_ORG,
+                _ENGINE_ACTOR_REF,
+                message_at or _now(),
+            )
             # Destructive: CANCELLED appears in neither open_loops() nor
             # resulted_unacknowledged(), so a cancel applied on an unreadable
             # clock takes a clinically open referral off every queue at once.
