@@ -42,8 +42,17 @@ claims to hold it goes red, restore. Two rules for those runs, both learned the 
   checkout also discards anything else in the working tree for that path, and it proves the
   file matches the index rather than that the mutation was undone.
 
-A mutation run that reports GREEN is not a passing test; it is a test proving something
-other than its own subject. Say which mutation was applied when reporting the result.
+A mutation run that reports GREEN has **two** explanations, and only one of them is "the
+test does not discriminate". The other is "I mutated the wrong thing" — a needle that
+matched a neighbouring branch, or an edit whose label and content disagree. Both happened
+here on the first attempt at routing `schedule`: one mutation hit the unreachable `CLOSED`
+branch instead of the artifact-state branch it was named for, and another deleted
+`RECEIVED` from the table while claiming to delete `SCHEDULED`. Re-aimed, both went red.
+
+That ambiguity is what makes the bytecode rule necessary rather than merely tidy: under a
+stale `.pyc` you cannot tell the two explanations apart, because the run you are reading
+did not execute the edit you are looking at. So: report the mutation *and* the resulting
+counts, and treat any GREEN as unexplained until you have re-read the diff you applied.
 
 ## Correction to the baseline above
 
