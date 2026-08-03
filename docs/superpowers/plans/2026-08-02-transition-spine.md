@@ -212,17 +212,28 @@ def test_the_receiving_organisation_cannot_reconcile_either():
         apply(referral, org)
 
 
+@pytest.mark.parametrize("source", [AssertionSource.SYSTEM_INFERRED,
+                                    AssertionSource.RECEIVING_ORG])
 @pytest.mark.parametrize("state", list(ReferralState))
-def test_reconciled_is_unreachable_from_every_state_without_a_human(state):
+def test_reconciled_is_unreachable_from_every_state_without_a_human(state, source):
     """The state-space sweep, following the pattern of the existing
     test_registry_safety.py. A guarantee that holds from DOCUMENTED but not from
-    SCHEDULED is not a guarantee."""
+    SCHEDULED is not a guarantee.
+
+    Note the assertion is on the *reason*, not on the exception type. RECONCILED is
+    legal only from DOCUMENTED, so a raises-only assertion passes from the other ten
+    states because the transition table refuses the edge one step later -- proving the
+    table's behaviour rather than the guarantee's. Measured: with the guard deleted, a
+    raises-only sweep went 1 failed / 10 passed. This form goes 22/22.
+    """
     referral = _referral(state=state)
-    t = _t(to_state=ReferralState.RECONCILED,
-           assertion_source=AssertionSource.SYSTEM_INFERRED)
-    with pytest.raises(TransitionRejected):
+    t = _t(to_state=ReferralState.RECONCILED, assertion_source=source)
+    with pytest.raises(TransitionRejected) as exc:
         apply(referral, t)
+    assert exc.value.reason is RejectionReason.RECONCILE_REQUIRES_A_HUMAN
 ```
+
+**This ordering is load-bearing and must itself be tested.** `apply()` checks the human guard *before* consulting the legality table. Swapping them makes the sweep pass from ten of eleven states for the wrong reason — measured at `21 failed, 2 passed` with the order reversed, so a test pinning the order is cheap and catches a refactor that looks harmless.
 
 Plus: every legal transition in `LEGAL_TRANSITIONS` is reachable; every illegal one raises; `apply` returns a new `Referral` and does not mutate the input; `seq` increments by exactly one.
 

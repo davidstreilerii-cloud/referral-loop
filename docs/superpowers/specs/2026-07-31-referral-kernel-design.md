@@ -313,6 +313,20 @@ DRAFT → SENT → RECEIVED → ACCEPTED → SCHEDULED → SEEN → DOCUMENTED �
 Exits: `DECLINED` (receiving org refuses), `CANCELLED` (referring side withdraws), `AGED_OUT`
 (terminal by timeout, no counterparty signal).
 
+**Where `AGED_OUT` is reachable from** (added 2026-08-02, during Plan 2b): exactly the states in
+which we are waiting on the **counterparty** — `SENT`, `RECEIVED`, `ACCEPTED`, `SCHEDULED`, `SEEN`.
+
+Not from `DRAFT`: aging means counterparty silence, and a draft has no counterparty yet. An
+abandoned draft exits via `DRAFT → CANCELLED`, which requires a human — deciding a draft referral
+is dead is a clinical judgement, not a timeout.
+
+Not from `DOCUMENTED`: there we are waiting on **ourselves**. A documented-but-unreconciled loop is
+*unreviewed*, not unclosed, and it lives in `resulted_unacknowledged()` — a queue whose whole
+purpose is to stay non-empty until a coordinator acts. Letting the system age it out would empty
+the queue that is the product. The existing store already agrees: `_NEVER_DELETABLE` refuses to
+purge exactly that population. `AGED_OUT` projecting to the loud `failed` rather than a silent
+close does not rescue it — a loud wrong status still removes the loop from the list a human works.
+
 ### 6.2 Hold is an attribute, not a state
 
 A referral held from `ACCEPTED` and one held from `SCHEDULED` are operationally different, and
