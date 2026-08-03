@@ -581,8 +581,15 @@ reads correctly when reality arrives backwards.
 
 - `target` → `Task/{referral_id}`, plus `ServiceRequest/{id}` where known
 - `occurredDateTime` → `occurred_at`; `recorded` → `recorded_at`
-- `activity` → our CodeSystem: `submit | accept | decline | schedule | see | document |
-  reconcile | cancel | age-out | hold | release`
+- `activity` → our CodeSystem: `draft | submit | receive | accept | decline | schedule | see |
+  document | reconcile | cancel | age-out | hold | release`
+
+  *Amended 2026-08-03.* The original list had eleven codes and no verb for `DRAFT` or
+  `RECEIVED` — it enumerated the transitions I had in mind when writing §8.2, not the states
+  the model ended up with, and the gap only surfaced when the projection had to be **total**
+  over `ReferralState`. Copying it would have emitted a `Provenance` that says something
+  happened without saying what, which is worse than an incomplete vocabulary: it is a resource
+  that looks complete to a consumer. Thirteen codes.
 - `entity[]` → one per `Evidence`, `role = source`
 - `agent[]`:
   - **always** a `Device` agent — this system, its version, the rule-pack version, and the model
