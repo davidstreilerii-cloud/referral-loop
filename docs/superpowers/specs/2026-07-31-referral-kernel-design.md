@@ -539,6 +539,24 @@ BEGIN IMMEDIATE
 COMMIT
 ```
 
+**Substitution during migration (recorded 2026-08-02, Plan 2b Task 4).** There is no `referrals`
+table and this spec never said to create one — it describes the target state, written before
+contact with the code. The current-state projection is `loops`, still in the legacy nine-state
+vocabulary, so `UPDATE referrals` reads as `UPDATE loops` until Plan 2c retires that vocabulary
+and `migration.py` with it.
+
+Deliberately **one** projection, not two. Standing up `referrals` alongside `loops` would match
+this text sooner at the cost of a window in which two projections can disagree — the same
+two-enforcement-points failure this design has had to rule against three separate times
+(the machine-versus-registry split, the from-state frozensets, the guard-versus-table ordering).
+
+`transition_events` nevertheless names its foreign key **`referral_id`** from day one, holding
+what the rest of the schema calls a `loop_id`. The values are identical UUIDs; only the vocabulary
+differs, and `migration.canonical_state` proves the mapping total. The reason is that
+`transition_events` is append-only: renaming a column on an append-only table later is precisely
+the `_widen_key` hazard that emptied the PHI archive and took three review rounds to close, and the
+table holding the provenance record is the worst possible place to meet it again.
+
 `UNIQUE(referral_id, seq)` makes the event chain gapless **and** provides optimistic concurrency:
 two MLLP connections racing on the same referral, one loses the insert and retries. Direct
 mutation of `referrals` is private to the store and unreachable from `core/`.
