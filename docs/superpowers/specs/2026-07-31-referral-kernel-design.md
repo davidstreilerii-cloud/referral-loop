@@ -372,6 +372,47 @@ predicate — which is exactly where that decision should live.
 Tested by an exhaustive state-space sweep, following the pattern of the existing
 `test_registry_safety.py`.
 
+#### Carried to Plan 2c: `undo_match` is a two-aggregate operation
+
+*Found 2026-08-03 — the first and only guard that resisted expression as a `Transition` during
+Plan 2b's routing. It resisted for the right reason.*
+
+`undo_match` detaches a result from a referral and re-orphans it. Two things make it inexpressible
+as `apply(referral, transition) -> Referral`:
+
+1. **It mints a second aggregate.** `registry.py:1270` calls `orphan(...)` to create the record
+   holding the detached result — an `InboundArtifact` under §5.1 — *before* touching the referral.
+   `apply()` takes one aggregate and returns one; there is no signature by which it mints another.
+2. **Its referral half is a backward edge deliberately excluded from the table.** The `unmatched`
+   event maps to `LoopState.OPEN`, so the referral moves `DOCUMENTED → SENT`. `LEGAL_TRANSITIONS`
+   has no such edge, and its absence is load-bearing — it is the same rule that makes `SEEN` and
+   later non-cancellable.
+
+**Adding `DOCUMENTED → SENT` to admit `undo_match` would weaken "a result cannot be un-ordered"
+for every other caller**, to serve one operation that is really a two-aggregate correction. A
+domain model that can express every existing operation is not automatically a good model; here the
+model is saying the operation is wrong-shaped, and widening it to accommodate would destroy what
+the model was for.
+
+Worth noting how this was reached. §6.5 argued for the split from the **store** —
+`_EXACT_TIER_STATES` needing `ATTACHED`, `_NEVER_DELETABLE` treating `ORPHAN` specially, the
+`attached_from` exemption. This argument arrives from the **transition signature**, starting only
+from `apply()` taking one aggregate. Two independent routes to the same conclusion.
+
+**Preserve verbatim into 2c** — the ordering guarantee in `undo_match`, which is a property of the
+*pair* of writes and is the first thing lost when an operation is re-expressed in a new vocabulary:
+
+> *"of the two orderings only this one fails safe. A failure after this point leaves a duplicate
+> orphan and a loop still RESULTED — visible and correctable. The other order loses the result
+> outright."*
+
+Under the two-aggregate split this becomes *"detach this artifact from this referral"* — one
+operation over two aggregates, needing a home that is neither `machine.apply()` nor a from-state
+frozenset. `_UNMATCHABLE_FROM` therefore stays **live** through Plan 2b, annotated as awaiting 2c
+and deliberately **not** marked `SUPERSEDED`: unlike the other four it is still the only thing
+enforcing its rule, and a superseded label on a live guard is how a reader concludes a rule moved
+when it did not.
+
 #### Carried to Plan 2c: operator guidance that lost its home
 
 *Recorded 2026-08-03 while routing `record_result`.*
