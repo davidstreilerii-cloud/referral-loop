@@ -1228,6 +1228,8 @@ def resolve_patient(
 
 If the Patient search URL in the tests does not match what the module builds, **fix the test's expected key to match the module, not the other way round** — then confirm by printing `behaviour.requests` that the server saw the URL you expect.
 
+**Known transient lint state.** The import block above is the finished module's, so `datetime` is unused until Task 7 adds `find_candidate_documents`, and `ruff` reports F401 on it. Left as-is because Task 7 immediately follows and consumes it, and removing-then-re-adding an import one task later is churn in the history for no gain. **Task 7 must verify `ruff check src/ tests/` is clean before it commits** — that is what makes this bounded rather than unnoticed. If Task 7 is not running next, remove the import here instead.
+
 - [ ] **Step 5: Commit**
 
 ```bash
