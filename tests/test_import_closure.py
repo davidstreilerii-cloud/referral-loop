@@ -36,7 +36,7 @@ print(json.dumps(sorted(sys.modules)))
 
 _CORE_PROBE = (
     "import referral_loop.core, referral_loop.core.states, referral_loop.core.models,"
-    "referral_loop.core.transitions;"
+    "referral_loop.core.transitions, referral_loop.core.machine;"
     "import json,sys; print(json.dumps(sorted(sys.modules)))"
 )
 
