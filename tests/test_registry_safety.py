@@ -1033,3 +1033,48 @@ def test_schedule_accepts_exactly_two_states_and_refuses_the_rest(registry, stat
         with pytest.raises(ReferralLoopError):
             registry.schedule(loop_id, control_id="S-NEW")
         assert registry.get(loop_id).state is state, "a refused schedule moved the loop"
+
+
+_CANCEL_ACCEPTS = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
+
+
+@pytest.mark.parametrize("state", [s for s in LoopState if s is not LoopState.CLOSED])
+def test_cancel_accepts_exactly_two_states_and_refuses_the_rest(registry, state):
+    """`cancel` as it behaves today, pinned before Task 5 routes it.
+
+    Every call carries an explicit `message_at` so this sweep tests the *state* axis
+    alone. Cancel is one of the two transitions that demand a readable clock
+    (`require_message_time=True`), and a sweep that let the ordering guard do the refusing
+    would go green while proving nothing about which states cancel accepts -- the same
+    trap the RECONCILED sweep fell into, one layer out.
+
+    The refusal type is asserted for the reason schedule's sweep gives: three of these
+    states leave the referral vocabulary under spec 6.5, and a ValueError escaping in
+    place of a ReferralLoopError changes what listener.py answers the sending engine.
+    """
+    loop_id = _loop_in(registry, state)
+    assert registry.get(loop_id).state is state
+
+    if state in _CANCEL_ACCEPTS:
+        registry.cancel(loop_id, control_id="C-NEW", message_at=T2)
+        assert registry.get(loop_id).state is LoopState.CANCELLED
+    else:
+        with pytest.raises(ReferralLoopError):
+            registry.cancel(loop_id, control_id="C-NEW", message_at=T2)
+        assert registry.get(loop_id).state is state, "a refused cancel moved the loop"
+
+
+def test_cancel_still_demands_a_readable_clock_once_a_loop_has_a_watermark(registry):
+    """The ordering axis, kept separate from the sweep above and pinned in its own right.
+
+    This is the H2 remediation: a blank MSH-7 used to turn off the only anti-replay
+    control in the system, and a replayed SIU^S15 then cancelled a scheduled loop out of
+    open_loops() and resulted_unacknowledged() alike -- clinically open, on no coordinator
+    queue at all. Routing the state guard through the machine must not disturb it, so it
+    is asserted here before the routing rather than assumed after.
+    """
+    loop_id = registry.open_loop(mrn="MRN9", modality="CT", control_id="W-ORM")
+    registry.schedule(loop_id, control_id="W-SIU", message_at=T1)
+    with pytest.raises(StaleMessageError):
+        registry.cancel(loop_id, control_id="W-CAN", message_at=None)
+    assert registry.get(loop_id).state is LoopState.SCHEDULED
