@@ -313,6 +313,31 @@ DRAFT → SENT → RECEIVED → ACCEPTED → SCHEDULED → SEEN → DOCUMENTED �
 Exits: `DECLINED` (receiving org refuses), `CANCELLED` (referring side withdraws), `AGED_OUT`
 (terminal by timeout, no counterparty signal).
 
+#### Defect: `SIU^S15` cancels an appointment, not a referral
+
+*Found 2026-08-02 while routing `cancel` through the machine. Recorded here rather than fixed,
+because Plan 2b is a zero-behaviour-change exercise. **Plan 2c item.***
+
+`listener._apply_cancel` drives `Registry.cancel` from `SIU^S15`. But `S15` is an **appointment**
+cancellation, and a cancelled appointment is not a withdrawn referral — the patient still needs to
+be seen and the referral still needs rebooking.
+
+Today both collapse onto `CANCELLED`, which appears in neither `open_loops()` nor
+`resulted_unacknowledged()`. So on the entirely benign happy path — a specialist's office cancels
+and reschedules, which happens daily — **a clinically open referral silently leaves every
+coordinator queue.**
+
+That is the precise failure this product exists to prevent, occurring by design rather than by
+attack. Note the security audit reached the same fact from the other direction: it listed `SIU^S15`
+mass-cancellation among C2's exploits *because* `CANCELLED` is on no worklist. It framed that as
+something an adversary does. A routine scheduling message does it too.
+
+The likely fix is that `S15` maps to a hold, or back to `ACCEPTED`, rather than to `CANCELLED` —
+the referral was never withdrawn, only its appointment was. `CANCELLED` should be reachable only
+from an actual withdrawal by the referring side, which today has no distinct message driving it.
+Resolving this is a vocabulary change with a live behaviour consequence, so it needs its own
+before/after on the eval corpus rather than being folded into a routing commit.
+
 **Where `AGED_OUT` is reachable from** (added 2026-08-02, during Plan 2b): exactly the states in
 which we are waiting on the **counterparty** — `SENT`, `RECEIVED`, `ACCEPTED`, `SCHEDULED`, `SEEN`.
 
