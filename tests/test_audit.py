@@ -654,8 +654,11 @@ def test_the_action_is_recorded_only_after_it_committed(registry, monkeypatch):
     """A row saying `success` for an append that raised would be worse than no
     row: the audit would be evidence for something that did not happen."""
     loop_id = _resulted(registry)
+    # **kwargs so the double keeps matching append_event's signature: Plan 2b Task 4b
+    # added a keyword-only `transition`, and a double that pins the old arity fails as
+    # a TypeError from the stub rather than exercising the disk-full path it is for.
     monkeypatch.setattr(registry.store, "append_event",
-                        lambda _e: (_ for _ in ()).throw(OSError("disk full")))
+                        lambda _e, **_kw: (_ for _ in ()).throw(OSError("disk full")))
 
     with pytest.raises(OSError):
         registry.acknowledge(loop_id, actor="a", role="r", control_id="C")

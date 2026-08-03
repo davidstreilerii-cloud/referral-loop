@@ -691,13 +691,19 @@ class Registry:
         source: AssertionSource,
         actor: ActorRef,
         occurred_at: datetime,
-    ) -> None:
+    ) -> Transition:
         """Ask `core.machine` whether this move is legal, and raise if it is not.
 
-        The returned `Referral` is deliberately discarded. State is still derived by
-        replaying `loop_events`, and it stays that way until the single-transaction store
-        lands (Plan 2b Task 4); this call is the *decision*, moved to one enforcement
-        point, and moving the *write* is a separate change with its own risk.
+        Returns the validated `Transition` so the caller hands it to
+        `store.append_event(..., transition=...)`, which writes the provenance row on the
+        same connection and the same commit as the loop_events append and the projection
+        update. Task 5 moved the *decision* here and left the write behind, and that gap
+        survived a green suite for four methods because routing the decision is observable
+        and routing the write is not -- every test asserted on state, and state still came
+        from replaying loop_events. Task 4b closed it.
+
+        The `Referral` apply() returns is still discarded: loop_events drives replay until
+        Plan 2c collapses the two logs.
 
         A loop whose state left the referral vocabulary under spec 6.5 -- ORPHAN,
         DISMISSED, ATTACHED -- and the reserved CLOSED both make `canonical_state` raise
@@ -730,24 +736,23 @@ class Registry:
         events = self.store.events_for(loop.loop_id)
         referral = to_referral(loop, state_occurred_at=events[-1].occurred_at, seq=len(events))
         referral = replace(referral, documentation=self._documentation(loop.loop_id))
-        machine.apply(
-            referral,
-            Transition(
-                to_state=to_state,
-                assertion_source=source,
-                actor=actor,
-                evidence=(),
-                occurred_at=occurred_at,
-                recorded_at=occurred_at,
-                hold=None,
-                rationale=None,
-            ),
+        transition = Transition(
+            to_state=to_state,
+            assertion_source=source,
+            actor=actor,
+            evidence=(),
+            occurred_at=occurred_at,
+            recorded_at=occurred_at,
+            hold=None,
+            rationale=None,
         )
+        machine.apply(referral, transition)
+        return transition
 
     def schedule(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
         with self._lock:
             loop = self.get(loop_id)
-            self._refuse_illegal_transition(
+            transition = self._refuse_illegal_transition(
                 loop,
                 ReferralState.SCHEDULED,
                 # An SIU is the receiving organisation telling us it booked the patient.
@@ -760,7 +765,8 @@ class Registry:
                 LoopEvent(
                     loop_id, "scheduled", _now(), control_id,
                     self._stamp({}, message_at, control_id),
-                )
+                ),
+                transition=transition,
             )
 
     def cancel(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
@@ -775,7 +781,7 @@ class Registry:
             # *appointment*, which is not the referral being withdrawn. The legacy machine
             # collapses both onto CANCELLED and this commit preserves that exactly;
             # separating them is a vocabulary change, not a routing change.
-            self._refuse_illegal_transition(
+            transition = self._refuse_illegal_transition(
                 loop,
                 ReferralState.CANCELLED,
                 AssertionSource.RECEIVING_ORG,
@@ -790,7 +796,8 @@ class Registry:
                 LoopEvent(
                     loop_id, "cancelled", _now(), control_id,
                     self._stamp({}, message_at, control_id),
-                )
+                ),
+                transition=transition,
             )
 
     def record_result(
@@ -851,7 +858,7 @@ class Registry:
             # wire. `attached_from` is set only by attach_orphan, whose only non-test
             # caller is the coordinator worklist -- so it is exactly the signal spec 6.5
             # describes for an attachment being a human's assertion on the referral.
-            self._refuse_illegal_transition(
+            transition = self._refuse_illegal_transition(
                 loop,
                 ReferralState.DOCUMENTED,
                 AssertionSource.HUMAN if attached_from else AssertionSource.RECEIVING_ORG,
@@ -890,14 +897,18 @@ class Registry:
             # supersedes.
             if obx11 == CORRECTED or loop.state is LoopState.ACKNOWLEDGED:
                 detail = self._stamp({**provenance, **_CLEARED_ACK}, message_at, control_id)
-                self.store.append_event(LoopEvent(loop_id, "reopened", _now(), control_id, detail))
+                self.store.append_event(
+                    LoopEvent(loop_id, "reopened", _now(), control_id, detail),
+                    transition=transition,
+                )
                 return
 
             self.store.append_event(
                 LoopEvent(
                     loop_id, "resulted", _now(), control_id,
                     self._stamp(provenance, message_at, control_id),
-                )
+                ),
+                transition=transition,
             )
 
     def acknowledge(self, loop_id: str, actor: str, role: str, control_id: str) -> None:
@@ -940,7 +951,7 @@ class Registry:
                 # RefusalCode the audit has always recorded, rather than the audit
                 # learning a second vocabulary for the same two facts.
                 try:
-                    self._refuse_illegal_transition(
+                    transition = self._refuse_illegal_transition(
                         loop,
                         ReferralState.RECONCILED,
                         # A coordinator at this site, vouching for the match. The one
@@ -966,7 +977,8 @@ class Registry:
                             "ack_at": at.isoformat(),
                             "ack_result_status": status,
                         },
-                    )
+                    ),
+                    transition=transition,
                 )
 
     def reverse_acknowledgement(

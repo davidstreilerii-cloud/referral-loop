@@ -288,3 +288,128 @@ def test_the_writer_opens_its_transaction_immediate_rather_than_deferred():
     assert literals == ["BEGIN IMMEDIATE"], (
         f"the transition writer must open IMMEDIATE, not deferred; found {literals}"
     )
+
+
+# ------------------------------------------- 4b: the write, not just the decision
+
+
+def _registry(tmp_path):
+    from referral_loop.registry import Registry
+    store = LoopStore(tmp_path / "dual.db")
+    return store, Registry(store)
+
+
+def test_every_routed_transition_lands_in_both_logs(tmp_path):
+    """loop_events still drives replay; transition_events is the provenance log. Both
+    exist until Plan 2c collapses them, so both must be written -- and this is what makes
+    the section 9.3 invariants checkable on data that arrived the way production data
+    does, rather than on rows a test appended by hand.
+    """
+    store, registry = _registry(tmp_path)
+    loop_id = registry.open_loop(mrn="M1", modality="CT", control_id="C1")
+    registry.schedule(loop_id, control_id="C2")
+    registry.record_result(loop_id, obx11="F", control_id="C3")
+    registry.acknowledge(loop_id, actor="a", role="r", control_id="C4")
+
+    # open_loop is not routed yet, so it writes only loop_events; the three routed
+    # transitions after it must each have produced a provenance row.
+    assert store.transition_count(loop_id) == 3
+    assert store.fold_transitions(loop_id) is ReferralState.RECONCILED
+
+
+def test_a_rejected_transition_leaves_no_event_and_no_state_change(tmp_path):
+    """The half that would have been silently untrue.
+
+    A test asserting only that the state did not move passes on a partial write -- the
+    projection rolled back, the provenance row left behind. Both logs are checked, because
+    the failure this guards is a transition_events row for something that never happened.
+    """
+    store, registry = _registry(tmp_path)
+    loop_id = registry.open_loop(mrn="M1", modality="CT", control_id="C1")
+    registry.record_result(loop_id, obx11="F", control_id="C2")
+    registry.acknowledge(loop_id, actor="a", role="r", control_id="C3")
+
+    events_before = len(store.events_for(loop_id))
+    transitions_before = store.transition_count(loop_id)
+
+    with pytest.raises(Exception):
+        registry.acknowledge(loop_id, actor="a", role="r", control_id="C4")
+
+    assert len(store.events_for(loop_id)) == events_before
+    assert store.transition_count(loop_id) == transitions_before
+
+
+def test_the_gapless_invariant_holds_across_a_populated_store(tmp_path):
+    """Spec 9.3 invariant 1, over many referrals driven through the registry rather than
+    through append_transition. A hand-built fixture exercises the sequence its author
+    imagined; every ordering hazard this project has found was a sequence nobody imagined
+    until something produced it."""
+    store, registry = _registry(tmp_path)
+    for n in range(60):
+        loop_id = registry.open_loop(mrn=f"M{n}", modality="CT", control_id=f"O{n}")
+        registry.schedule(loop_id, control_id=f"S{n}")
+        registry.record_result(loop_id, obx11="F", control_id=f"R{n}")
+        if n % 2:
+            registry.acknowledge(loop_id, actor="a", role="r", control_id=f"A{n}")
+
+    rows = store._read(
+        "SELECT referral_id, MAX(seq), COUNT(*) FROM transition_events GROUP BY referral_id")
+    assert len(rows) == 60, "the fixture did not populate the log, so this proved nothing"
+    for referral_id, highest, count in rows:
+        assert highest == count, f"{referral_id}: max seq {highest}, {count} events"
+
+
+def test_the_projection_equals_the_fold_across_a_populated_store(tmp_path):
+    """Spec 9.3 invariant 2, on the same populated store: what the registry reports and
+    what the transition chain folds to must agree for every referral."""
+    from referral_loop.migration import canonical_state
+
+    store, registry = _registry(tmp_path)
+    for n in range(40):
+        loop_id = registry.open_loop(mrn=f"M{n}", modality="CT", control_id=f"O{n}")
+        registry.schedule(loop_id, control_id=f"S{n}")
+        if n % 3 == 0:
+            registry.cancel(loop_id, control_id=f"X{n}", message_at=None)
+        else:
+            registry.record_result(loop_id, obx11="F", control_id=f"R{n}")
+
+    checked = 0
+    for loop in store.all_loops():
+        folded = store.fold_transitions(loop.loop_id)
+        if folded is None:
+            continue
+        assert folded is canonical_state(loop.state), (
+            f"{loop.loop_id}: projection {loop.state} folds to {folded}")
+        checked += 1
+    assert checked == 40, f"only {checked} referrals had a chain to check"
+
+
+def test_a_failure_writing_the_provenance_row_rolls_back_the_event_too(tmp_path, monkeypatch):
+    """The "one transaction" claim, made observable.
+
+    Without this, splitting append_event into two commits -- loop_events first, the
+    provenance row after -- leaves every test in this file green, because nothing fails
+    between them. That is the same shape as the BEGIN IMMEDIATE gap: a property argued in
+    a docstring and checked by nothing.
+
+    So the provenance insert is made to fail, and the assertion is that the loop_events
+    append and the projection update went with it. A partial write here is worse than a
+    failed one: the loop would advance with no provenance for how, which is precisely the
+    record this table exists to keep.
+    """
+    store, registry = _registry(tmp_path)
+    loop_id = registry.open_loop(mrn="M1", modality="CT", control_id="C1")
+    events_before = len(store.events_for(loop_id))
+    state_before = registry.get(loop_id).state
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("provenance insert failed")
+
+    monkeypatch.setattr(LoopStore, "_insert_transition", boom)
+    with pytest.raises(Exception):
+        registry.schedule(loop_id, control_id="C2")
+
+    assert len(store.events_for(loop_id)) == events_before, (
+        "the loop_events append survived a failed provenance write")
+    assert registry.get(loop_id).state is state_before
+    assert store.transition_count(loop_id) == 0

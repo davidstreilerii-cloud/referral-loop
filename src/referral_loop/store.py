@@ -1154,7 +1154,7 @@ class LoopStore:
         """Every label, oldest first. The artifact a site would contribute back."""
         return [dict(r) for r in self._read("SELECT * FROM labels ORDER BY label_id")]
 
-    def append_event(self, event: LoopEvent) -> None:
+    def append_event(self, event: LoopEvent, *, transition: Transition | None = None) -> None:
         """Append an event and refresh its projection in ONE transaction.
 
         The event log is authoritative, but open_loops() reads ids from the
@@ -1205,6 +1205,21 @@ class LoopStore:
                 # Same connection, so this joins the transaction the INSERT
                 # opened and is covered by the single commit below.
                 self._materialize(event.loop_id, conn)
+                if transition is not None:
+                    # Spec 9.2's single transaction. The provenance row rides the same
+                    # connection and the same commit as the loop_events append and the
+                    # projection update, so a rejection or a crash leaves all three or
+                    # none. A rejected transition never reaches here at all -- the machine
+                    # refuses before the registry calls this -- and that is the half a
+                    # test asserting only "the state did not move" would pass on while a
+                    # provenance row for something that never happened sat in the log.
+                    #
+                    # Dual-write, deliberately: loop_events still drives replay and
+                    # everything reading state, transition_events is the provenance log,
+                    # and both exist until Plan 2c collapses them. Not two enforcement
+                    # points -- one write in two places, unable to diverge because they
+                    # share this transaction.
+                    self._insert_transition(conn, event.loop_id, transition, seq=None)
                 conn.commit()
             except sqlite3.Error as exc:
                 conn.rollback()
@@ -1216,6 +1231,37 @@ class LoopStore:
                 conn.close()
 
     _EVENTS_SQL = "SELECT * FROM loop_events WHERE loop_id = ? ORDER BY event_id"
+
+    def _insert_transition(self, conn: sqlite3.Connection, referral_id: str,
+                           transition: Transition, *, seq: int | None) -> int:
+        """One provenance row on an already-open transaction. Returns the seq used.
+
+        The seq is derived here, inside the caller's transaction, for the reason
+        append_transition's docstring gives: a seq computed outside it is computed from a
+        stale read, which is the race UNIQUE(referral_id, seq) exists to lose.
+        """
+        if seq is None:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM transition_events WHERE referral_id = ?",
+                (referral_id,),
+            ).fetchone()
+            seq = int(row[0]) + 1
+        hold = transition.hold
+        conn.execute(
+            "INSERT INTO transition_events (referral_id, seq, to_state, "
+            "assertion_source, actor_kind, actor_id, occurred_at, recorded_at, "
+            "evidence, hold_action, rationale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                referral_id, seq, transition.to_state.value,
+                transition.assertion_source.value, transition.actor.kind,
+                transition.actor.id, transition.occurred_at.isoformat(),
+                transition.recorded_at.isoformat(), _evidence_json(transition.evidence),
+                None if hold is None else ("hold" if hold.hold else "release"),
+                transition.rationale,
+            ),
+        )
+        return seq
 
     def append_transition(self, referral_id: str, transition: Transition) -> int:
         """Append one accepted Transition and return the seq it was given.
@@ -1266,33 +1312,7 @@ class LoopStore:
             conn.isolation_level = None
             conn.execute("BEGIN IMMEDIATE")
             try:
-                if seq is None:
-                    row = conn.execute(
-                        "SELECT COALESCE(MAX(seq), 0) FROM transition_events "
-                        "WHERE referral_id = ?",
-                        (referral_id,),
-                    ).fetchone()
-                    seq = int(row[0]) + 1
-                hold = transition.hold
-                conn.execute(
-                    "INSERT INTO transition_events (referral_id, seq, to_state, "
-                    "assertion_source, actor_kind, actor_id, occurred_at, recorded_at, "
-                    "evidence, hold_action, rationale) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        referral_id,
-                        seq,
-                        transition.to_state.value,
-                        transition.assertion_source.value,
-                        transition.actor.kind,
-                        transition.actor.id,
-                        transition.occurred_at.isoformat(),
-                        transition.recorded_at.isoformat(),
-                        _evidence_json(transition.evidence),
-                        None if hold is None else ("hold" if hold.hold else "release"),
-                        transition.rationale,
-                    ),
-                )
+                seq = self._insert_transition(conn, referral_id, transition, seq=seq)
                 conn.execute("COMMIT")
             except BaseException:
                 # Including KeyboardInterrupt: a half-written chain is the failure this
