@@ -372,6 +372,25 @@ predicate — which is exactly where that decision should live.
 Tested by an exhaustive state-space sweep, following the pattern of the existing
 `test_registry_safety.py`.
 
+#### Carried to Plan 2c: operator guidance that lost its home
+
+*Recorded 2026-08-03 while routing `record_result`.*
+
+`record_result`'s explicit `CANCELLED` refusal carried operator guidance the generic machine
+refusal does not, and no test pinned the text:
+
+> **"route to orphan queue and flag"**
+
+It was deleted rather than kept as a second guard in front of `machine.apply()` — a guard that
+agrees today and disagrees the day the table changes is precisely what routing removes, and
+preserving a string is not worth reintroducing it.
+
+But the guidance is real, and its deletion exposed that it was in the wrong place rather than
+causing a loss. Whether a result arriving for a cancelled loop becomes an orphan is **ingest's**
+decision on the refusal, not something `record_result` should embed in an error string. Ingest is
+`listener.py`, which Plan 2b does not touch, so the text is preserved here verbatim and the
+decision belongs at the catch site in Plan 2c.
+
 #### Candidate defect: a preliminary demotes a reconciled loop
 
 *Found 2026-08-03 while generating the `record_result` behaviour table by running the
