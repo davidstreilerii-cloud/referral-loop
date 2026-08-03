@@ -153,7 +153,7 @@ The `HTTPError` branch matters most: a 429 arrives there, not on the success pat
 - [ ] **Step 5: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/connect/egress.py tests/test_egress.py
 git commit -m "feat(connect): Response carries headers, looked up case-insensitively
 
@@ -278,7 +278,7 @@ and pass `identifier_systems=identifier_systems` to the constructor. `_text` alr
 - [ ] **Step 5: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/connect/connectors.py tests/test_connectors.py
 git commit -m "feat(connect): identifier_systems, and is_queryable
 
@@ -401,7 +401,7 @@ def patient(patient_id: str = "p1") -> dict:
 - [ ] **Step 4: Smoke-test it**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 ./.venv/Scripts/python.exe - <<'PY'
 import sys, ssl, json, urllib.request, tempfile
 from pathlib import Path
@@ -427,7 +427,7 @@ Expected: `entries: 1 type: DocumentReference`
 `./.venv/Scripts/python.exe -m pytest tests/test_preflight.py -q` → 8 passed (this file already uses the fixture).
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add tests/_fhirserver.py
 git commit -m "test: the fixture learns to be a FHIR server, not just a metadata endpoint
 
@@ -661,7 +661,7 @@ def fetch_retrying(
 - [ ] **Step 6: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/connect/retry.py tests/test_retry.py
 git commit -m "feat(connect): a retry policy, beside the request rather than inside it
 
@@ -889,7 +889,7 @@ def validate(resource: Mapping[str, object]) -> Mapping[str, object]:
 - [ ] **Step 5: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/connect/resources.py tests/test_resources.py
 git commit -m "feat(connect): the return shapes, and structural validation
 
@@ -1231,7 +1231,7 @@ If the Patient search URL in the tests does not match what the module builds, **
 - [ ] **Step 5: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/connect/documents.py tests/test_documents.py
 git commit -m "feat(connect): resolve the patient first, and refuse three ways
 
@@ -1511,7 +1511,7 @@ from .resources import READABLE_TYPES, DocumentSearch, FetchedResource, Resource
 The off-allowlist test must fail for the right reason. Confirm the server never saw a request for the evil host:
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 ./.venv/Scripts/python.exe -m pytest tests/test_documents.py -k off_the_allowlist -v
 ```
 
@@ -1520,7 +1520,7 @@ Then temporarily change `_walk` to catch and ignore `EgressRefused` instead of r
 - [ ] **Step 6: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/connect/documents.py tests/test_documents.py
 git commit -m "feat(connect): the pagination walk, bounded and allowlisted
 
@@ -1587,7 +1587,7 @@ In `cli.py`'s `_run_connectors`, after the peer cross-check block and before `pr
 - [ ] **Step 5: Commit**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 git add src/referral_loop/cli.py tests/test_connectors_cli.py
 git commit -m "feat(cli): the report names the connectors that cannot be queried
 
@@ -1609,7 +1609,7 @@ back empty is not. Stated where the rest of the configuration is checked."
 - [ ] **Step 2: Full suite**
 
 ```bash
-cd "$REPO"
+cd "$WORKTREE"
 ./.venv/Scripts/python.exe -m pytest tests/ -q -m "not docker" 2>&1 | tail -5
 ```
 
