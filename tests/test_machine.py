@@ -177,6 +177,34 @@ def test_the_happy_path_of_section_six_one_walks_end_to_end():
     assert referral.seq == len(path)
 
 
+def test_aging_out_is_reachable_exactly_where_we_are_waiting_on_the_counterparty():
+    """The rule behind the AGED_OUT column, asserted rather than left to the comment.
+
+    Aging means counterparty silence. DRAFT is excluded because a draft has no counterparty
+    to be silent -- an abandoned one exits via CANCELLED, which needs a human, because
+    deciding a referral is dead is a clinical judgement and not a timeout.
+
+    DOCUMENTED is excluded because there the wait is on us. A documented referral is one
+    whose note came back and which nobody has reviewed; it is the population
+    `store.resulted_unacknowledged()` selects, and that queue exists to stay non-empty
+    until a person acts. Aging it out empties the queue that is the product. The store
+    already holds this position -- `_NEVER_DELETABLE` lists RESULTED, the same population
+    under the old vocabulary, as "a result nobody has acknowledged".
+    """
+    ages_out = {s.name for s, targets in LEGAL_TRANSITIONS.items()
+                if ReferralState.AGED_OUT in targets}
+    assert ages_out == {"SENT", "RECEIVED", "ACCEPTED", "SCHEDULED", "SEEN"}
+
+
+def test_an_unreviewed_document_cannot_be_aged_out_from_under_a_coordinator():
+    """The case above, exercised rather than read off the table."""
+    referral = _referral(state=ReferralState.DOCUMENTED)
+    with pytest.raises(TransitionRejected) as caught:
+        apply(referral, _t(to_state=ReferralState.AGED_OUT,
+                           assertion_source=AssertionSource.SYSTEM_INFERRED))
+    assert caught.value.reason is RejectionReason.NOT_A_LEGAL_TRANSITION
+
+
 def test_a_corrected_document_demotes_a_reconciled_referral():
     """Spec 6.4, the existing corrected-result behaviour (OBX-11 = C) carried over."""
     referral = _referral(state=ReferralState.RECONCILED)
@@ -405,6 +433,31 @@ def test_a_transition_that_says_nothing_about_the_hold_leaves_it_alone():
     moved = apply(referral, _t(to_state=ReferralState.SEEN,
                                assertion_source=AssertionSource.RECEIVING_ORG))
     assert moved.hold == held
+
+
+def test_an_inbound_schedule_notice_does_not_release_a_hold_a_coordinator_placed():
+    """The failure HoldChange exists to prevent, written out as the case it actually is.
+
+    A coordinator holds a referral for "patient unreachable". An SIU then arrives from the
+    receiving organisation and moves the referral to SCHEDULED. That message says nothing
+    about the hold and must not touch it -- but with `Hold | None` on the Transition there
+    is no way to spell "leave it alone" that is distinct from "lift it", so the ingest path
+    would have to pass None and would silently release a suspension a person applied.
+
+    The hold is compared whole, not merely for presence: a release-and-reapply that lost
+    the reason or the actor would put the referral back on the wrong aging threshold and
+    attribute the suspension to nobody.
+    """
+    held = Hold(reason="patient unreachable", actor="coordinator-b")
+    referral = _referral(state=ReferralState.SENT, hold=held)
+    siu = _t(to_state=ReferralState.SCHEDULED,
+             assertion_source=AssertionSource.RECEIVING_ORG,
+             hold=None)
+    moved = apply(referral, siu)
+    assert moved.state is ReferralState.SCHEDULED
+    assert moved.hold is held
+    assert moved.hold.reason == "patient unreachable"
+    assert moved.hold.actor == "coordinator-b"
 
 
 def test_a_transition_may_apply_a_hold_while_the_state_moves():

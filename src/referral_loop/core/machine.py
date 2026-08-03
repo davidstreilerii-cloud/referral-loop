@@ -101,6 +101,25 @@ class TransitionRejected(ReferralLoopError):
 # * **RECONCILED is not terminal.** Spec 6.4: a corrected document demotes it back to
 #   DOCUMENTED, which is the existing `reopened` event.
 #
+# AGED_OUT is reachable exactly from the states where we are waiting on the counterparty:
+# SENT, RECEIVED, ACCEPTED, SCHEDULED, SEEN. Nowhere else, and the two exclusions are the
+# rule rather than omissions.
+#
+# DRAFT is excluded because a draft has no counterparty to be silent; an abandoned one
+# exits through CANCELLED, which needs a human, because deciding a referral is dead is a
+# clinical judgement rather than a timeout.
+#
+# DOCUMENTED is excluded because there we are waiting on *ourselves*. A DOCUMENTED
+# referral is one whose consult note came back and which no coordinator has reviewed --
+# not an unclosed loop but an unreviewed one -- and it is the population
+# `store.resulted_unacknowledged()` selects, a queue that exists precisely to stay
+# non-empty until a person acts. Aging it out empties the queue that is the product.
+# The existing store already takes this position: `_NEVER_DELETABLE` lists RESULTED, the
+# same population under the old vocabulary, as "a result nobody has acknowledged".
+# That AGED_OUT projects to `Task.status = failed` and is therefore loud rather than
+# silent does not rescue it: a loud wrong status still removes the referral from the list
+# a coordinator works.
+#
 # Backwards moves are otherwise absent. A referral does not return to SCHEDULED once seen,
 # and CANCELLED after the encounter happened is not a withdrawal -- registry.cancel
 # already refuses a RESULTED loop for that reason, and CANCELLED appears on no worklist.
@@ -155,10 +174,10 @@ LEGAL_TRANSITIONS: Mapping[ReferralState, frozenset[ReferralState]] = {
         ReferralState.DOCUMENTED,
         ReferralState.AGED_OUT,
     }),
+    # No AGED_OUT. See the note above the table: from here the wait is on us.
     ReferralState.DOCUMENTED: frozenset({
         ReferralState.DOCUMENTED,
         ReferralState.RECONCILED,
-        ReferralState.AGED_OUT,
     }),
     # Spec 6.4 and nothing else.
     ReferralState.RECONCILED: frozenset({
