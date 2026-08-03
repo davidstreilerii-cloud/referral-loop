@@ -64,7 +64,7 @@ BUSINESS_STATUS_URL_ENV = "REFERRAL_BUSINESS_STATUS_URL"
 _FORBIDDEN_IN_CANONICAL = "|"
 
 
-def _checked_url(name: str, value: str) -> str:
+def _checked_url(name: str, value: str, default: str = DEFAULT_BUSINESS_STATUS_URL) -> str:
     """A canonical url, or a refusal naming the variable that carries it.
 
     Refuses at import rather than at first publication. The failure mode being bought off
@@ -79,7 +79,7 @@ def _checked_url(name: str, value: str) -> str:
             f"this refuses to read it as 'unset' -- an empty value is far more often an "
             f"unset shell variable interpolated into a config than a decision. Unset "
             f"{name} entirely to publish the shipped default "
-            f"({DEFAULT_BUSINESS_STATUS_URL})."
+            f"({default})."
         )
     if any(character.isspace() for character in text):
         # Surrounding whitespace is stripped rather than refused -- a trailing space in a
@@ -115,17 +115,19 @@ def _checked_url(name: str, value: str) -> str:
     return text
 
 
-def _configured_url(env: Mapping[str, str] | None = None) -> str:
+def _configured_url(env: Mapping[str, str] | None = None, *,
+                    variable: str = BUSINESS_STATUS_URL_ENV,
+                    default: str = DEFAULT_BUSINESS_STATUS_URL) -> str:
     """The canonical this deployment publishes. Unset means the shipped default.
 
     Takes the mapping as an argument, matching RetentionPolicy.from_env, so the resolution
     is reachable without mutating the process environment.
     """
     env = os.environ if env is None else env
-    override = env.get(BUSINESS_STATUS_URL_ENV)
+    override = env.get(variable)
     if override is None:
-        return DEFAULT_BUSINESS_STATUS_URL
-    return _checked_url(BUSINESS_STATUS_URL_ENV, override)
+        return default
+    return _checked_url(variable, override, default)
 
 
 # The single source of truth for the url, for this resource and for any future emitter of a
@@ -223,4 +225,56 @@ BUSINESS_STATUS: dict[str, Any] = {
             ),
         },
     ],
+}
+
+
+# ---------------------------------------------------------------- activity codes
+
+# Design spec 8.2. What a transition *did*, as opposed to what state it left the referral
+# in -- Provenance.activity is a verb and Task.businessStatus is a noun, and the two are
+# not the same vocabulary even though they are derived from the same transition.
+DEFAULT_ACTIVITY_URL = "https://referral-loop.health/fhir/CodeSystem/referral-activity"
+
+# A second env var rather than a shared base-namespace one, deliberately. Consolidating
+# would change REFERRAL_BUSINESS_STATUS_URL, which is on canonical-model-v1 and which
+# another branch may already be configuring. At two vocabularies this is repetition; a
+# third is the trigger to consolidate, because at three it is a pattern nobody chose.
+ACTIVITY_URL_ENV = "REFERRAL_ACTIVITY_URL"
+
+# Same defaulting posture as the business statuses: unset publishes the shipped default,
+# because the safe value is the one every deployment shares. Overriding buys local
+# identity at the cost of Codings that no other site can resolve -- see the warning on
+# BUSINESS_STATUS_URL_ENV, which applies here unchanged.
+ACTIVITY_URL = _configured_url(variable=ACTIVITY_URL_ENV, default=DEFAULT_ACTIVITY_URL)
+ACTIVITY_VERSION = "1.0.0"
+
+# Eleven from spec 8.2, plus `draft` and `receive`. Those two are an addition rather than
+# an oversight being copied: 8.2's list has no verb for DRAFT or RECEIVED, and a
+# projection that is total over ReferralState needs one for every state it can be handed.
+# Recorded here rather than silently -- the alternative was emitting a Provenance with no
+# activity, which is a resource that says something happened without saying what.
+ACTIVITY_CODES: dict[str, str] = {
+    "draft": "Referral drafted, not yet sent",
+    "submit": "Referral sent to the receiving organisation",
+    "receive": "Receipt acknowledged by the receiving organisation",
+    "accept": "Referral accepted by the receiving organisation",
+    "decline": "Referral refused by the receiving organisation",
+    "schedule": "Appointment scheduled",
+    "see": "Patient seen",
+    "document": "Documentation returned",
+    "reconcile": "Loop closed by a coordinator at the referring site",
+    "cancel": "Referral withdrawn",
+    "age-out": "Referral timed out with no counterparty signal",
+    "hold": "Referral suspended",
+    "release": "Suspension lifted",
+}
+
+REFERRAL_ACTIVITY: dict[str, Any] = {
+    "resourceType": "CodeSystem",
+    "url": ACTIVITY_URL,
+    "version": ACTIVITY_VERSION,
+    "name": "ReferralActivity",
+    "status": "active",
+    "content": "complete",
+    "concept": [{"code": code, "display": display} for code, display in ACTIVITY_CODES.items()],
 }
