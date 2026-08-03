@@ -60,6 +60,19 @@ code on disk, silently, and both present as logic bugs. Neither is one.
   left the intended one untouched. Checking that the mutant actually behaves
   differently -- even once, by hand -- catches these where inspection did not.
 
+**Transaction boundaries are systematically under-tested, and mutation is what finds
+it.** Twice in this plan a transactional guarantee was argued in a docstring and
+checked by nothing: `BEGIN IMMEDIATE` in Task 4, and `append_event`'s single commit
+in Task 4b. Both times the mutation found it and review did not. The reason is
+structural rather than careless -- everything else here has an observable output, so
+a test asserts on what appeared; a transaction's guarantee is that an intermediate
+state *never becomes visible*, and no ordinary test looks for something that should
+not exist. Splitting one commit into two leaves every ordinary test green.
+
+The instrument that works is to make the second write fail and assert the first went
+with it. Deterministic, no threading, and it observes the property directly instead
+of by proxy. Write that test whenever a comment claims two writes are atomic.
+
 A mutation run that reports GREEN has **two** explanations, and only one of them is "the
 test does not discriminate". The other is "I mutated the wrong thing" — a needle that
 matched a neighbouring branch, or an edit whose label and content disagree. Both happened

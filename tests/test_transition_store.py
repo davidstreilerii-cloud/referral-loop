@@ -6,6 +6,7 @@ without rewriting registry.py.
 """
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -413,3 +414,75 @@ def test_a_failure_writing_the_provenance_row_rolls_back_the_event_too(tmp_path,
         "the loop_events append survived a failed provenance write")
     assert registry.get(loop_id).state is state_before
     assert store.transition_count(loop_id) == 0
+
+
+# ------------------------------------------- what the failure paths may say
+
+_SENTINEL_TEXT = "ZZSENTINELNARRATIVE"
+
+
+def _loaded(**kw):
+    """A transition carrying sentinel text in every free-text field it has."""
+    return _t(rationale=_SENTINEL_TEXT,
+              evidence=(Evidence(kind=EvidenceKind.DOCUMENT, ref=_SENTINEL_TEXT,
+                                 spans=None, confidence=None),),
+              **kw)
+
+
+def test_no_transition_write_failure_repeats_the_free_text_it_was_carrying(store):
+    """`rationale` is coordinator free text and `Evidence.ref` is caller-supplied, so both
+    are the fields a clinical detail would arrive in. Neither may reach an exception
+    message: every caller of this logs the string, and a confirmed finding in this
+    codebase is that identifiers reach application logs exactly that way.
+
+    Both failure paths are exercised -- the losing writer's IntegrityError and the generic
+    sqlite failure -- because they are separate messages and only one of them names the
+    referral at all.
+    """
+    store.append_transition("R1", _loaded())
+
+    with pytest.raises(StoreUnavailableError) as caught:
+        store._append_transition_at_seq("R1", _loaded(), seq=1)
+    for rendering in (str(caught.value), repr(caught.value), str(caught.value.args)):
+        assert _SENTINEL_TEXT not in rendering, f"free text reached {rendering!r}"
+
+
+def test_the_generic_write_failure_says_nothing_about_the_transition(store, monkeypatch):
+    """The second path. It names neither the referral nor anything off the transition --
+    only that a write failed and what SQLite said about it."""
+    import sqlite3 as _sqlite
+
+    def boom(*_a, **_k):
+        raise _sqlite.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(LoopStore, "_insert_transition", boom)
+    with pytest.raises(StoreUnavailableError) as caught:
+        store.append_transition("R1", _loaded())
+    message = str(caught.value)
+    assert _SENTINEL_TEXT not in message
+    assert "disk I/O error" in message
+
+
+def test_the_transition_write_interpolates_only_non_identifying_values():
+    """Read as source, because the behavioural tests above can only exercise the paths
+    they thought of. This bounds what *any* future message on these paths may name:
+    the referral id, the seq, and the database's own error text.
+
+    `referral_id` holds a minted loop id today, which is why this is not a live leak --
+    but that is a property of the caller, not of the message, and callers change. This is
+    what would fail if a later edit reached for `transition.rationale` to make a failure
+    more diagnosable.
+    """
+    import ast
+    import inspect
+
+    source = Path(inspect.getfile(LoopStore)).read_text(encoding="utf-8")
+    writer = next(n for n in ast.walk(ast.parse(source))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_write_transition")
+    named = {n.id for n in ast.walk(writer) if isinstance(n, ast.Name)}
+    interpolated = {n.value.id for n in ast.walk(writer)
+                    if isinstance(n, ast.FormattedValue) and isinstance(n.value, ast.Name)}
+    assert interpolated <= {"referral_id", "seq", "exc"}, (
+        f"a failure message interpolates something outside the allowlist: "
+        f"{sorted(interpolated - {'referral_id', 'seq', 'exc'})}")
+    assert "transition" in named, "this test is only meaningful while the writer sees one"
