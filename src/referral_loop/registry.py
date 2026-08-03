@@ -136,8 +136,12 @@ from .audit import (
     audited,
 )
 from .clock import MAX_CLOCK_SKEW, is_future_dated
+from .core import machine
+from .core.states import ReferralState
+from .core.transitions import ActorRef, AssertionSource, Transition
 from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
 from .events import LabelType, Loop, LoopEvent, LoopState
+from .migration import canonical_state, to_referral
 from .store import LoopStore
 
 logger = logging.getLogger(__name__)
@@ -195,8 +199,18 @@ _ORPHAN_STATUS_KEYS = ("result_status", "obx11")
 # they are only meaningful while the loop is still waiting on a result.
 # Cancelling a RESULTED loop would erase the result from every worklist query --
 # CANCELLED appears in neither open_loops() nor resulted_unacknowledged().
+# SUPERSEDED (Plan 2b Task 5): `schedule` now asks core.machine, and nothing reads this.
+# Kept only until `cancel` routes too, because the plan deletes these frozensets in one
+# step rather than one at a time -- but marked, because an unreferenced constant that
+# looks like a guard is how a reader concludes a method is protected when it is not.
 _SCHEDULABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
 _CANCELLABLE_FROM = frozenset({LoopState.OPEN, LoopState.SCHEDULED})
+
+# The actor a message-driven transition is attributed to. A device rather than a
+# person: the HL7 interface asserted this, and naming a coordinator would put a human
+# behind a claim no human made. Spec 8.2 always carries a Device agent for the same
+# reason.
+_ENGINE_ACTOR_REF = ActorRef(kind="device", id="referral-loop")
 
 # Detail key holding the clinical timestamp of the message that caused an event
 # (MSH-7). Present only on message-driven events -- human actions must never
@@ -638,11 +652,76 @@ class Registry:
 
     # -------------------------------------------------------------- transitions
 
+    def _refuse_illegal_transition(
+        self,
+        loop: Loop,
+        to_state: ReferralState,
+        source: AssertionSource,
+        actor: ActorRef,
+        occurred_at: datetime,
+    ) -> None:
+        """Ask `core.machine` whether this move is legal, and raise if it is not.
+
+        The returned `Referral` is deliberately discarded. State is still derived by
+        replaying `loop_events`, and it stays that way until the single-transaction store
+        lands (Plan 2b Task 4); this call is the *decision*, moved to one enforcement
+        point, and moving the *write* is a separate change with its own risk.
+
+        A loop whose state left the referral vocabulary under spec 6.5 -- ORPHAN,
+        DISMISSED, ATTACHED -- and the reserved CLOSED both make `canonical_state` raise
+        `ValueError`. That is converted here rather than allowed out, because listener.py
+        catches `ReferralLoopError` one clause above a bare `except Exception` and answers
+        the sending engine differently in each; an orphan refusing a schedule must keep
+        answering what it answers today.
+
+        `documentation` is whatever `to_referral` produces, which is `None`: the legacy
+        row has no such column and the fold that populates it is Task 4's. That is safe
+        for every `to_state` except `RECONCILED`, whose guard reads it -- so `acknowledge`
+        cannot route through here until that fold exists. See the Task 5 note in the plan.
+        """
+        try:
+            state = canonical_state(loop.state)
+        except ValueError as exc:
+            raise ReferralLoopError(
+                f"Loop {loop.loop_id} is in state {loop.state.value}, which has no referral "
+                f"lifecycle to move: {exc}"
+            ) from exc
+        if not isinstance(state, ReferralState):
+            raise ReferralLoopError(
+                f"Loop {loop.loop_id} is in state {loop.state.value}, which is an inbound "
+                "artifact's state and not a referral's, so it has no transition to make "
+                "(design spec section 6.5)"
+            )
+
+        # Non-empty: self.get() raises LoopNotFoundError before this is reached, and a
+        # loop exists only by virtue of having events.
+        events = self.store.events_for(loop.loop_id)
+        referral = to_referral(loop, state_occurred_at=events[-1].occurred_at, seq=len(events))
+        machine.apply(
+            referral,
+            Transition(
+                to_state=to_state,
+                assertion_source=source,
+                actor=actor,
+                evidence=(),
+                occurred_at=occurred_at,
+                recorded_at=occurred_at,
+                hold=None,
+                rationale=None,
+            ),
+        )
+
     def schedule(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
         with self._lock:
             loop = self.get(loop_id)
-            if loop.state not in _SCHEDULABLE_FROM:
-                raise ReferralLoopError(f"Cannot schedule a loop in state {loop.state}")
+            self._refuse_illegal_transition(
+                loop,
+                ReferralState.SCHEDULED,
+                # An SIU is the receiving organisation telling us it booked the patient.
+                AssertionSource.RECEIVING_ORG,
+                _ENGINE_ACTOR_REF,
+                message_at or _now(),
+            )
             self._refuse_if_stale(loop_id, message_at, "schedule")
             self.store.append_event(
                 LoopEvent(
