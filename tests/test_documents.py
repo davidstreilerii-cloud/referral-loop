@@ -9,7 +9,9 @@ import pytest
 from referral_loop.connect.connectors import ConnectorRegistry
 from referral_loop.connect.documents import (
     MAX_PAGES,
+    MAX_RESOURCES,
     ConnectorCannotResolvePatients,
+    FhirRequestFailed,
     PaginationRefused,
     PatientAmbiguousAtConnector,
     PatientNotFoundAtConnector,
@@ -239,3 +241,94 @@ def test_a_malformed_resource_is_skipped_and_counted(certs, tmp_path):
         got = find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
     assert len(got.resources) == 1
     assert got.skipped_malformed == 1
+
+
+def test_a_two_hundred_that_is_not_a_bundle_is_not_read_as_zero_results(certs, tmp_path):
+    """The critical one. _entries read .get("entry") and turned anything that was not a list
+    into [], so a CapabilityStatement returned with status 200 -- valid JSON, wrong resource --
+    produced "this connector does not know that patient". The server never said that. A
+    response that is not a searchset is a failed question, not an answered one."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    behaviour = ServerBehaviour(
+        bundles={
+            "/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": {
+                "resourceType": "CapabilityStatement",
+                "status": "active",
+            }
+        }
+    )
+    with fhir_server(certfile, keyfile, behaviour) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(FhirRequestFailed, match="Bundle|searchset"):
+            resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
+
+
+def test_a_hop_two_response_that_is_not_a_bundle_is_not_an_empty_search(certs, tmp_path):
+    """Same gap one level down, where it is worse: it produced an empty DocumentSearch with
+    skipped_malformed == 0 -- a clean bill of health for a question that was never answered."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = {
+        "resourceType": "OperationOutcome",
+        "issue": [],
+    }
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(FhirRequestFailed, match="Bundle|searchset"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_the_resource_budget_is_shared_across_both_types(certs, tmp_path):
+    """Spec 3.4 says the caps apply to the call as a whole so two resource types cannot quietly
+    double the budget. The page cap was shared through a mutable list; the resource cap was a
+    local list per walk, so it doubled. 499 of each returned 998 against a cap of 500."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    half = MAX_RESOURCES - 1
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        *(document_reference(f"d{i}") for i in range(half))
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        *(diagnostic_report(f"r{i}") for i in range(half))
+    )
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="resources"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_a_resource_of_the_other_readable_type_is_refused_not_relabelled(certs, tmp_path):
+    """resource_type was taken from the query rather than the resource, so a DiagnosticReport
+    returned by the DocumentReference search was accepted and labelled DocumentReference. This
+    module's own comment says provenance that is approximated is not provenance."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        diagnostic_report("r-wrong-type")
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        got = find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+    assert got.resources == ()
+    assert got.skipped_malformed == 1, "mislabelling it as the queried type is worse than dropping it"
+
+
+def test_a_next_link_with_an_unknown_scheme_refuses_as_pagination(certs, tmp_path):
+    """endpoint_of raises ConnectorConfigError for a scheme it does not know -- a boundary the
+    previous sub-project drew, with a comment predicting this exact caller. _walk caught only
+    EgressRefused, so the documented PaginationRefused was not what escaped."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        document_reference("d1"), next_url="ftp://evil.example/page2"
+    )
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="scheme|allowlist"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)

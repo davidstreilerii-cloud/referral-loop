@@ -95,3 +95,15 @@ def test_a_fetched_resource_records_where_it_came_from():
     )
     assert r.connector_id == "example-med"
     assert r.page == 2
+
+
+def test_validate_refuses_the_other_readable_type_when_one_is_expected():
+    """Both are readable, but a DiagnosticReport is not a DocumentReference. Accepting it
+    because it is in READABLE_TYPES is how the wrong label gets attached."""
+    with pytest.raises(ResourceMalformed, match="DocumentReference"):
+        validate(_report(), expected="DocumentReference")
+
+
+def test_validate_without_an_expected_type_still_refuses_an_unreadable_one():
+    with pytest.raises(ResourceMalformed, match="resourceType"):
+        validate({"resourceType": "Observation", "id": "o1", "status": "final"})

@@ -27,7 +27,7 @@ from urllib.parse import quote
 
 from ..errors import ReferralLoopError
 from .auth import TokenCache, acquire_token
-from .connectors import ConnectorProfile, ConnectorRegistry
+from .connectors import ConnectorConfigError, ConnectorProfile, ConnectorRegistry
 from .egress import EgressRefused, Response
 from .resources import READABLE_TYPES, DocumentSearch, FetchedResource, ResourceMalformed, validate
 from .retry import fetch_retrying
@@ -114,10 +114,31 @@ def _authorized_get(
     return payload
 
 
-def _entries(bundle: Mapping[str, object]) -> list[Mapping[str, object]]:
-    entry = bundle.get("entry")
-    if not isinstance(entry, list):
+def _entries(payload: Mapping[str, object], url: str) -> list[Mapping[str, object]]:
+    """Entries of a searchset Bundle, refusing anything that is not one.
+
+    The shape check is the point. Without it, `.get("entry")` on a CapabilityStatement, an
+    OperationOutcome, or any other 200 response returns None, becomes [], and is reported as
+    "we asked and there was nothing" -- which is the one thing this module exists not to say
+    when it is not true. A response that is not a searchset is a question that was not answered,
+    not a question answered with nothing.
+    """
+    kind = payload.get("resourceType")
+    if kind != "Bundle":
+        raise FhirRequestFailed(
+            f"{url} returned a {kind!r}, not a Bundle; a non-searchset response is a failed "
+            "search, not an empty one"
+        )
+    bundle_type = payload.get("type")
+    if bundle_type != "searchset":
+        raise FhirRequestFailed(
+            f"{url} returned a Bundle of type {bundle_type!r}, not a searchset"
+        )
+    entry = payload.get("entry")
+    if entry is None:
         return []
+    if not isinstance(entry, list):
+        raise FhirRequestFailed(f"{url} returned a Bundle whose entry is not a list")
     return [e["resource"] for e in entry if isinstance(e, dict) and isinstance(e.get("resource"), dict)]
 
 
@@ -149,7 +170,7 @@ def resolve_patient(
     """Hop 1. Returns the remote's Patient id, or raises -- never returns nothing."""
     system = profile.mrn_system
     url = patient_search_url(profile, mrn)  # raises ConnectorCannotResolvePatients if undeclared
-    found = _entries(_authorized_get(registry, profile, url, cache=cache or TokenCache()))
+    found = _entries(_authorized_get(registry, profile, url, cache=cache or TokenCache()), url)
 
     if not found:
         raise PatientNotFoundAtConnector(
@@ -196,12 +217,13 @@ def _walk(
     first_url: str,
     *,
     budget: list[int],
+    resource_budget: list[int],
     cache: TokenCache,
 ) -> tuple[list[tuple[Mapping[str, object], int]], list[str], int]:
     """Follow next links, returning (resources, urls_visited, pages).
 
-    `budget` is a one-element list shared across both resource-type walks, so the cap applies to
-    the call rather than to each type.
+    `budget` and `resource_budget` are one-element lists shared across both resource-type walks,
+    so the caps apply to the call rather than to each type.
     """
     collected: list[tuple[Mapping[str, object], int]] = []
     visited: list[str] = []
@@ -223,21 +245,23 @@ def _walk(
         # than being followed. It is a URL the remote chose.
         try:
             payload = _authorized_get(registry, profile, url, cache=cache)
-        except EgressRefused as exc:
+        except (EgressRefused, ConnectorConfigError) as exc:
             raise PaginationRefused(
-                f"{profile.connector_id}: next link left the allowlist: {exc}"
+                f"{profile.connector_id}: next link is not a destination we will fetch: {exc}"
             ) from exc
 
+        found_here = _entries(payload, url)
         visited.append(url)
         budget[0] -= 1
         pages += 1
         # Paired with the page it came from, so FetchedResource.page is the real page rather
         # than arithmetic over an index -- provenance that is guessed is not provenance.
-        collected.extend((resource, pages) for resource in _entries(payload))
-        if len(collected) > MAX_RESOURCES:
+        collected.extend((resource, pages) for resource in found_here)
+        resource_budget[0] -= len(found_here)
+        if resource_budget[0] < 0:
             raise PaginationRefused(
-                f"{profile.connector_id}: more than {MAX_RESOURCES} resources; refusing rather "
-                "than truncating"
+                f"{profile.connector_id}: more than {MAX_RESOURCES} resources across all "
+                "queried types; refusing rather than truncating"
             )
         url = _next_url(payload)
 
@@ -252,7 +276,13 @@ def find_candidate_documents(
     since: datetime,
     until: datetime | None = None,
 ) -> DocumentSearch:
-    """Hop 1 then hop 2, for both readable resource types."""
+    """Hop 1 then hop 2, for both readable resource types.
+
+    The window is built from `.date()`, so a `since` of 14:00 searches from midnight that day.
+    That widens the search rather than narrowing it, which is the safe direction here -- a
+    missed document is the failure this module exists to prevent and an extra candidate is not
+    -- but it is a real loss of precision and not an accident.
+    """
     cache = TokenCache()
     patient_id = resolve_patient(registry, profile, mrn=mrn, cache=cache)
 
@@ -261,6 +291,7 @@ def find_candidate_documents(
         window += f"&date=le{until.date().isoformat()}"
 
     budget = [MAX_PAGES]
+    resource_budget = [MAX_RESOURCES]
     resources: list[FetchedResource] = []
     # The real hop-1 URL, not a reconstruction: provenance that is approximated is not
     # provenance, and this is the string a coordinator reads to see what was actually asked.
@@ -273,12 +304,14 @@ def find_candidate_documents(
             f"{profile.fhir_base_url}/{kind}"
             f"?patient={quote('Patient/' + patient_id, safe='')}{window}"
         )
-        found, visited, pages = _walk(registry, profile, first, budget=budget, cache=cache)
+        found, visited, pages = _walk(
+            registry, profile, first, budget=budget, resource_budget=resource_budget, cache=cache
+        )
         urls.extend(visited)
         pages_walked += pages
         for raw, page in found:
             try:
-                validate(raw)
+                validate(raw, expected=kind)
             except ResourceMalformed as exc:
                 # Skipped and counted, not fatal. One malformed resource must not hide the
                 # others -- and the count returns on the result rather than only in a log.

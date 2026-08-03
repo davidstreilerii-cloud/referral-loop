@@ -54,7 +54,7 @@ def _require(resource: Mapping[str, object], field: str) -> object:
     return resource[field]
 
 
-def validate(resource: Mapping[str, object]) -> Mapping[str, object]:
+def validate(resource: Mapping[str, object], *, expected: str | None = None) -> Mapping[str, object]:
     """Refuse anything the mapper could not use. Returns the resource unchanged."""
     kind = resource.get("resourceType")
     if kind not in READABLE_TYPES:
@@ -62,6 +62,14 @@ def validate(resource: Mapping[str, object]) -> Mapping[str, object]:
         # put an Observation into a set the caller believes is documents.
         raise ResourceMalformed(
             f"resourceType {kind!r} is not one of {READABLE_TYPES}"
+        )
+
+    if expected is not None and kind != expected:
+        # Both types are readable, which is exactly why this check is needed: without it a
+        # DiagnosticReport returned by the DocumentReference search is accepted and then
+        # labelled DocumentReference by the caller, because the label came from the query.
+        raise ResourceMalformed(
+            f"expected {expected} but the server returned {kind} {resource.get('id', '?')}"
         )
 
     for field in ("id", "status", "subject"):
