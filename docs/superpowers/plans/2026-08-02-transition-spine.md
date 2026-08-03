@@ -406,6 +406,56 @@ Two enforcement points that disagree is worse than either alone.
 
 ---
 
+### Task 4b: Wire the write path — added 2026-08-03, and it should have been Task 4
+
+**A plan defect, not an implementation one.** Task 4 was scoped to "add the `transition_events`
+table" and never said to wire it. Task 5 then routed the *decision* to `machine.apply()` while the
+*write* continued through `store.append_event` into `loop_events`. Result: `append_transition` had
+**no caller outside its own docstring**, a full lifecycle through the registry left
+`transition_events` empty, and the definition-of-done item *"state change and event append are one
+transaction"* was **not met** — §9.2's transaction existed as a method nobody called.
+
+**Why four segments of green suite did not catch it: routing the decision is observable, routing
+the write is not.** Every test asserted on state and refusals, and state still came from replaying
+`loop_events`. There was no test that could have failed. That generalises — a migration that moves
+the decision first and the write later has a window in which everything passes and half the work is
+missing.
+
+It surfaced only because Task 7's populated-database check would have run `MAX(seq) == COUNT(*)`
+over **zero rows** and passed. The implementer refused to run it. Fifth instance of the
+vacuous-proof pattern in this project, and the first caught before the check ran rather than after.
+
+- [ ] **Step 1: Pin that the routed methods currently write only `loop_events`**
+
+Behaviour a test should hold *before* it changes, so the change is visible rather than assumed.
+
+- [ ] **Step 2: Stop discarding the `Referral`**
+
+`_refuse_illegal_transition` returns its result; the registry writes through
+`store.append_transition` in the same transaction as the projection update.
+
+- [ ] **Step 3: Accept the dual write, and prove it cannot diverge**
+
+`loop_events` still drives replay and everything reading state; `transition_events` is the
+provenance log. Both exist until Plan 2c collapses them.
+
+Two logs that must agree is the shape this plan has ruled against three times. The difference:
+these are not two *enforcement* points, they are one write in two places. The mitigation is that
+they share a transaction and are proven unable to diverge — not that one of them is authoritative.
+
+- [ ] **Step 4: The invariant that makes 4b provable**
+
+**Every routed transition in `loop_events` has a corresponding row in `transition_events`, and a
+rejection leaves neither.**
+
+Test both halves. The second is the one that was silently untrue before: a rejected transition must
+roll back the projection update *and* the append, and a test that only checks the state did not
+change would pass on a partial write.
+
+- [ ] **Step 5: Full suite, mutations with bytecode off, commit**
+
+---
+
 ### Task 6: The Provenance projection
 
 **Files:**
