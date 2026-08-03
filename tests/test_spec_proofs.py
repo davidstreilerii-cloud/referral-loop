@@ -50,6 +50,8 @@ from referral_loop import registry as registry_module
 from referral_loop import store as store_module
 from referral_loop.audit import referral_audit_entries
 from referral_loop.cli import PUBKEY_ENV, boot
+from referral_loop.core import machine as machine_module
+from referral_loop.core.states import DocumentationStatus
 from referral_loop.errors import PackVerificationError
 from referral_loop.eval import (
     check_release_criteria,
@@ -357,11 +359,23 @@ def test_spec_1_the_same_chain_with_a_final_result_does_acknowledge(system):
 
 
 def test_spec_1_can_fail(system, monkeypatch):
-    """Let P through the acknowledgeable-status gate; the proof must go red."""
+    """Let P through the reconcilable-documentation gate; the proof must go red.
+
+    Repointed in Plan 2b Task 5. This sabotaged registry._ACKNOWLEDGEABLE_STATUSES until
+    that frozenset stopped being the enforcement point -- spec rule 1 is now
+    machine._RECONCILABLE_DOCUMENTATION, fed by registry._documentation's fold. Sabotaging
+    the dead constant left this companion toothless and proof 1 green for a reason nobody
+    had checked, which for the artifact a governance committee reads is worse than an
+    absent proof: a claim with evidence that does not support it.
+
+    The harness caught it by construction -- a companion whose target is dead fails with
+    DID NOT RAISE rather than passing quietly. That property is why the sabotage must
+    always name the live enforcement point and never a convenient proxy for it.
+    """
     monkeypatch.setattr(
-        registry_module, "_ACKNOWLEDGEABLE_STATUSES",
-        frozenset({registry_module.FINAL, registry_module.CORRECTED,
-                   registry_module.PRELIMINARY}),
+        machine_module, "_RECONCILABLE_DOCUMENTATION",
+        frozenset({DocumentationStatus.FINAL, DocumentationStatus.CORRECTED,
+                   DocumentationStatus.PRELIMINARY}),
     )
     with pytest.raises(AssertionError):
         _proof_1(system)

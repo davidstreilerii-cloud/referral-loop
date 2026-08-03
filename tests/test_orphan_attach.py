@@ -161,7 +161,10 @@ def test_a_preliminary_orphan_cannot_be_attached_to_acknowledge_a_loop(store, re
     registry.attach_orphan(orphan_id, target, actor="coord1", role="coordinator")
 
     assert registry.get(target).state is LoopState.RESULTED
-    with pytest.raises(ReferralLoopError, match="no final or corrected result"):
+    # Wording changed when spec rule 1 moved to machine.apply() (Plan 2b Task 5).
+    # Same refusal, same RefusalCode; the message now names the documentation
+    # condition rather than the OBX-11 it was folded from.
+    with pytest.raises(ReferralLoopError, match="final or corrected"):
         registry.acknowledge(target, actor="coord1", role="coordinator", control_id="C-ACK")
     assert registry.get(target).state is LoopState.RESULTED
 

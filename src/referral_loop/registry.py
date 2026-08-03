@@ -126,6 +126,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from .audit import (
@@ -137,7 +138,8 @@ from .audit import (
 )
 from .clock import MAX_CLOCK_SKEW, is_future_dated
 from .core import machine
-from .core.states import ReferralState
+from .core.machine import RejectionReason, TransitionRejected
+from .core.states import DocumentationStatus, ReferralState
 from .core.transitions import ActorRef, AssertionSource, Transition
 from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
 from .events import LabelType, Loop, LoopEvent, LoopState
@@ -157,7 +159,21 @@ _ACKNOWLEDGEABLE_FROM = frozenset({LoopState.RESULTED})
 # OBX-11 values a coordinator may acknowledge. An allowlist: rule 1 must not be
 # expressible as "anything that is not a preliminary", because that resolves the
 # loop on every value we failed to anticipate.
+# SUPERSEDED (Plan 2b Task 5): spec rule 1 is now machine.apply()'s documentation
+# allowlist, fed by _documentation's fold. Nothing reads this.
 _ACKNOWLEDGEABLE_STATUSES = frozenset({FINAL, CORRECTED})
+
+# How the machine's refusal reasons land in the audit. The audit's vocabulary predates the
+# machine and is what a risk officer asks about by name, so the mapping goes this way round
+# rather than teaching audit.py a second set of codes for the same two facts.
+_REFUSAL_FOR = {
+    RejectionReason.NOT_A_LEGAL_TRANSITION: RefusalCode.WRONG_STATE,
+    RejectionReason.PRELIMINARY_NOT_RECONCILABLE: RefusalCode.PRELIMINARY_NOT_ACKNOWLEDGEABLE,
+    # Unreachable from acknowledge, which always asserts HUMAN, but mapped rather than
+    # left to KeyError: a future caller routing a non-human reconciliation through here
+    # should get an audited refusal, not a crash inside the except clause.
+    RejectionReason.RECONCILE_REQUIRES_A_HUMAN: RefusalCode.WRONG_STATE,
+}
 
 # Only these event types carry a result. A merged_in event (Task 7) copies
 # fields off another loop, and an orphaned event carries caller-supplied detail;
@@ -656,6 +672,29 @@ class Registry:
 
     # -------------------------------------------------------------- transitions
 
+    def _documentation(self, loop_id: str) -> DocumentationStatus | None:
+        """What condition this loop's documentation is in, folded from its own events.
+
+        Reuses _latest_result_status, which reuses _latest_result_event. That ordering --
+        newest by clinical time, an event with no clock of its own inheriting the newest
+        clinical time established at its own point in the log, ties on append index -- took
+        three review rounds during the security audit, and two successive bugs came from
+        breaking the rule that a message time is never compared against an arrival time.
+        It is not re-derived here. This method maps its answer into the domain vocabulary
+        and does nothing else.
+
+        An unreadable status folds to None rather than to PRELIMINARY. Both are refused by
+        machine's allowlist, so the safety outcome is identical; None is the more honest of
+        the two because the log did not assert a preliminary read, it asserted something
+        this system could not read. Fabricating PRELIMINARY would put a clinical claim in
+        the aggregate that no message ever made.
+        """
+        status = self._latest_result_status(loop_id)
+        try:
+            return DocumentationStatus(status) if status else None
+        except ValueError:
+            return None
+
     def _refuse_illegal_transition(
         self,
         loop: Loop,
@@ -701,6 +740,7 @@ class Registry:
         # loop exists only by virtue of having events.
         events = self.store.events_for(loop.loop_id)
         referral = to_referral(loop, state_occurred_at=events[-1].occurred_at, seq=len(events))
+        referral = replace(referral, documentation=self._documentation(loop.loop_id))
         machine.apply(
             referral,
             Transition(
@@ -898,21 +938,33 @@ class Registry:
 
             with self._lock:
                 loop = self.get(loop_id)
-                if loop.state not in _ACKNOWLEDGEABLE_FROM:
-                    scope.refusal = RefusalCode.WRONG_STATE
-                    raise ReferralLoopError(f"Cannot acknowledge a loop in state {loop.state}")
+                # Both guards are now the machine's. The state check is
+                # LEGAL_TRANSITIONS; spec rule 1 is the `documentation` guard, fed by the
+                # fold in _refuse_illegal_transition -- which is why acknowledge could not
+                # route until that fold existed.
+                #
+                # The refusal *codes* are what does not move. "TransitionRejected" cannot
+                # tell a risk officer whether the loop was in the wrong state or the read
+                # was preliminary, and the message that could is exactly what must not be
+                # copied into an audit row. So RejectionReason is mapped back onto the
+                # RefusalCode the audit has always recorded, rather than the audit
+                # learning a second vocabulary for the same two facts.
+                try:
+                    self._refuse_illegal_transition(
+                        loop,
+                        ReferralState.RECONCILED,
+                        # A coordinator at this site, vouching for the match. The one
+                        # assertion source machine.apply() will accept for RECONCILED --
+                        # spec 6.3 -- and the reason acknowledge is a human-only path.
+                        AssertionSource.HUMAN,
+                        ActorRef(kind="practitioner", id=actor),
+                        _now(),
+                    )
+                except TransitionRejected as exc:
+                    scope.refusal = _REFUSAL_FOR[exc.reason]
+                    raise
 
                 status = self._latest_result_status(loop_id)
-                if status not in _ACKNOWLEDGEABLE_STATUSES:
-                    # Spec rule 1, and the one refusal a risk officer will ask
-                    # about by name. "ReferralLoopError" cannot distinguish it
-                    # from the state check above, and the message that could is
-                    # exactly what must not be copied into the audit.
-                    scope.refusal = RefusalCode.PRELIMINARY_NOT_ACKNOWLEDGEABLE
-                    raise ReferralLoopError(
-                        f"Loop {loop_id} has no final or corrected result "
-                        f"(latest OBX-11 {status!r}); ACKNOWLEDGED is unreachable"
-                    )
 
                 at = _now()
                 self.store.append_event(

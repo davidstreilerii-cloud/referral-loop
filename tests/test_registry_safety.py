@@ -1160,3 +1160,46 @@ def test_an_unhandled_status_is_refused_before_the_state_is_even_consulted(regis
     with pytest.raises(ReferralLoopError, match="Unhandled OBX-11"):
         registry.record_result(loop_id, obx11="Z", control_id="R-NEW")
     assert registry.get(loop_id).state is LoopState.OPEN
+
+
+_ACK_ACCEPTS_FROM = frozenset({LoopState.RESULTED})
+
+
+@pytest.mark.parametrize("obx11", ("P", "F", "C"))
+@pytest.mark.parametrize("state", [s for s in LoopState if s is not LoopState.CLOSED])
+def test_acknowledge_accepts_only_a_resulted_loop_on_a_final_or_corrected_read(
+    registry, state, obx11
+):
+    """Both of acknowledge's guards, crossed, before Task 5 routes either.
+
+    _ACKNOWLEDGEABLE_FROM is a state question and moves to core.machine.
+    _ACKNOWLEDGEABLE_STATUSES is the preliminary prohibition -- spec rule 1, the
+    malpractice scenario -- and becomes the machine's `documentation` guard once the fold
+    populates it. Both must keep refusing exactly what they refuse today.
+
+    The status is established by landing a result of that OBX-11 on the loop wherever a
+    result can land, so the pair being tested is (state the loop is in, read it holds).
+    """
+    loop_id = _loop_in(registry, state)
+    if state not in _RESULT_REFUSING_STATES:
+        registry.record_result(loop_id, obx11=obx11, control_id="A-ORU", message_at=T2)
+    before = registry.get(loop_id).state
+
+    accepted = before in _ACK_ACCEPTS_FROM and obx11 in ("F", "C")
+    if accepted:
+        registry.acknowledge(loop_id, actor="a", role="r", control_id="A-ACK")
+        assert registry.get(loop_id).state is LoopState.ACKNOWLEDGED
+    else:
+        with pytest.raises(ReferralLoopError):
+            registry.acknowledge(loop_id, actor="a", role="r", control_id="A-ACK")
+        assert registry.get(loop_id).state is before, "a refused acknowledgement moved the loop"
+
+
+def test_a_loop_with_no_result_at_all_is_not_acknowledgeable(registry):
+    """The allowlist's boundary case, kept separate from the sweep because no OBX-11
+    parameter can express 'no result ever arrived'. A denylist on PRELIMINARY would
+    acknowledge this one."""
+    loop_id = _loop_in(registry, LoopState.OPEN)
+    with pytest.raises(ReferralLoopError):
+        registry.acknowledge(loop_id, actor="a", role="r", control_id="A-ACK")
+    assert registry.get(loop_id).state is LoopState.OPEN

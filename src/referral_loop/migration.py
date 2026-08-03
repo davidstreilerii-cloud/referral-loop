@@ -38,6 +38,7 @@ that cannot be recovered afterwards.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from .core.models import (
@@ -138,6 +139,34 @@ def canonical_state(legacy: LoopState) -> ReferralState | ArtifactState:
     # migration with its own name in the message, rather than as a KeyError or -- worse --
     # a None that flows on and becomes a referral in no state at all.
     raise ValueError(f"legacy state {legacy!r} has no canonical mapping; migration.py is incomplete")
+
+
+# The inverse of _TO_REFERRAL_STATE, for translating canonical vocabulary back at a
+# legacy-facing boundary. Derived rather than written out, so it cannot drift from the
+# forward map. Partial by construction: the six ReferralStates with no legacy source have
+# no entry, and translate_to_legacy leaves those alone.
+_TO_LEGACY_NAME: dict[str, str] = {
+    canonical.name: legacy.name for legacy, canonical in _TO_REFERRAL_STATE.items()
+}
+
+
+def translate_to_legacy(message: str) -> str:
+    """Rewrite canonical state names in `message` as the legacy names a user still sees.
+
+    For legacy-facing surfaces only. The worklist API and its UI speak the nine-state
+    vocabulary everywhere else, so a refusal that said RECONCILED where every other
+    surface says ACKNOWLEDGED would be a user-visible change made by an internal
+    refactor -- which Plan 2b's routing is explicitly not entitled to make.
+
+    Whole words only, so RECONCILED does not corrupt a longer token that contains it.
+
+    **This dies with migration.py in Plan 2c.** When the last Loop consumer goes, the
+    worklist speaks the canonical vocabulary and this translation becomes a lie in the
+    other direction. It is here because the boundary exists, not because it is good.
+    """
+    for canonical, legacy in _TO_LEGACY_NAME.items():
+        message = re.sub(rf"\b{canonical}\b", legacy, message)
+    return message
 
 
 def to_referral(loop: Loop, *, state_occurred_at: datetime, seq: int) -> Referral:

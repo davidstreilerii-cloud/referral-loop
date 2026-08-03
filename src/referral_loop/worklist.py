@@ -147,6 +147,7 @@ from .errors import (
     ThresholdsNotAcceptedError,
 )
 from .events import Loop, LoopState
+from .migration import translate_to_legacy
 from .pack import RulePack
 from .registry import Registry
 from .staleness import age, is_stale, require_thresholds_accepted, staleness_ratio
@@ -822,7 +823,12 @@ def _refused(registry: Registry, loop_id: str, exc: ReferralLoopError, *,
     allowlist; on any other state it came from the state check, and attaching the
     preliminary explanation there would be a confident lie.
     """
-    body = {"error": str(exc), "loop_id": loop_id}
+    # Canonical state names are translated back to the legacy vocabulary the rest of
+    # this API speaks. Plan 2b routed these refusals through core.machine, whose
+    # messages name ReferralStates; without this a coordinator would read RECONCILED
+    # on a surface that says ACKNOWLEDGED everywhere else. Removed with migration.py
+    # in Plan 2c, when this surface speaks canonical too.
+    body = {"error": translate_to_legacy(str(exc)), "loop_id": loop_id}
     if explain_preliminary:
         try:
             if registry.get(loop_id).state is LoopState.RESULTED:

@@ -19,14 +19,14 @@ Two enforcement points, checked in this order and no other:
    enforced by refusing a reserved event type at the store. On the transition it survives
    someone making the state reachable.
 
-2. **Spec rule 1, the preliminary prohibition.** A move into `RECONCILED` is permitted
+2. **`LEGAL_TRANSITIONS`, the from-state table.**
+
+3. **Spec rule 1, the preliminary prohibition.** A move into `RECONCILED` is permitted
    only when the referral's `documentation` is `FINAL` or `CORRECTED`. An allowlist, not
    a denylist: a referral documented by a read carrying no status at all -- a restored
    log, a foreign writer, a future code path -- must not reconcile merely because its
    status is not literally preliminary. `registry.py` enforces this today as
    `_ACKNOWLEDGEABLE_STATUSES` and makes the same allowlist argument in the same words.
-
-3. **`LEGAL_TRANSITIONS`, the from-state table.**
 
 The order is load-bearing rather than incidental. `RECONCILED` is legal only from
 `DOCUMENTED`, so checking legality first would mean every other state refused a
@@ -34,9 +34,14 @@ system-asserted reconciliation as an illegal edge and the safety refusal was nev
 reached -- leaving it exercised for the first time in production on the day someone adds
 an edge. Checked first, it is the reason the state-space sweep says anything at all.
 
-The two guarantees are ordered against each other for a reason too: "the system may not
-reconcile" holds whatever the documentation says, while the documentation guard stops
-applying the moment a final arrives, so the human guard is reported when both fire.
+The human guard stays above both: "the system may not reconcile" holds whatever the
+documentation says, and whatever the table says.
+
+Spec rule 1 sits *below* the table, and that ordering is the audit's. A loop in a state
+that cannot reconcile at all is a bookkeeping refusal, and reporting it as the preliminary
+prohibition would inflate the one refusal count a risk officer watches by name with every
+wrong-state attempt. The table answers first; rule 1 answers only for the edge the table
+allows, which is the only edge it has an opinion about.
 
 ## What is deliberately not here: the ordering axis
 
@@ -265,6 +270,15 @@ def apply(referral: Referral, transition: Transition) -> Referral:
             "is evidence toward that, not the coordinator's confirmation of it (spec 6.3)",
         )
 
+    if transition.to_state not in LEGAL_TRANSITIONS[referral.state]:
+        raise TransitionRejected(
+            referral.id,
+            referral.state,
+            transition.to_state,
+            RejectionReason.NOT_A_LEGAL_TRANSITION,
+            "no such edge in the lifecycle of spec 6.1",
+        )
+
     if (
         transition.to_state is ReferralState.RECONCILED
         and referral.documentation not in _RECONCILABLE_DOCUMENTATION
@@ -277,15 +291,6 @@ def apply(referral: Referral, transition: Transition) -> Referral:
             "a referral is reconcilable only on documentation that is final or corrected; "
             f"this one's is {referral.documentation.value if referral.documentation else 'absent'} "
             "(spec rule 1)",
-        )
-
-    if transition.to_state not in LEGAL_TRANSITIONS[referral.state]:
-        raise TransitionRejected(
-            referral.id,
-            referral.state,
-            transition.to_state,
-            RejectionReason.NOT_A_LEGAL_TRANSITION,
-            "no such edge in the lifecycle of spec 6.1",
         )
 
     hold = referral.hold if transition.hold is None else transition.hold.hold
