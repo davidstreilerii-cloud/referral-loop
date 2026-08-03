@@ -1665,6 +1665,275 @@ The diff must be **empty** — including `core/`, which this plan must not touch
 
 - [ ] **Step 5: Walk the definition of done** below, item by item, with evidence for each.
 
+### Task 10: Corrections from the final review
+
+**Files:** modify `src/referral_loop/connect/documents.py`, `src/referral_loop/connect/resources.py`, `tests/test_documents.py`, `tests/test_resources.py`
+
+A whole-branch review falsified the central property three times with running reproductions. All three are defects in this plan, not in its execution.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_documents.py`:
+
+```python
+def test_a_two_hundred_that_is_not_a_bundle_is_not_read_as_zero_results(certs, tmp_path):
+    """The critical one. _entries read .get("entry") and turned anything that was not a list
+    into [], so a CapabilityStatement returned with status 200 -- valid JSON, wrong resource --
+    produced "this connector does not know that patient". The server never said that. A
+    response that is not a searchset is a failed question, not an answered one."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    behaviour = ServerBehaviour(
+        bundles={
+            "/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": {
+                "resourceType": "CapabilityStatement",
+                "status": "active",
+            }
+        }
+    )
+    with fhir_server(certfile, keyfile, behaviour) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(FhirRequestFailed, match="Bundle|searchset"):
+            resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
+
+
+def test_a_hop_two_response_that_is_not_a_bundle_is_not_an_empty_search(certs, tmp_path):
+    """Same gap one level down, where it is worse: it produced an empty DocumentSearch with
+    skipped_malformed == 0 -- a clean bill of health for a question that was never answered."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = {
+        "resourceType": "OperationOutcome",
+        "issue": [],
+    }
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(FhirRequestFailed, match="Bundle|searchset"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_the_resource_budget_is_shared_across_both_types(certs, tmp_path):
+    """Spec 3.4 says the caps apply to the call as a whole so two resource types cannot quietly
+    double the budget. The page cap was shared through a mutable list; the resource cap was a
+    local list per walk, so it doubled. 499 of each returned 998 against a cap of 500."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    half = MAX_RESOURCES - 1
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        *(document_reference(f"d{i}") for i in range(half))
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        *(diagnostic_report(f"r{i}") for i in range(half))
+    )
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="resources"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+def test_a_resource_of_the_other_readable_type_is_refused_not_relabelled(certs, tmp_path):
+    """resource_type was taken from the query rather than the resource, so a DiagnosticReport
+    returned by the DocumentReference search was accepted and labelled DocumentReference. This
+    module's own comment says provenance that is approximated is not provenance."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        diagnostic_report("r-wrong-type")
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        got = find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+    assert got.resources == ()
+    assert got.skipped_malformed == 1, "mislabelling it as the queried type is worse than dropping it"
+
+
+def test_a_next_link_with_an_unknown_scheme_refuses_as_pagination(certs, tmp_path):
+    """endpoint_of raises ConnectorConfigError for a scheme it does not know -- a boundary the
+    previous sub-project drew, with a comment predicting this exact caller. _walk caught only
+    EgressRefused, so the documented PaginationRefused was not what escaped."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        document_reference("d1"), next_url="ftp://evil.example/page2"
+    )
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PaginationRefused, match="scheme|allowlist"):
+            find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+```
+
+Append to `tests/test_resources.py`:
+
+```python
+def test_validate_refuses_the_other_readable_type_when_one_is_expected():
+    """Both are readable, but a DiagnosticReport is not a DocumentReference. Accepting it
+    because it is in READABLE_TYPES is how the wrong label gets attached."""
+    with pytest.raises(ResourceMalformed, match="DocumentReference"):
+        validate(_report(), expected="DocumentReference")
+
+
+def test_validate_without_an_expected_type_still_refuses_an_unreadable_one():
+    with pytest.raises(ResourceMalformed, match="resourceType"):
+        validate({"resourceType": "Observation", "id": "o1", "status": "final"})
+```
+
+- [ ] **Step 2: Run and watch them fail**
+
+`./.venv/Scripts/python.exe -m pytest tests/test_documents.py tests/test_resources.py -q` — expect the six new tests to fail. Paste the real output.
+
+- [ ] **Step 3: Fix `_entries` to require a searchset Bundle**
+
+In `documents.py`, replace `_entries` with:
+
+```python
+def _entries(payload: Mapping[str, object], url: str) -> list[Mapping[str, object]]:
+    """Entries of a searchset Bundle, refusing anything that is not one.
+
+    The shape check is the point. Without it, `.get("entry")` on a CapabilityStatement, an
+    OperationOutcome, or any other 200 response returns None, becomes [], and is reported as
+    "we asked and there was nothing" -- which is the one thing this module exists not to say
+    when it is not true. A response that is not a searchset is a question that was not answered,
+    not a question answered with nothing.
+    """
+    kind = payload.get("resourceType")
+    if kind != "Bundle":
+        raise FhirRequestFailed(
+            f"{url} returned a {kind!r}, not a Bundle; a non-searchset response is a failed "
+            "search, not an empty one"
+        )
+    bundle_type = payload.get("type")
+    if bundle_type != "searchset":
+        raise FhirRequestFailed(
+            f"{url} returned a Bundle of type {bundle_type!r}, not a searchset"
+        )
+    entry = payload.get("entry")
+    if entry is None:
+        return []
+    if not isinstance(entry, list):
+        raise FhirRequestFailed(f"{url} returned a Bundle whose entry is not a list")
+    return [e["resource"] for e in entry if isinstance(e, dict) and isinstance(e.get("resource"), dict)]
+```
+
+Update both call sites to pass the URL: in `resolve_patient`, `_entries(_authorized_get(...), url)`; in `_walk`, `collected.extend((resource, pages) for resource in _entries(payload, url))`.
+
+- [ ] **Step 4: Share the resource budget across both walks**
+
+In `_walk`, replace the local length check. Change the signature to take `resource_budget: list[int]` alongside `budget`, and replace:
+
+```python
+        if len(collected) > MAX_RESOURCES:
+```
+
+with:
+
+```python
+        resource_budget[0] -= len(_entries(payload, url))
+        if resource_budget[0] < 0:
+```
+
+Simpler and less error-prone: keep one `_entries` call per page by assigning it first. The whole loop body becomes:
+
+```python
+        found_here = _entries(payload, url)
+        visited.append(url)
+        budget[0] -= 1
+        pages += 1
+        collected.extend((resource, pages) for resource in found_here)
+        resource_budget[0] -= len(found_here)
+        if resource_budget[0] < 0:
+            raise PaginationRefused(
+                f"{profile.connector_id}: more than {MAX_RESOURCES} resources across all "
+                "queried types; refusing rather than truncating"
+            )
+        url = _next_url(payload)
+```
+
+In `find_candidate_documents`, create `resource_budget = [MAX_RESOURCES]` beside `budget` and pass it to both `_walk` calls. **The point is that both walks decrement the same list**, exactly as `budget` already does for pages.
+
+- [ ] **Step 5: Make `validate` check the type it was asked for**
+
+In `resources.py`, change the signature to `def validate(resource: Mapping[str, object], *, expected: str | None = None) -> Mapping[str, object]:` and after the `READABLE_TYPES` check add:
+
+```python
+    if expected is not None and kind != expected:
+        # Both types are readable, which is exactly why this check is needed: without it a
+        # DiagnosticReport returned by the DocumentReference search is accepted and then
+        # labelled DocumentReference by the caller, because the label came from the query.
+        raise ResourceMalformed(
+            f"expected {expected} but the server returned {kind} {resource.get('id', '?')}"
+        )
+```
+
+In `documents.py`, call `validate(raw, expected=kind)` and set `resource_type=kind` only after that check has passed — the label is now verified rather than assumed.
+
+- [ ] **Step 6: Catch the unknown-scheme refusal as pagination**
+
+In `_walk`, widen the except clause:
+
+```python
+        except (EgressRefused, ConnectorConfigError) as exc:
+            raise PaginationRefused(
+                f"{profile.connector_id}: next link is not a destination we will fetch: {exc}"
+            ) from exc
+```
+
+and import `ConnectorConfigError` from `.connectors`. The previous sub-project's `endpoint_of` raises it for a scheme it does not recognise, and its comment predicted this caller by name — `_walk` catching only `EgressRefused` meant the documented `PaginationRefused` was not what escaped.
+
+- [ ] **Step 7: Note the date granularity**
+
+Add to `find_candidate_documents`'s docstring:
+
+```
+    The window is built from `.date()`, so a `since` of 14:00 searches from midnight that day.
+    That widens the search rather than narrowing it, which is the safe direction here -- a
+    missed document is the failure this module exists to prevent and an extra candidate is not
+    -- but it is a real loss of precision and not an accident.
+```
+
+- [ ] **Step 8: Run everything and commit**
+
+```bash
+cd "$WORKTREE"
+./.venv/Scripts/python.exe -m pytest tests/test_documents.py tests/test_resources.py -q
+./.venv/Scripts/ruff.exe check src/ tests/
+./.venv/Scripts/mypy.exe src/referral_loop/ --ignore-missing-imports --check-untyped-defs --warn-unused-ignores
+```
+
+All must pass and both tools be clean.
+
+```bash
+git add src/referral_loop/connect/documents.py src/referral_loop/connect/resources.py tests/test_documents.py tests/test_resources.py
+git commit -m "fix(connect): a 200 that is not a searchset is a failed search, not an empty one
+
+Three ways the central property was falsifiable, all found by a review that tried to break it
+rather than confirm it, all reproduced against a running server.
+
+_entries read .get('entry') and turned anything that was not a list into []. A
+CapabilityStatement returned with status 200 therefore produced 'this connector does not know
+that patient' -- a definitive claim the server never made -- and at hop two produced an empty
+DocumentSearch with skipped_malformed of zero, a clean bill of health for a question that was
+never answered. That is exactly the confusion this module exists to prevent.
+
+MAX_RESOURCES was enforced against a list local to each walk while the page cap was shared
+through a mutable one, so two resource types doubled it: 499 each returned 998 against a cap of
+500, contradicting the spec sentence that says the caps apply to the call as a whole.
+
+resource_type came from the query rather than the resource, so a DiagnosticReport returned by
+the DocumentReference search was accepted and relabelled. Both types are readable, which is
+precisely why being in READABLE_TYPES is not enough.
+
+And a next link with an unknown scheme raised ConnectorConfigError from endpoint_of -- the
+boundary the previous sub-project drew, whose comment predicted this exact caller -- which
+_walk did not catch, so the documented PaginationRefused was not what escaped."
+```
+
+---
+
 ## Definition of done
 
 - [ ] `Response` carries headers; `header()` is case-insensitive; both `fetch` branches populate it
