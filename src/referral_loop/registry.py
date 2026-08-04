@@ -114,7 +114,7 @@ refused acknowledgement on a preliminary read is exactly the event a risk
 officer asks about, and an audit that only records successes cannot answer them.
 
 Nothing else here is audited. The message-driven transitions -- open_loop,
-orphan, schedule, cancel, record_result -- are already held verbatim and durably
+orphan, schedule, unschedule, cancel, record_result -- are already held verbatim and durably
 in the raw archive, so copying them into a second exportable database would
 double the PHI footprint for no added assurance.
 
@@ -764,6 +764,83 @@ class Registry:
             self.store.append_event(
                 LoopEvent(
                     loop_id, "scheduled", _now(), control_id,
+                    self._stamp({}, message_at, control_id),
+                ),
+                transition=transition,
+            )
+
+    def unschedule(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
+        """An SIU^S15: the appointment went away. The referral did not.
+
+        Spec 6.1 glosses CANCELLED as "the referring side withdraws" -- a clinical
+        judgement by a person here that this referral is dead. An S15 is a counterparty
+        scheduler reporting that a booking no longer exists, which is close to the
+        opposite: the patient still needs the visit, so somebody has to book it again.
+        Collapsing the two onto CANCELLED meant the most benign path there is -- a patient
+        rings the specialist's office and moves their CT -- drove a clinically open
+        referral into a state that appears in neither open_loops() nor
+        resulted_unacknowledged(), and that no later message can undo because CANCELLED is
+        terminal in LEGAL_TRANSITIONS. On no queue, permanently, with every existing guard
+        satisfied.
+
+        So an S15 returns the referral to ACCEPTED, which is where it was before it was
+        booked. It keeps ageing on the coordinator's queue, which is the definition of
+        work outstanding. `cancel` keeps CANCELLED for the withdrawal it always meant.
+        """
+        with self._lock:
+            loop = self.get(loop_id)
+
+            # There has to have BEEN an appointment for one to be cancelled, and this is
+            # the guard core.machine cannot make. LoopState.OPEN maps to
+            # ReferralState.SENT, and SENT -> ACCEPTED is a legal edge for its own
+            # unrelated and correct reason: a receiving organisation accepting a referral
+            # it was sent. So an S15 naming a loop nobody ever booked would be applied
+            # and would record an *acceptance* the receiving org never asserted, off a
+            # message that said the opposite.
+            #
+            # This is NOT a regression to the from-state frozensets Task 5 retired. Those
+            # were a second opinion on *state legality*, which core.machine owns, which is
+            # exactly why they could drift out of agreement with it. This asks a different
+            # question -- whether the evidence for the assertion exists at all -- and it
+            # is the class of refusal listener._target_loop makes when it declines
+            # ambiguous evidence, not the class the machine makes. `_UNMATCHABLE_FROM`
+            # above is the existing precedent: a live guard, deliberately unretired and
+            # annotated as such, for a rule the machine has no way to express.
+            #
+            # It answers first, so it also speaks for the three states that leave the
+            # referral vocabulary under spec 6.5. That is not a loss of the 6.5 message:
+            # an orphan has no appointment either, and both refusals are the
+            # ReferralLoopError listener.py answers the sending engine on.
+            if loop.state is not LoopState.SCHEDULED:
+                raise ReferralLoopError(
+                    f"Loop {loop_id} is in state {loop.state.value}, so there is no appointment "
+                    "to cancel. An SIU^S15 asserts only that a booking went away; a loop that "
+                    "was never booked has none to lose, and treating one as an acceptance would "
+                    "attribute to the receiving organisation a claim it never made."
+                )
+
+            transition = self._refuse_illegal_transition(
+                loop,
+                ReferralState.ACCEPTED,
+                # The same counterparty scheduler that sends the S12 behind `schedule`.
+                # Not HUMAN: no coordinator at this site clicked anything, and this is the
+                # receiving organisation reporting on its own diary.
+                AssertionSource.RECEIVING_ORG,
+                _ENGINE_ACTOR_REF,
+                message_at or _now(),
+            )
+            # `schedule`'s staleness posture, not `cancel`'s, and destructiveness is the
+            # whole of the difference. `cancel` demands a readable clock because CANCELLED
+            # is on no worklist, so a replayed S15 with a blank MSH-7 took a clinically
+            # open loop off every queue at once -- the H2 exploit. Unscheduling hides
+            # nothing: OPEN and SCHEDULED are both in the store's _OPEN_STATES, so the
+            # loop stays exactly where the coordinator already sees it. Refusing it on an
+            # unreadable clock would buy no protection and would leave the loop
+            # advertising an appointment that no longer exists.
+            self._refuse_if_stale(loop_id, message_at, "unschedule")
+            self.store.append_event(
+                LoopEvent(
+                    loop_id, "appointment_cancelled", _now(), control_id,
                     self._stamp({}, message_at, control_id),
                 ),
                 transition=transition,

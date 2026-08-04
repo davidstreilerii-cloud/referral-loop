@@ -267,6 +267,35 @@ def test_a_scheduled_referral_may_be_rescheduled():
         ReferralState.SCHEDULED)
 
 
+def test_a_scheduled_referral_may_be_unscheduled_back_to_accepted():
+    """An SIU^S15 cancels an appointment, not a referral: the patient still needs to be
+    seen and the booking has to be made again. The referral therefore goes back to the
+    state it was in before it was booked rather than to CANCELLED, which is terminal and
+    on no worklist.
+
+    Not a backwards move of the kind the table's note refuses. Nothing clinical has
+    happened yet -- SCHEDULED -> SCHEDULED is already legal as a reschedule, and an S15
+    followed by an S12 is that same reschedule sent as two messages.
+    """
+    referral = _referral(state=ReferralState.SCHEDULED)
+    assert apply(referral, _t(to_state=ReferralState.ACCEPTED,
+                              assertion_source=AssertionSource.RECEIVING_ORG)).state is (
+        ReferralState.ACCEPTED)
+
+
+@pytest.mark.parametrize("state", [ReferralState.SEEN, ReferralState.DOCUMENTED,
+                                   ReferralState.RECONCILED])
+def test_unscheduling_stops_at_the_encounter(state):
+    """The boundary the new SCHEDULED -> ACCEPTED edge must not move. Once the patient has
+    been seen there is no appointment left to cancel, and a late S15 for the slot they
+    already attended must not return the referral to awaiting a booking."""
+    referral = _referral(state=state, documentation=DocumentationStatus.FINAL)
+    with pytest.raises(TransitionRejected) as caught:
+        apply(referral, _t(to_state=ReferralState.ACCEPTED,
+                           assertion_source=AssertionSource.RECEIVING_ORG))
+    assert caught.value.reason is RejectionReason.NOT_A_LEGAL_TRANSITION
+
+
 def test_a_sent_referral_may_be_scheduled_without_a_receipt_ever_arriving():
     """Also required by Task 5: _SCHEDULABLE_FROM contains OPEN, which is SENT here. An
     SIU is routinely the first thing a receiving org sends, and a table that demanded a

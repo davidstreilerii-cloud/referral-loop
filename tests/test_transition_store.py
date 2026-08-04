@@ -385,6 +385,36 @@ def test_the_projection_equals_the_fold_across_a_populated_store(tmp_path):
     assert checked == 40, f"only {checked} referrals had a chain to check"
 
 
+def test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold(tmp_path):
+    """The known exception to the test above, pinned rather than left to be rediscovered.
+
+    `registry.unschedule` asserts ACCEPTED on the transition chain and projects the loop
+    to `LoopState.OPEN`, which `canonical_state` reads back as SENT. That is not a bug in
+    either write: the legacy nine-state vocabulary has no member for ACCEPTED at all --
+    `migration.WITHOUT_LEGACY_SOURCE` names it as one of the six the old machine cannot
+    represent -- and OPEN is the only projection that keeps a referral whose appointment
+    was cancelled on `open_loops()`, which is the entire point of the method.
+
+    So the divergence is the cost of the two vocabularies coexisting, and it is bounded:
+    it lasts until Plan 2c collapses the two logs and `LoopState` goes away, at which
+    point ACCEPTED is expressible and this test should fail and be deleted. Written as a
+    test so that day is loud. It is deliberately NOT a widening of the invariant above --
+    that one must keep holding for every other path.
+    """
+    from referral_loop.migration import canonical_state
+
+    store, registry = _registry(tmp_path)
+    loop_id = registry.open_loop(mrn="M1", modality="CT", control_id="O1")
+    registry.schedule(loop_id, control_id="S1")
+    registry.unschedule(loop_id, control_id="X1")
+
+    assert store.fold_transitions(loop_id) is ReferralState.ACCEPTED
+    assert canonical_state(registry.get(loop_id).state) is ReferralState.SENT
+    assert [loop.loop_id for loop in store.open_loops("M1")] == [loop_id], (
+        "the projection the divergence buys: the referral is still on the worklist"
+    )
+
+
 def test_a_failure_writing_the_provenance_row_rolls_back_the_event_too(tmp_path, monkeypatch):
     """The "one transaction" claim, made observable.
 

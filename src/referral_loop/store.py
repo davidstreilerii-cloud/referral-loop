@@ -578,6 +578,13 @@ _EVENT_STATE = {
     # still in the event log. A conditional restore would need two event types
     # to say one thing, and would make replay depend on a lookup.
     "unmatched": LoopState.OPEN,
+    # An SIU^S15: the counterparty's scheduler saying the appointment went away. OPEN
+    # rather than CANCELLED, and that is the whole of the fix -- the patient still needs
+    # the visit, so the loop returns to the queue it was on before it was booked and keeps
+    # ageing there. CANCELLED is in neither _OPEN_STATES nor resulted_unacknowledged(),
+    # so projecting an appointment cancellation onto it put a clinically open referral on
+    # no worklist at all. registry.unschedule carries the argument in full.
+    "appointment_cancelled": LoopState.OPEN,
 }
 
 # No event type maps to LoopState.CLOSED, and that is the whole of the v1
