@@ -584,7 +584,15 @@ _EVENT_STATE = {
     # ageing there. CANCELLED is in neither _OPEN_STATES nor resulted_unacknowledged(),
     # so projecting an appointment cancellation onto it put a clinically open referral on
     # no worklist at all. registry.unschedule carries the argument in full.
-    "appointment_cancelled": LoopState.OPEN,
+    #
+    # Named for what it does to the referral, and it pairs with "scheduled" above rather
+    # than reading as a variant of "cancelled" four lines up. The first draft called it
+    # "appointment_cancelled", which put a name one prefix away from "cancelled" -- the
+    # referral is dead and off every worklist -- onto the event that means the referral is
+    # alive and back on it. That is this defect's own conflation, and an event type is the
+    # single worst place to keep it: these strings are the durable log, so a later reader
+    # cannot revise one without a migration.
+    "unscheduled": LoopState.OPEN,
 }
 
 # No event type maps to LoopState.CLOSED, and that is the whole of the v1
@@ -1350,6 +1358,17 @@ class LoopStore:
         None rather than a default: a referral with no transitions has no state the log
         ever asserted, and answering DRAFT would invent one. Spec 9.3 invariant 2 compares
         the projection against this.
+
+        One referral shape breaks that comparison, deliberately. `registry.unschedule`
+        writes ACCEPTED here and projects the loop to `LoopState.OPEN`, which
+        `migration.canonical_state` reads back as SENT: the legacy vocabulary has no
+        member for ACCEPTED (`migration.WITHOUT_LEGACY_SOURCE`), and OPEN is the only
+        projection that keeps a referral whose appointment was cancelled on
+        `open_loops()`. It is the cost of the two vocabularies coexisting and it ends when
+        Plan 2c collapses them. Named here because a caller reaching for this function to
+        check the invariant will otherwise read a divergence as corruption. Pinned by
+        test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold; the
+        invariant holds on every other path.
         """
         rows = self._read(
             "SELECT to_state FROM transition_events WHERE referral_id = ? ORDER BY seq",

@@ -454,7 +454,13 @@ def test_a_future_dated_result_cannot_deafen_a_loop_to_its_own_correction(regist
 def test_an_unstamped_cancel_cannot_regress_a_watermarked_loop(registry):
     """H2. `CANCELLED` appears in neither open_loops() nor
     resulted_unacknowledged(), so an unstamped SIU^S15 naming a scheduled loop
-    took a clinically open referral off every coordinator queue at once."""
+    took a clinically open referral off every coordinator queue at once.
+
+    Past tense on the S15, deliberately: it drives `unschedule` now and never arrives
+    here. The guard stays on `cancel` because what it protects is destructiveness, not
+    a message type, and `cancel` is still the transition that ends a referral outright
+    -- so a caller plan 2c wires to it inherits the remediation rather than rediscovering
+    the incident."""
     loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
     registry.schedule(loop_id, control_id="C2", message_at=T2)
     with pytest.raises(StaleMessageError):
@@ -1073,6 +1079,14 @@ def test_cancel_still_demands_a_readable_clock_once_a_loop_has_a_watermark(regis
     open_loops() and resulted_unacknowledged() alike -- clinically open, on no coordinator
     queue at all. Routing the state guard through the machine must not disturb it, so it
     is asserted here before the routing rather than assumed after.
+
+    The S15 has since been routed away to `unschedule`, which sets no such flag because
+    `SCHEDULED -> OPEN` hides nothing. That does not retire this test. The flag guards
+    destructiveness rather than a message type, `cancel` still ends a referral outright
+    and still lands it on no worklist, and the transition has no production caller until
+    plan 2c wires the withdrawal path -- which is exactly the condition under which a
+    control gets quietly dropped and then has to be rediscovered by the incident that
+    motivated it the first time.
     """
     loop_id = registry.open_loop(mrn="MRN9", modality="CT", control_id="W-ORM")
     registry.schedule(loop_id, control_id="W-SIU", message_at=T1)
@@ -1263,7 +1277,7 @@ def test_an_s15_for_a_loop_that_was_never_scheduled_is_refused(registry, store):
     message that said the opposite. The refusal has to be `unschedule`'s own.
 
     Asserted on the state AND on the log: the loop is already OPEN, so a check that only
-    looked at the projection would pass while an `appointment_cancelled` event and a
+    looked at the projection would pass while an `unscheduled` event and a
     provenance row for a transition into ACCEPTED sat in the history.
     """
     loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)

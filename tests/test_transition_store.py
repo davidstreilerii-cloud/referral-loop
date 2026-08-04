@@ -362,7 +362,15 @@ def test_the_gapless_invariant_holds_across_a_populated_store(tmp_path):
 
 def test_the_projection_equals_the_fold_across_a_populated_store(tmp_path):
     """Spec 9.3 invariant 2, on the same populated store: what the registry reports and
-    what the transition chain folds to must agree for every referral."""
+    what the transition chain folds to must agree for every referral.
+
+    For every referral *except an unscheduled one*, and the exception is twenty lines
+    below rather than hidden: `registry.unschedule` writes ACCEPTED to the chain and OPEN
+    to the projection, which reads back as SENT. This fixture reaches `cancel` and
+    `record_result` and never `unschedule`, so the sweep here is not silently excluding
+    the case -- it does not generate it. Widening this test to tolerate the divergence
+    would retire the invariant for every path to cover one; keeping the two separate is
+    what makes the exception visible when Plan 2c removes it."""
     from referral_loop.migration import canonical_state
 
     store, registry = _registry(tmp_path)

@@ -191,14 +191,19 @@ _RESULT_EVENTS = frozenset({"resulted", "reopened"})
 
 # The only state a match may be undone from. Not ACKNOWLEDGED, deliberately: see
 # the module note on undo_match versus reverse_acknowledgement.
-# NOT superseded. The only from-state guard core.machine does not own, and the one
-# still enforcing its own rule -- so it is live code, deliberately not labelled like
-# the five that went. undo_match resists expression as a Transition for a reason that
-# is a finding rather than an obstacle: it detaches a result and mints a replacement
-# orphan, so it is one operation over *two* aggregates, and machine.apply() takes one
-# Referral and returns one. Its referral half would also need DOCUMENTED -> SENT, a
-# backward edge deliberately absent from LEGAL_TRANSITIONS -- adding it to admit this
-# one operation would weaken "a result cannot be un-ordered" for every other caller.
+# NOT superseded. One of two from-state guards core.machine does not own, and still
+# enforcing its own rule -- so it is live code, deliberately not labelled like the five
+# that went. The other is `unschedule`'s no-appointment check, which refuses any loop not
+# currently SCHEDULED; the two are unalike in subject and alike in kind, both asking
+# whether the evidence for an assertion exists rather than whether a state edge is legal,
+# which is the question the machine owns.
+#
+# undo_match resists expression as a Transition for a reason that is a finding rather
+# than an obstacle: it detaches a result and mints a replacement orphan, so it is one
+# operation over *two* aggregates, and machine.apply() takes one Referral and returns
+# one. Its referral half would also need DOCUMENTED -> SENT, a backward edge
+# deliberately absent from LEGAL_TRANSITIONS -- adding it to admit this one operation
+# would weaken "a result cannot be un-ordered" for every other caller.
 # Design spec 6.5 shaped, and therefore Plan 2c's.
 _UNMATCHABLE_FROM = frozenset({LoopState.RESULTED})
 
@@ -788,9 +793,27 @@ class Registry:
         terminal in LEGAL_TRANSITIONS. On no queue, permanently, with every existing guard
         satisfied.
 
-        So an S15 returns the referral to ACCEPTED, which is where it was before it was
-        booked. It keeps ageing on the coordinator's queue, which is the definition of
-        work outstanding. `cancel` keeps CANCELLED for the withdrawal it always meant.
+        So an S15 returns the referral to ACCEPTED: the receiving organisation still
+        holds it and has not booked it, which is exactly what a cancelled appointment
+        leaves behind. **Not back to where it was before it was booked** -- the chain
+        said SENT then, and SCHEDULED -> SENT is deliberately absent from
+        LEGAL_TRANSITIONS. Nor would it be right: an organisation that booked a patient
+        has demonstrably accepted the referral, and a cancelled slot does not un-accept
+        it. ACCEPTED is the only backward edge out of SCHEDULED and it is also the
+        correct one.
+
+        Two vocabularies meet in that sentence, so: ACCEPTED is the *transition chain*.
+        The **projection** goes to `LoopState.OPEN`, which `migration.canonical_state`
+        reads back as SENT, because the legacy nine-state vocabulary has no member for
+        ACCEPTED at all (`migration.WITHOUT_LEGACY_SOURCE`) and OPEN is the only one that
+        keeps the referral on `open_loops()`. Chain and projection therefore disagree
+        here and nowhere else -- the one place spec 9.3 invariant 2 does not hold, pinned
+        by test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold and
+        resolved when Plan 2c collapses the two logs.
+
+        Either way the loop keeps ageing on the coordinator's queue, which is the
+        definition of work outstanding. `cancel` keeps CANCELLED for the withdrawal it
+        always meant.
         """
         with self._lock:
             loop = self.get(loop_id)
@@ -853,7 +876,7 @@ class Registry:
             self._refuse_if_stale(loop_id, message_at, "unschedule")
             self.store.append_event(
                 LoopEvent(
-                    loop_id, "appointment_cancelled", _now(), control_id,
+                    loop_id, "unscheduled", _now(), control_id,
                     self._stamp({}, message_at, control_id),
                 ),
                 transition=transition,

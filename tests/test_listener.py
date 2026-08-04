@@ -833,7 +833,7 @@ def test_siu_s15_unschedules_the_loop_named_by_its_order_number(handler):
     assert [row.loop_id for row in handler.store.open_loops(MRN)] == [loop.loop_id], (
         "the referral still needs the scan, so it stays on the coordinator's queue"
     )
-    assert events_of(handler, loop.loop_id)[-1] == "appointment_cancelled", (
+    assert events_of(handler, loop.loop_id)[-1] == "unscheduled", (
         "and the un-booking was applied rather than declined into the same state"
     )
     assert handler.unbooked_cancel_count == 0
@@ -842,12 +842,14 @@ def test_siu_s15_unschedules_the_loop_named_by_its_order_number(handler):
 def test_an_s15_for_a_referral_that_was_never_booked_changes_nothing(handler):
     """A cancellation for an appointment nobody here ever heard of.
 
-    Two shapes produce it and both are benign: a receiving organisation whose S12 never
-    reached us cancelling the slot anyway, and an S15 redelivered under a fresh MSH-10
-    after the first one already un-booked the loop. Neither is an application failure and
-    neither is a matching failure, which is why it gets its own counter -- an operator
-    watching `untargeted_count` is chasing order-number quality, and an operator watching
-    this one is chasing an S12 that is not arriving.
+    Benign, and the causes are enumerated in `errors.NoAppointmentError`: an `SIU^S12`
+    that never reached us, or one that reached us and was declined. Neither is an
+    application failure and neither is a matching failure, which is why it gets its own
+    counter -- an operator watching `untargeted_count` is chasing order-number quality,
+    and an operator watching this one is chasing a booking that never landed.
+
+    Not a redelivered S15: a second copy from the same peer is answered as a content-key
+    duplicate before `_apply` runs, so it never reaches this path at all.
 
     `AA`, because the message is well formed and will never become acceptable on
     redelivery: `AE` would ask the engine to retry a benign S15 forever and wedge the

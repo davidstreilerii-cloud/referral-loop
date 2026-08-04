@@ -428,7 +428,7 @@ def test_siu_s15_from_the_peer_that_holds_cancel_authority_still_unschedules(
 ):
     """The positive control for the test above, and it needs the booking for the same
     reason: `OPEN` is also where a refused S15 leaves the loop, so this asserts the
-    `appointment_cancelled` event rather than the projection alone."""
+    `unscheduled` event rather than the projection alone."""
     engine = client_context(pki, pki.ris)
 
     with serving(handler, peers) as address:
@@ -442,7 +442,7 @@ def test_siu_s15_from_the_peer_that_holds_cancel_authority_still_unschedules(
     assert loop.state is LoopState.OPEN
     assert handler.unauthorized_cancel_count == 0
     assert [event.event_type for event in handler.store.events_for(loop.loop_id)][-1] == (
-        "appointment_cancelled"
+        "unscheduled"
     )
 
 

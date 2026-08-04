@@ -1,9 +1,19 @@
 """Typed failures for the referral loop subsystem.
 
-Most map to a row of the spec failure matrix (section 8). ThresholdsNotAcceptedError
-does not -- it encodes the resolution of open question 3 (section 12): staleness
-thresholds ship as defaults but the site must accept them explicitly, so a
-threshold stays the hospital's clinical decision rather than ours.
+Most map to a row of the spec failure matrix (section 8). Two do not, and both
+carve-outs are deliberate:
+
+  * ThresholdsNotAcceptedError encodes the resolution of open question 3
+    (section 12): staleness thresholds ship as defaults but the site must accept
+    them explicitly, so a threshold stays the hospital's clinical decision rather
+    than ours.
+  * NoAppointmentError. Section 8 has no row for an SIU^S15 against a referral
+    that was never booked, because the matrix was written when an S15 drove
+    Registry.cancel and a loop's booking history did not decide whether one could
+    be applied. It does now, so a shape the matrix never contemplated is a
+    routine event on a live feed. Named here rather than left implicit: a reader
+    checking this list against section 8 will find one row short and needs to
+    know that is the spec trailing the code, not the code missing a case.
 
 Every name carries the -Error suffix, matching the convention already used
 across this codebase (AnthropicClientError, SpendLimitError, MissingColumnsError).
@@ -94,10 +104,28 @@ class MrnRetiredError(ReferralLoopError):
 class NoAppointmentError(ReferralLoopError):
     """An `SIU^S15` naming a referral that carries no booking to cancel.
 
-    Benign and expected on a live feed: an S12 that never reached us, or an S15
-    redelivered under a fresh MSH-10 after the first one already un-booked the loop.
-    Nothing is wrong with the message, nothing is wrong with the store, and nothing
-    changes -- which is exactly why it needs a name of its own.
+    Benign and expected on a live feed, and worth naming its causes because the
+    counter it drives (`listener.unbooked_cancel_count`) is only useful if a rising
+    one points somewhere:
+
+      * An `SIU^S12` that never reached this listener at all -- the usual case, and a
+        feed gap somebody can go and look for.
+      * An `S12` that reached it and was **declined**, which leaves us unbooked while
+        the receiving organisation believes it booked. Two routes, and both leave a
+        number behind: an `S12` arriving before the order that opens the loop finds no
+        loop to target and raises `untargeted_count`, which an out-of-order feed does
+        routinely; an `S12` clinically older than a message already applied is refused
+        by `_refuse_if_stale` and raises `stale_message_count`. Neither refusal touches
+        the `S15` that follows, because both turn on the loop's own history rather than
+        on anything the `S15` carries.
+
+    Not a redelivery of the S15 itself, in the ordinary case: `content_key` hashes the
+    message type, ORC-1, the order numbers and the MRN but not MSH-10, so a second copy
+    from the same peer is answered as a content duplicate before `_apply` is reached.
+    It becomes reachable only across peers, since both dedup scopes are keyed on
+    `peer_id` -- which needs two peers holding cancel authority for one order, and is
+    rare enough that an operator handed it as a first hypothesis would be sent looking
+    for something that is almost certainly not there.
 
     Typed for the reason MrnRetiredError is: the listener has to answer three
     different failures out of one call, and matching on an error string is the

@@ -433,10 +433,11 @@ class MessageHandler:
         # `SIU^S15`s that named their loop exactly and found no booking on it. Not folded
         # into `untargeted_count`: that one says the evidence did not resolve to a loop
         # and sends somebody to look at order numbers, this one says the loop resolved
-        # fine and had no appointment, and sends somebody to look for an S12 stream that
-        # is not arriving. Not folded into `apply_failure_count` either -- nothing failed,
-        # and a benign daily shape counted as a failure teaches operators to ignore the
-        # number that means the store is broken.
+        # fine and had no appointment, and sends somebody to look for a booking that never
+        # landed. Not folded into `apply_failure_count` either -- nothing failed, and a
+        # benign daily shape counted as a failure teaches operators to ignore the number
+        # that means the store is broken. What makes one rise is enumerated in
+        # errors.NoAppointmentError.
         self.unbooked_cancel_count = 0
         self.unreadable_status_count = 0
         self.mrn_reresolution_count = 0
@@ -1353,25 +1354,22 @@ class MessageHandler:
             )
         except NoAppointmentError as exc:
             # `_target_loop`'s posture -- count, warn, change nothing, answer AA -- for the
-            # same reason: the listener holds evidence it cannot act on. It is a separate
-            # counter because it is a separate operational fact. `untargeted_count` says an
-            # order number resolved to no single loop, and an operator watching it goes and
-            # looks at order-number quality in the feed. This says the loop was named
-            # exactly and had no booking, and the thing to go and look at is an S12 stream
-            # that is not arriving -- or, harmlessly, a redelivered S15 under a fresh MSH-10
-            # after the first already un-booked the loop. Folded into one number, the second
-            # fact is invisible inside the first.
+            # same reason: the listener holds evidence it cannot act on. Why this gets a
+            # counter of its own rather than `untargeted_count` is argued where the counter
+            # is declared; what the causes are is argued in errors.NoAppointmentError.
             #
             # Caught here rather than left to `handle`'s generic ReferralLoopError clause,
             # which would count it as `apply_failure_count` beside a store fault and log it
             # at ERROR. Nothing failed. A scheduling feed that emits these daily would read
-            # as an interface in trouble, and the numbers are how an operator sees any of
-            # this at all.
+            # as an interface in trouble, and this is the one place any of it surfaces:
+            # no MessageHandler counter is exported anywhere, so the number below, and only
+            # the number below, is what an operator will ever see.
             self.unbooked_cancel_count += 1
             logger.warning(
                 "SIU^S15 %r names a loop that carries no appointment to cancel (%s); "
-                "no loop changed, flagged for review. %d so far -- a rising count is an "
-                "SIU^S12 stream that is not reaching us.",
+                "no loop changed, flagged for review. %d so far -- a rising count is "
+                "usually an SIU^S12 stream that is not reaching us, or one this listener "
+                "declined; check untargeted_count and stale_message_count too.",
                 message.control_id, exc, self.unbooked_cancel_count,
             )
 

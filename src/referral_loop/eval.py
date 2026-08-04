@@ -609,10 +609,13 @@ def _order(
 
 def _schedule(*, control: str, mrn: str, placer: str, filler: str,
               when: str = _SYNTH_ORDERED_AT) -> str:
+    # No SCH segment, matching `_cancel` below: nothing in the ingest path reads one --
+    # `_target_loop` resolves an SIU on ORC/OBR order numbers alone -- and a segment
+    # present in one of a matched pair and absent from the other invites a later reader
+    # to think the difference is load-bearing.
     return _message(
         _msh("SIU^S12", control, when),
         _pid(mrn),
-        _segment("SCH", {1: control, 2: control}),
         _segment("ORC", {1: "SC", 2: placer, 3: filler}),
         _segment("OBR", {1: "1", 2: placer, 3: filler, 7: when}),
     )
