@@ -503,20 +503,31 @@ def _unattributable(hits: list[Loop], tier: int, reason: str) -> MatchResult:
       coordinator can attach it deliberately through `attach_orphan` -- which
       also records the label the flywheel reads (spec section 7).
 
-    **Scheduling messages reach this too, and for `SIU^S12` it costs recall.**
-    `listener._target_loop` matches an `SIU` on its order number through the
-    same tiers, so an appointment message carrying a valid `ORC-2` and no
-    readable `PID-3` now declines here rather than scheduling the loop it names:
-    the loop stays OPEN and `untargeted_count` rises where it previously went
-    SCHEDULED. That is a real loss on a benign shape and it is accepted rather
-    than special-cased. `S12` and `S15` arrive through one path and are the same
-    evidence -- an order number and no patient -- so a matcher that scheduled on
-    it would have to decline the cancel by some rule other than the evidence,
-    and `S15` on that evidence retires a clinically open loop into a state no
-    worklist shows. A missed schedule leaves the loop on the queue it was
-    already on, visible and still aging; it is the direction that stays safe,
-    the same asymmetry `_target_loop` argues for refusing tier-3 evidence. The
-    cost is counted and logged, never silent.
+    **Scheduling messages do not reach this, and the note that said they did was
+    wrong twice over.** It read: an `SIU` carrying a valid `ORC-2` and no
+    readable `PID-3` declines here rather than scheduling the loop it names, and
+    the recall loss on `S12` is worth paying because `S12` and `S15` are the same
+    evidence and an `S15` on it "retires a clinically open loop into a state no
+    worklist shows".
+
+    The second half died when the `S15` stopped driving `Registry.cancel`. It now
+    drives `unschedule` and lands on `OPEN`, which is in the store's
+    `_OPEN_STATES`, so a wrong one no longer takes anything off a queue -- it
+    writes a false appointment fact onto a referral, which is a different and
+    smaller harm.
+
+    The first half was never true after H3. `listener._target_loop` builds its
+    candidate list as `open_loops(mrn) if mrn else []`, so an `SIU` naming no
+    patient arrives here with **no candidates at all**: no tier fires, the answer
+    is tier 5 "no candidate loop", and `unattributed` is empty by construction.
+    This function needs a hit whose MRN is *unverified*, and for an `SIU` an
+    unverified MRN and an empty candidate list are the same condition. The recall
+    loss is real, the loop stays OPEN and `untargeted_count` rises -- but it is
+    `_target_loop`'s decision, argued in `_target_loop`'s own docstring, and this
+    was a second copy of it that could drift and did.
+
+    Nothing here changes. The decision this function actually makes is about
+    results, which do reach it, and it stands on the argument above.
 
     Confidence 0.0, not a pack-relative demotion. Scoring it just under
     `pack.confidence_floor` would route it to review through `_resolve`'s floor

@@ -181,6 +181,23 @@ def scheduling(control_id: str, message_type: str, mrn: str = MRN,
     return message(*segments)
 
 
+def rebooking(control_id: str, placer: str, appointment: str, message_at: str) -> str:
+    """An `SIU^S12` for a *new* slot: same order, a new appointment number in ORC-3.
+
+    `scheduling()` leaves ORC-3 empty, and two of those for one order hash to the
+    same content key, which dedup swallows -- see
+    test_a_rebooking_that_names_no_new_appointment_is_eaten_by_content_dedup. A
+    real rebooking names the new booking, which is both what a scheduling system
+    emits and what makes it a different message rather than a retransmit.
+    """
+    return message(
+        msh("SIU^S12", control_id, message_at),
+        pid(),
+        segment("SCH", {1: appointment, 2: appointment}),
+        segment("ORC", {1: "SC", 2: placer, 3: appointment}),
+    )
+
+
 def merge(control_id: str, prior: str = MRN, surviving: str = SURVIVING_MRN,
           message_at: str = RESULTED_AT) -> str:
     return message(
@@ -722,15 +739,21 @@ def test_a_result_naming_neither_a_patient_nor_an_order_number_gets_no_candidate
 def test_a_scheduling_message_naming_no_patient_changes_no_loop(handler):
     """`open_loops("")` is every open loop in the site, so an `SIU^S15` with no
     PID segment reached the "the patient has exactly one open loop" fallback
-    with the *site's* only open loop -- and cancelling a loop removes it from
-    every worklist while it is still clinically open."""
+    with the *site's* only open loop -- a message about nobody un-booking a
+    stranger's appointment.
+
+    The loop is booked first so the *state* assertion can tell the two answers
+    apart. An S15 that got through would leave it `OPEN`, and `OPEN` is where an
+    unbooked loop already was, so that half of this test used to hold whether H3
+    was in place or not and only `untargeted_count` was doing any work."""
     handler.handle(order())
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
     handler.handle(message(
-        msh("SIU^S15", "S_NO_PID", RESULTED_AT),
+        msh("SIU^S15", "S_NO_PID", "20260725130000"),
         segment("SCH", {1: "APPT1", 2: "APPT1"}),
     ))
 
-    assert loops(handler)[0].state is LoopState.OPEN
+    assert loops(handler)[0].state is LoopState.SCHEDULED
     assert handler.untargeted_count == 1
 
 
@@ -783,10 +806,115 @@ def test_siu_s12_schedules_the_loop_named_by_its_order_number(handler):
     assert loops(handler)[0].state is LoopState.SCHEDULED
 
 
-def test_siu_s15_cancels_the_loop_named_by_its_order_number(handler):
+def test_siu_s15_unschedules_the_loop_named_by_its_order_number(handler):
+    """The routing half of the un-schedule fix, end to end from the wire.
+
+    `registry.unschedule` was already correct when this was written; nothing drove it.
+    `_apply_unschedule` was still calling `registry.cancel`, so the benign daily path --
+    a patient rings the specialist's office and moves their CT -- drove a clinically open
+    referral into CANCELLED, which is in neither `open_loops()` nor
+    `resulted_unacknowledged()` and is terminal in LEGAL_TRANSITIONS. On no queue,
+    permanently, with every guard in this file satisfied.
+
+    Asserted on the event log as well as the state, and that is not belt-and-braces:
+    OPEN is *also* what a refused S15 leaves behind, so a test that only read the
+    projection would pass against a listener that had stopped applying S15s altogether.
+    """
     handler.handle(order())
-    handler.handle(scheduling("S2", "SIU^S15", placer=PLACER))
-    assert loops(handler)[0].state is LoopState.CANCELLED
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
+    assert loops(handler)[0].state is LoopState.SCHEDULED
+
+    ack = handler.handle(scheduling("S2", "SIU^S15", placer=PLACER,
+                                    message_at="20260725130000"))
+
+    assert ack_code(ack) == "AA"
+    loop = loops(handler)[0]
+    assert loop.state is LoopState.OPEN
+    assert [row.loop_id for row in handler.store.open_loops(MRN)] == [loop.loop_id], (
+        "the referral still needs the scan, so it stays on the coordinator's queue"
+    )
+    assert events_of(handler, loop.loop_id)[-1] == "appointment_cancelled", (
+        "and the un-booking was applied rather than declined into the same state"
+    )
+    assert handler.unbooked_cancel_count == 0
+
+
+def test_an_s15_for_a_referral_that_was_never_booked_changes_nothing(handler):
+    """A cancellation for an appointment nobody here ever heard of.
+
+    Two shapes produce it and both are benign: a receiving organisation whose S12 never
+    reached us cancelling the slot anyway, and an S15 redelivered under a fresh MSH-10
+    after the first one already un-booked the loop. Neither is an application failure and
+    neither is a matching failure, which is why it gets its own counter -- an operator
+    watching `untargeted_count` is chasing order-number quality, and an operator watching
+    this one is chasing an S12 that is not arriving.
+
+    `AA`, because the message is well formed and will never become acceptable on
+    redelivery: `AE` would ask the engine to retry a benign S15 forever and wedge the
+    interface behind it.
+    """
+    handler.handle(order())
+    loop_id = loops(handler)[0].loop_id
+    before = events_of(handler, loop_id)
+
+    ack = handler.handle(scheduling("S2", "SIU^S15", placer=PLACER))
+
+    assert ack_code(ack) == "AA"
+    assert loops(handler)[0].state is LoopState.OPEN
+    assert events_of(handler, loop_id) == before, "no transition, and none recorded"
+    assert handler.unbooked_cancel_count == 1
+    assert handler.untargeted_count == 0, (
+        "the message named its loop exactly -- the evidence that is missing is the booking"
+    )
+    assert handler.apply_failure_count == 0, (
+        "and a referral with no appointment is not the store or the machine failing"
+    )
+
+
+def test_an_s15_then_an_s12_reschedules_through_the_listener(handler):
+    """What a scheduler that cancels before it rebooks emits, on the wire.
+
+    The collapsed form -- an S12 for the new slot with no S15 first -- was always legal
+    as SCHEDULED -> SCHEDULED. Admitting that while the two-message form dropped the
+    referral off every worklist was the incoherence; this is the same reschedule, and it
+    ends where the collapsed one does.
+    """
+    handler.handle(order())
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
+    handler.handle(scheduling("S2", "SIU^S15", placer=PLACER, message_at="20260725130000"))
+    assert loops(handler)[0].state is LoopState.OPEN
+
+    handler.handle(rebooking("S3", PLACER, "APPT2", "20260725140000"))
+
+    assert loops(handler)[0].state is LoopState.SCHEDULED
+    assert handler.unbooked_cancel_count == 0
+    assert handler.duplicate_content_key_count == 0
+
+
+def test_a_rebooking_that_names_no_new_appointment_is_eaten_by_content_dedup(handler):
+    """A gap this fix exposes rather than causes, recorded so it is not rediscovered.
+
+    `content_key` hashes the message type, ORC-1, the order numbers and the MRN. It does
+    not hash MSH-7 or the SCH appointment identifier, so two `SIU^S12`s for one order
+    that differ only in *which slot* they book are one content key, and the second is a
+    no-op. Before the un-schedule fix that was invisible: the S15 in between drove the
+    loop to CANCELLED, which no S12 could leave anyway. Now the reschedule is legal, and
+    the loop stays `OPEN` -- reading as un-booked while the patient holds an appointment.
+
+    Asserted rather than fixed, because widening the key means bumping
+    `_CONTENT_KEY_VERSION`, which makes every message in flight look new, and that is a
+    dedup change owed its own before/after rather than a rider on a routing commit.
+    """
+    handler.handle(order())
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
+    handler.handle(scheduling("S2", "SIU^S15", placer=PLACER, message_at="20260725130000"))
+
+    handler.handle(scheduling("S3", "SIU^S12", placer=PLACER, message_at="20260725140000"))
+
+    assert loops(handler)[0].state is LoopState.OPEN, (
+        "the rebooking was swallowed; this is the gap, not the intended behaviour"
+    )
+    assert handler.duplicate_content_key_count == 1
 
 
 def test_siu_with_no_order_number_falls_back_to_a_single_open_loop(handler):
@@ -825,13 +953,21 @@ def test_siu_naming_an_order_number_but_no_patient_schedules_nothing(handler):
 
 def test_siu_never_touches_more_than_one_loop(handler):
     """The plan's listener looped over every open loop for the patient. One
-    SIU^S15 would then cancel unrelated open orders, and CANCELLED appears on
-    no worklist -- loops vanishing while clinically open is the failure this
-    product exists to prevent."""
+    SIU^S15 would then un-book every unrelated order this patient has -- the
+    worklist telling a coordinator that four booked patients need booking, on
+    the say-so of a message that spoke about one of them.
+
+    Both loops are booked first so the assertion has two answers to choose
+    between. Against unbooked loops `OPEN` is where they started, and the
+    per-loop `unschedule` refusal would hold the assertion up on its own."""
     handler.handle(order(control_id="ORM_1", placer="P1", filler="F1"))
     handler.handle(order(control_id="ORM_2", placer="P2", filler="F2"))
-    handler.handle(scheduling("S15", "SIU^S15"))
-    assert [loop.state for loop in loops(handler)] == [LoopState.OPEN, LoopState.OPEN]
+    handler.handle(scheduling("S12_1", "SIU^S12", placer="P1", message_at="20260725120000"))
+    handler.handle(scheduling("S12_2", "SIU^S12", placer="P2", message_at="20260725120000"))
+    handler.handle(scheduling("S15", "SIU^S15", message_at="20260725130000"))
+    assert [loop.state for loop in loops(handler)] == [
+        LoopState.SCHEDULED, LoopState.SCHEDULED
+    ]
     assert handler.untargeted_count == 1
 
 
@@ -840,18 +976,29 @@ def test_scheduling_refuses_tier_3_evidence(handler):
     whole suite. Scheduling and cancelling are applied on an exact order
     identifier or on a single unambiguous open loop -- never on MRN + service
     code inside a date window, which is the weakest evidence class the matcher
-    has and would let one appointment message cancel a different order."""
+    has and would let one appointment message un-book a different order.
+
+    The loop is booked, and that is what keeps the mutation detectable now that
+    an S15 lands on `OPEN` rather than `CANCELLED`: against an unbooked loop a
+    widened `_EXACT_TIERS` would resolve the wrong loop, be refused one step
+    later by `unschedule`, and leave `OPEN` behind exactly as correct behaviour
+    does. `untargeted_count` and `unbooked_cancel_count` are asserted together
+    for the same reason -- which of the two refused it is the whole question."""
     handler.handle(order())
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
     weak = message(
-        msh("SIU^S15", "S_WEAK", RESULTED_AT),
+        msh("SIU^S15", "S_WEAK", "20260725130000"),
         pid(),
         segment("SCH", {1: "APPT1", 2: "APPT1"}),
         segment("ORC", {1: "SC", 2: "AN_ORDER_NUMBER_WE_DO_NOT_HAVE"}),
         segment("OBR", {1: "1", 4: SERVICE, 7: ORDERED_AT}),
     )
     handler.handle(weak)
-    assert loops(handler)[0].state is LoopState.OPEN, "a tier-3 guess must not cancel a loop"
+    assert loops(handler)[0].state is LoopState.SCHEDULED, (
+        "a tier-3 guess must not un-book a loop"
+    )
     assert handler.untargeted_count == 1
+    assert handler.unbooked_cancel_count == 0
 
 
 def test_a_redelivered_unmatched_result_does_not_create_a_second_orphan(handler):
@@ -986,8 +1133,11 @@ def test_the_raw_archive_keeps_the_message_verbatim(handler):
 
 
 def test_a_cancel_clinically_older_than_an_applied_schedule_is_refused(handler):
-    """MSH-7 must reach the registry or the watermark is inert for live traffic
-    -- and a late SIU^S15 would silently cancel a loop out of every worklist."""
+    """MSH-7 must reach the registry or the watermark is inert for live traffic.
+
+    Failing open on an *absent* clock, which `unschedule` deliberately does, is not
+    failing open on a readable and older one: an S15 for a slot that a later S12 already
+    replaced must not un-book the booking that superseded it."""
     handler.handle(order())
     handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
     assert loops(handler)[0].state is LoopState.SCHEDULED
@@ -1096,13 +1246,26 @@ def test_a_future_dated_result_cannot_deafen_a_loop_to_its_own_correction(handle
 
 
 @pytest.mark.parametrize("msh7", ["", "X"])
-def test_a_cancel_with_an_unreadable_msh7_cannot_close_a_watermarked_loop(handler, msh7):
-    """H2. Omitting MSH-7 disabled the only anti-replay control in the system.
+def test_an_s15_with_an_unreadable_msh7_still_leaves_the_loop_on_a_queue(handler, msh7):
+    """H2 on the wire, and the guard that answers it is no longer the same one.
 
-    `CANCELLED` appears in neither open_loops() nor resulted_unacknowledged(),
-    so a cancel that lands on a scheduled loop takes a clinically open referral
-    off every coordinator queue at once -- which is the failure this product
-    exists to prevent, caused by the product.
+    H2 was that omitting MSH-7 disabled the only anti-replay control in the system.
+    The clinically severe case was an S15: it drove `Registry.cancel`, `CANCELLED` is
+    in neither open_loops() nor resulted_unacknowledged(), so a replay with a blank
+    clock took a clinically open referral off every coordinator queue at once. The
+    remedy was `require_message_time`, and this test asserted the refusal.
+
+    An S15 now drives `unschedule`, which does not set that flag, so an unstamped one
+    is **applied**. That is the deliberate posture and not a regression of H2: the
+    property H2 protected was that the loop stays visible, and `SCHEDULED -> OPEN`
+    stays inside the store's `_OPEN_STATES`, so a replay costs a coordinator nothing
+    it can be harmed by. Refusing here would buy no visibility and would leave the
+    worklist advertising an appointment that no longer exists.
+
+    So the assertion moves from "the message was refused" to the property that was
+    ever worth having, checked on both worklists. `record_result` still sets the flag
+    and is still tested for it; this one is asserted here because the wire is where
+    the exploit arrived.
     """
     handler.handle(order())
     handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
@@ -1110,10 +1273,14 @@ def test_a_cancel_with_an_unreadable_msh7_cannot_close_a_watermarked_loop(handle
 
     ack = handler.handle(scheduling("S2", "SIU^S15", placer=PLACER, message_at=msh7))
 
-    assert ack_code(ack) == "AA", "archived and routed for review, not retried forever"
-    assert loops(handler)[0].state is LoopState.SCHEDULED
-    assert handler.store.open_loops(MRN), "the loop must stay on a coordinator's queue"
-    assert handler.stale_message_count == 1
+    assert ack_code(ack) == "AA"
+    loop = loops(handler)[0]
+    assert loop.state is LoopState.OPEN
+    assert [row.loop_id for row in handler.store.open_loops(MRN)] == [loop.loop_id], (
+        "the loop must stay on a coordinator's queue -- that is the whole of H2"
+    )
+    assert handler.stale_message_count == 0
+    assert handler.unbooked_cancel_count == 0
 
 
 def test_a_future_dated_order_still_ages_and_can_turn_stale(handler, monkeypatch):

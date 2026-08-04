@@ -91,6 +91,28 @@ class MrnRetiredError(ReferralLoopError):
     """
 
 
+class NoAppointmentError(ReferralLoopError):
+    """An `SIU^S15` naming a referral that carries no booking to cancel.
+
+    Benign and expected on a live feed: an S12 that never reached us, or an S15
+    redelivered under a fresh MSH-10 after the first one already un-booked the loop.
+    Nothing is wrong with the message, nothing is wrong with the store, and nothing
+    changes -- which is exactly why it needs a name of its own.
+
+    Typed for the reason MrnRetiredError is: the listener has to answer three
+    different failures out of one call, and matching on an error string is the
+    fragile version of that. A bare ReferralLoopError here would be counted as
+    `apply_failure_count` beside a store fault, so the daily rhythm of a scheduling
+    feed would read to an operator as the system failing to apply messages, and the
+    signal that actually matters -- an S12 stream that has stopped arriving -- would
+    be buried under it.
+
+    Never retryable. The loop has no appointment now and a redelivery finds none
+    either, so the answer is AA: AE would wedge the interface behind a message that
+    can never become acceptable.
+    """
+
+
 class StaleMessageError(ReferralLoopError):
     """A message clinically older than one already applied to the loop.
 

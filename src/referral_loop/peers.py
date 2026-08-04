@@ -31,14 +31,22 @@ closes when the old one is removed rather than whenever a certificate expires.
 
 **Authorities are granted, never inferred.** Three of them, and the line
 between what needs one and what does not is a single question: can this message
-end with a clinically open loop no longer on anybody's queue?
+leave a coordinator's queue disagreeing with where the patient actually is?
 
   * `merge` -- `ADT^A40` relinks two charts and re-points every future message
     for the retired identifier. Nothing else in the subsystem changes who a
     record is about.
-  * `cancel` -- `SIU^S15` puts a loop in `CANCELLED`, which appears in neither
-    `open_loops()` nor `resulted_unacknowledged()`, so a clinically open loop
-    leaves every coordinator queue while still waiting on a result.
+  * `cancel` -- `SIU^S15` un-books a loop, returning it to `OPEN`. This one was
+    granted when an S15 drove `Registry.cancel` and put the loop in `CANCELLED`,
+    on no queue at all; it now drives `unschedule` and the loop stays exactly
+    where the coordinator already sees it. The authority is kept, and the reason
+    it survives losing that argument is that the remaining harm is still a harm
+    only this peer may do: an S15 is the receiving organisation's account of its
+    own diary, and a peer without the authority forging one makes a booked
+    patient read as unbooked. Somebody chases them, or books them a second slot,
+    or tells them there is no appointment when there is -- and the appointment
+    the coordinator could see is gone from the projection. A feed that cannot
+    book a patient has no business un-booking one.
   * `result` -- `ORU^R01` with `OBX-11 = F` moves a loop to `RESULTED` and makes
     it acknowledgeable. This one was argued the other way first, and the
     argument was wrong. A result looked additive: it puts something *on* a
@@ -55,6 +63,15 @@ opens a loop, a schedule attaches an appointment to one that is already open --
 and neither can retire anything. A peer that may send those *is* the clinical
 feed, and gating them would be a line in every registry entry that never refused
 anything.
+
+That line is thinner than it was, and saying so is better than discovering it:
+`SIU^S12` and `SIU^S15` now differ only in which way they move the appointment
+fact, and a forged `S12` writes one just as false as a forged `S15` -- an unbooked
+patient reading as booked, whom nobody then chases. It is the *smaller* falsehood,
+because the loop keeps ageing on the same queue either way and a coordinator
+opening it sees an appointment they can check. Whether that is enough to keep
+`S12` ungated is a question for whoever revisits this list; it is not settled by
+the argument above, which was written when an S15 could still empty a worklist.
 
 The cost of the three is one line per peer in a configuration file, and what it
 buys is that a scheduling feed cannot result, a results feed cannot cancel, and

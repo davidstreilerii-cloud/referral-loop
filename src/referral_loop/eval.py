@@ -607,6 +607,17 @@ def _order(
     )
 
 
+def _schedule(*, control: str, mrn: str, placer: str, filler: str,
+              when: str = _SYNTH_ORDERED_AT) -> str:
+    return _message(
+        _msh("SIU^S12", control, when),
+        _pid(mrn),
+        _segment("SCH", {1: control, 2: control}),
+        _segment("ORC", {1: "SC", 2: placer, 3: filler}),
+        _segment("OBR", {1: "1", 2: placer, 3: filler, 7: when}),
+    )
+
+
 def _cancel(*, control: str, mrn: str, placer: str, filler: str,
             when: str = _SYNTH_ORDERED_AT) -> str:
     return _message(
@@ -761,15 +772,25 @@ def synthetic_corpus() -> list[LabeledCase]:
         expected_loop_placer=None,
     ))
 
-    # Failure matrix: a result for a CANCELLED loop orphans and is flagged.
+    # The un-schedule fix, measured rather than asserted -- the before/after the kernel
+    # design document asked this vocabulary change to carry.
+    #
+    # It was labelled the other way and named "result-for-a-cancelled-loop", because an
+    # SIU^S15 drove Registry.cancel: the loop reached CANCELLED, CANCELLED is outside
+    # _EXACT_TIER_STATES, and the report that followed orphaned. The scenario is the
+    # ordinary one -- the specialist's office moves the CT, then the scan happens and is
+    # reported -- and orphaning that result was the corpus scoring the defect as correct
+    # behaviour. An S15 un-books; the referral stays open; the result that arrives against
+    # it belongs to it.
     cases.append(LabeledCase(
-        name="result-for-a-cancelled-loop",
+        name="result-after-a-cancelled-appointment",
         messages=(
             _order(control="S-N5-ORD", mrn="SYN0105", placer="SYNP105", filler="SYNF105"),
+            _schedule(control="S-N5-SCH", mrn="SYN0105", placer="SYNP105", filler="SYNF105"),
             _cancel(control="S-N5-CAN", mrn="SYN0105", placer="SYNP105", filler="SYNF105"),
             _result(control="S-N5-RES", mrn="SYN0105", placer="SYNP105"),
         ),
-        expected_loop_placer=None,
+        expected_loop_placer="SYNP105",
     ))
 
     # A patient with one order gets two results: one that matches, and one for a
