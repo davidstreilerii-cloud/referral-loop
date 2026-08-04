@@ -1,19 +1,14 @@
 """Typed failures for the referral loop subsystem.
 
-Most map to a row of the spec failure matrix (section 8). Two do not, and both
-carve-outs are deliberate:
-
-  * ThresholdsNotAcceptedError encodes the resolution of open question 3
-    (section 12): staleness thresholds ship as defaults but the site must accept
-    them explicitly, so a threshold stays the hospital's clinical decision rather
-    than ours.
-  * NoAppointmentError. Section 8 has no row for an SIU^S15 against a referral
-    that was never booked, because the matrix was written when an S15 drove
-    Registry.cancel and a loop's booking history did not decide whether one could
-    be applied. It does now, so a shape the matrix never contemplated is a
-    routine event on a live feed. Named here rather than left implicit: a reader
-    checking this list against section 8 will find one row short and needs to
-    know that is the spec trailing the code, not the code missing a case.
+Many map to a row of the spec failure matrix (section 8). Do not read the absence
+of a row as a gap in the code: the matrix names the failures that were foreseen
+when it was written, and this module names the ones the implementation actually
+has to answer, so it runs ahead of section 8 by construction. ThresholdsNotAcceptedError
+encodes the resolution of open question 3 (section 12) rather than any matrix row;
+NoAppointmentError describes a shape the matrix could not have contemplated,
+because it was written when an SIU^S15 drove Registry.cancel and a loop's booking
+history did not decide whether one could be applied. Where the two disagree it is
+the spec trailing the code.
 
 Every name carries the -Error suffix, matching the convention already used
 across this codebase (AnthropicClientError, SpendLimitError, MissingColumnsError).

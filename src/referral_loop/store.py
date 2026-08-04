@@ -1359,16 +1359,27 @@ class LoopStore:
         ever asserted, and answering DRAFT would invent one. Spec 9.3 invariant 2 compares
         the projection against this.
 
-        One referral shape breaks that comparison, deliberately. `registry.unschedule`
-        writes ACCEPTED here and projects the loop to `LoopState.OPEN`, which
-        `migration.canonical_state` reads back as SENT: the legacy vocabulary has no
-        member for ACCEPTED (`migration.WITHOUT_LEGACY_SOURCE`), and OPEN is the only
-        projection that keeps a referral whose appointment was cancelled on
-        `open_loops()`. It is the cost of the two vocabularies coexisting and it ends when
-        Plan 2c collapses them. Named here because a caller reaching for this function to
-        check the invariant will otherwise read a divergence as corruption. Pinned by
-        test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold; the
-        invariant holds on every other path.
+        **A divergence from the projection is not by itself corruption**, and a caller
+        reaching for this function to check invariant 2 needs to know that before it
+        reads one. Two unrelated causes produce one:
+
+          * The vocabularies disagree about a state that genuinely exists.
+            `registry.unschedule` writes ACCEPTED here and projects `LoopState.OPEN`,
+            which `canonical_state` reads back as SENT, because the legacy vocabulary
+            has no member for ACCEPTED (`migration.WITHOUT_LEGACY_SOURCE`). Deliberate,
+            argued in full at `registry.unschedule`, and it ends when Plan 2c collapses
+            the two logs. Pinned by
+            test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold.
+          * **The chain was never written.** `reverse_acknowledgement` and `undo_match`
+            append events that move the projection while passing no `transition=`, so
+            the chain still folds to whatever the last recorded transition said --
+            RECONCILED against a projection of DOCUMENTED, and DOCUMENTED against SENT,
+            respectively. Nothing here is asserting two things; one side simply has no
+            entry. That is a gap in the write path rather than a vocabulary cost, and it
+            closes when something writes those transitions, not when 2c lands.
+
+        Only the first is intended, so a new divergence is worth reading as the second
+        until shown otherwise.
         """
         rows = self._read(
             "SELECT to_state FROM transition_events WHERE referral_id = ? ORDER BY seq",

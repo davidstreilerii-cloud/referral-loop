@@ -362,15 +362,21 @@ def test_the_gapless_invariant_holds_across_a_populated_store(tmp_path):
 
 def test_the_projection_equals_the_fold_across_a_populated_store(tmp_path):
     """Spec 9.3 invariant 2, on the same populated store: what the registry reports and
-    what the transition chain folds to must agree for every referral.
+    what the transition chain folds to must agree, for the paths this fixture drives.
 
-    For every referral *except an unscheduled one*, and the exception is twenty lines
-    below rather than hidden: `registry.unschedule` writes ACCEPTED to the chain and OPEN
-    to the projection, which reads back as SENT. This fixture reaches `cancel` and
-    `record_result` and never `unschedule`, so the sweep here is not silently excluding
-    the case -- it does not generate it. Widening this test to tolerate the divergence
-    would retire the invariant for every path to cover one; keeping the two separate is
-    what makes the exception visible when Plan 2c removes it."""
+    That scoping is doing real work and is not a hedge. The fixture reaches `open_loop`,
+    `schedule`, `cancel` and `record_result`, and the invariant holds across all four.
+    It does not reach `unschedule` -- whose divergence is deliberate and pinned twenty
+    lines below -- and it does not reach `reverse_acknowledgement` or `undo_match`, which
+    diverge for an unrelated reason: they append projection-moving events with no
+    `transition=`, so the chain is never told. Both have a non-None fold, so this sweep
+    would fail on either if the fixture generated it. It is not excluding them; it does
+    not produce them, and saying so is the difference between a scoped claim and a
+    universal one that happens to be untested.
+
+    Widening this test to tolerate any of the three would retire the invariant for every
+    path in order to cover a few. Keeping them separate is what makes each exception
+    visible when the thing that causes it is fixed."""
     from referral_loop.migration import canonical_state
 
     store, registry = _registry(tmp_path)

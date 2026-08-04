@@ -200,10 +200,17 @@ _SENDING_FACILITY_REF = f"MSH-{MSH_SENDING_FACILITY}.1"
 # keeps its authority now that it no longer strands the loop off every queue.
 _AUTHORITY_REQUIRED = {MERGE_TYPE: MERGE, CANCEL_TYPE: CANCEL, RESULT_TYPE: RESULT}
 
-# Which counter a refused authority increments. A dict rather than a branch: a
-# fourth authority added to the table above without a number here would be
-# refused correctly and counted as nothing, and the counters are how an operator
-# sees any of this happening at all.
+# Which counter a refused authority increments. A dict rather than a branch, and
+# indexed directly rather than `.get`-ed: a fourth authority added to the table above
+# without a number here raises KeyError on the first message of that type, before
+# anything is applied, instead of refusing quietly under no number at all. Loud and
+# immediate is the right failure for a table that has to stay in step with another
+# table three lines up.
+#
+# Why the number matters when the refusal already writes an ERROR line and an audit
+# row: both of those live inside `_record_refusal` and can be suppressed by the peer's
+# refusal budget. The counter is incremented before that call, deliberately, so it is
+# what survives a peer being throttled -- see `_record_refusal`, which argues it in full.
 _AUTHORITY_COUNTER = {
     MERGE: "unauthorized_merge_count",
     CANCEL: "unauthorized_cancel_count",
@@ -1367,9 +1374,10 @@ class MessageHandler:
             self.unbooked_cancel_count += 1
             logger.warning(
                 "SIU^S15 %r names a loop that carries no appointment to cancel (%s); "
-                "no loop changed, flagged for review. %d so far -- a rising count is "
-                "usually an SIU^S12 stream that is not reaching us, or one this listener "
-                "declined; check untargeted_count and stale_message_count too.",
+                "no loop changed, flagged for review. %d so far -- usually an SIU^S12 "
+                "stream that is not reaching us, or one this listener declined, which "
+                "logs as 'resolves to no single open loop' or 'Refused a clinically "
+                "older message'.",
                 message.control_id, exc, self.unbooked_cancel_count,
             )
 

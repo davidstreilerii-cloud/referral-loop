@@ -191,12 +191,15 @@ _RESULT_EVENTS = frozenset({"resulted", "reopened"})
 
 # The only state a match may be undone from. Not ACKNOWLEDGED, deliberately: see
 # the module note on undo_match versus reverse_acknowledgement.
-# NOT superseded. One of two from-state guards core.machine does not own, and still
-# enforcing its own rule -- so it is live code, deliberately not labelled like the five
-# that went. The other is `unschedule`'s no-appointment check, which refuses any loop not
-# currently SCHEDULED; the two are unalike in subject and alike in kind, both asking
-# whether the evidence for an assertion exists rather than whether a state edge is legal,
-# which is the question the machine owns.
+# NOT superseded. Task 5 retired five from-state frozensets because each was a second
+# opinion on state legality that core.machine already owned and could drift from; this
+# one survived because it is not that. It enforces a rule the machine has no way to
+# express -- see below -- so retiring it would lose the rule rather than deduplicate it,
+# which is why it is live code and deliberately not labelled like the five that went.
+#
+# No count is offered of what else guards a from-state anywhere in this file. Several
+# methods make an inline check, they answer to their own reasons, and a tally here would
+# be stale the first time somebody added one without knowing to come and update it.
 #
 # undo_match resists expression as a Transition for a reason that is a finding rather
 # than an obstacle: it detaches a result and mints a replacement orphan, so it is one
@@ -799,17 +802,31 @@ class Registry:
         said SENT then, and SCHEDULED -> SENT is deliberately absent from
         LEGAL_TRANSITIONS. Nor would it be right: an organisation that booked a patient
         has demonstrably accepted the referral, and a cancelled slot does not un-accept
-        it. ACCEPTED is the only backward edge out of SCHEDULED and it is also the
-        correct one.
+        it.
 
         Two vocabularies meet in that sentence, so: ACCEPTED is the *transition chain*.
-        The **projection** goes to `LoopState.OPEN`, which `migration.canonical_state`
-        reads back as SENT, because the legacy nine-state vocabulary has no member for
-        ACCEPTED at all (`migration.WITHOUT_LEGACY_SOURCE`) and OPEN is the only one that
-        keeps the referral on `open_loops()`. Chain and projection therefore disagree
-        here and nowhere else -- the one place spec 9.3 invariant 2 does not hold, pinned
-        by test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold and
+        The **projection** goes to `LoopState.OPEN`. Not SCHEDULED, which is in
+        `_OPEN_STATES` too and would keep the referral on the worklist just as well --
+        it is the state being *left*, and projecting there would re-assert the booking
+        this message says has gone away. OPEN keeps the referral on the queue without
+        claiming an appointment for it, which is the whole of what an S15 asserts.
+
+        `migration.canonical_state` reads that OPEN back as SENT, not as the ACCEPTED
+        the chain holds, because the legacy nine-state vocabulary has no member for
+        ACCEPTED at all (`migration.WITHOUT_LEGACY_SOURCE`). So chain and projection
+        disagree here, and spec 9.3 invariant 2 does not hold for an unscheduled
+        referral -- pinned by
+        test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold and
         resolved when Plan 2c collapses the two logs.
+
+        That divergence is a disagreement between the two vocabularies about a state
+        that genuinely exists. It is not the same thing as
+        `reverse_acknowledgement` and `undo_match`, which also end with chain and
+        projection apart but for an unrelated reason: both append a projection-moving
+        event with no `transition=` at all, so the chain never records the move rather
+        than recording it in a word the projection cannot spell. A reader of 2c needs
+        the difference -- this one closes when ACCEPTED becomes expressible, those two
+        close only when something writes their transitions.
 
         Either way the loop keeps ageing on the coordinator's queue, which is the
         definition of work outstanding. `cancel` keeps CANCELLED for the withdrawal it
