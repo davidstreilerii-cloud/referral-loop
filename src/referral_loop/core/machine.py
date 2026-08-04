@@ -176,9 +176,23 @@ class TransitionRejected(ReferralLoopError):
 # silent does not rescue it: a loud wrong status still removes the referral from the list
 # a coordinator works.
 #
-# Backwards moves are otherwise absent. A referral does not return to SCHEDULED once seen,
-# and CANCELLED after the encounter happened is not a withdrawal -- registry.cancel
-# already refuses a RESULTED loop for that reason, and CANCELLED appears on no worklist.
+# One backwards move, and the encounter is what bounds it. SCHEDULED -> ACCEPTED is an
+# SIU^S15: the counterparty's scheduler saying a booking went away, which is not the
+# referring side withdrawing the referral -- the patient still needs the visit and somebody
+# has to book it again. Driving that to CANCELLED, as the legacy machine did, took a
+# clinically open referral off every worklist permanently on the most benign path there is.
+# See registry.unschedule.
+#
+# It is admitted because nothing clinical has happened yet. SCHEDULED -> SCHEDULED is
+# *already* legal as a reschedule, and an S15 followed by an S12 is that same reschedule
+# expressed in two messages rather than one -- so admitting the collapsed form while
+# refusing the intermediate one would be incoherent.
+#
+# Backwards moves are otherwise absent, and the line is the encounter. A referral does not
+# return to SCHEDULED or to ACCEPTED once SEEN: the patient attended, so there is no
+# appointment left to cancel. CANCELLED after the encounter happened is likewise not a
+# withdrawal -- registry.cancel already refuses a RESULTED loop for that reason, and
+# CANCELLED appears on no worklist.
 LEGAL_TRANSITIONS: Mapping[ReferralState, frozenset[ReferralState]] = {
     # Not yet anybody else's problem. AGED_OUT is absent: 6.1 defines it as terminal by
     # timeout with no counterparty signal, and a draft has no counterparty to be silent.
@@ -217,6 +231,9 @@ LEGAL_TRANSITIONS: Mapping[ReferralState, frozenset[ReferralState]] = {
         ReferralState.AGED_OUT,
     }),
     ReferralState.SCHEDULED: frozenset({
+        # The S15 edge. See the note above the table: an appointment that went away is
+        # not a referral that was withdrawn.
+        ReferralState.ACCEPTED,
         ReferralState.SCHEDULED,
         ReferralState.SEEN,
         ReferralState.DOCUMENTED,

@@ -67,9 +67,13 @@ caller is. Three things follow from it and none of them is optional:
      real feed was about to use, which answered the genuine result `AA` and
      dropped it.
   2. **Three message types need an authority.** `ADT^A40` relinks two charts;
-     `SIU^S15` removes a clinically open loop from every worklist; `ORU^R01`
-     marks one RESULTED and acknowledgeable, so a coordinator closes it and a
-     genuinely pending finding reads as handled. Each is refused unless the
+     `SIU^S15` un-books a loop, so a patient who holds an appointment reads on
+     the worklist as needing one; `ORU^R01` marks one RESULTED and
+     acknowledgeable, so a coordinator closes it and a genuinely pending finding
+     reads as handled. The S15 no longer removes the loop from every worklist --
+     it routes to `unschedule`, not `cancel` -- but a forged one still overwrites
+     the receiving organisation's account of its own diary with the opposite of
+     what that organisation said. Each is refused unless the
      registry granted the peer that authority by name, and the refusal is `AA`
      -- the message is well formed and will never become acceptable from this
      peer, so asking the engine to retry it forever helps nobody -- plus a
@@ -97,6 +101,7 @@ from .errors import (
     CircularMergeError,
     FramingError,
     MrnRetiredError,
+    NoAppointmentError,
     ReferralLoopError,
     StaleMessageError,
     StoreUnavailableError,
@@ -184,19 +189,28 @@ _ORDER_CONTROL_REF = f"ORC-{ORC_ORDER_CONTROL}"
 _SENDING_APPLICATION_REF = f"MSH-{MSH_SENDING_APPLICATION}.1"
 _SENDING_FACILITY_REF = f"MSH-{MSH_SENDING_FACILITY}.1"
 
-# The message types that need an authority named in the peer registry. All three
-# can end with a clinically open loop on nobody's queue: a merge re-points it at
-# another chart, a cancellation retires it outright, and a result marks it
-# RESULTED and acknowledgeable -- after which a coordinator closes it and the
-# patient's genuinely pending finding reads as handled. Orders and schedules are
-# strictly additive and carry no authority. See peers.py for the full argument,
-# including why `result` was argued the other way first and why that was wrong.
+# The message types that need an authority named in the peer registry. Each can put a
+# coordinator's queue at odds with the patient's actual position: a merge re-points the
+# loop at another chart, a result marks it RESULTED and acknowledgeable -- after which a
+# coordinator closes it and the patient's genuinely pending finding reads as handled --
+# and an SIU^S15 un-books it, so a booked patient reads as needing a booking and gets
+# chased, or double-booked, or told they have no appointment. Orders and schedules are
+# strictly additive and carry no authority. See peers.py for the full argument, including
+# why `result` was argued the other way first and why that was wrong, and why the S15
+# keeps its authority now that it no longer strands the loop off every queue.
 _AUTHORITY_REQUIRED = {MERGE_TYPE: MERGE, CANCEL_TYPE: CANCEL, RESULT_TYPE: RESULT}
 
-# Which counter a refused authority increments. A dict rather than a branch: a
-# fourth authority added to the table above without a number here would be
-# refused correctly and counted as nothing, and the counters are how an operator
-# sees any of this happening at all.
+# Which counter a refused authority increments. A dict rather than a branch, and
+# indexed directly rather than `.get`-ed: a fourth authority added to the table above
+# without a number here raises KeyError on the first message of that type, before
+# anything is applied, instead of refusing quietly under no number at all. Loud and
+# immediate is the right failure for a table that has to stay in step with another
+# table three lines up.
+#
+# Why the number matters when the refusal already writes an ERROR line and an audit
+# row: both of those live inside `_record_refusal` and can be suppressed by the peer's
+# refusal budget. The counter is incremented before that call, deliberately, so it is
+# what survives a peer being throttled -- see `_record_refusal`, which argues it in full.
 _AUTHORITY_COUNTER = {
     MERGE: "unauthorized_merge_count",
     CANCEL: "unauthorized_cancel_count",
@@ -423,6 +437,15 @@ class MessageHandler:
         self.matched_count = 0
         self.orphan_count = 0
         self.untargeted_count = 0
+        # `SIU^S15`s that named their loop exactly and found no booking on it. Not folded
+        # into `untargeted_count`: that one says the evidence did not resolve to a loop
+        # and sends somebody to look at order numbers, this one says the loop resolved
+        # fine and had no appointment, and sends somebody to look for a booking that never
+        # landed. Not folded into `apply_failure_count` either -- nothing failed, and a
+        # benign daily shape counted as a failure teaches operators to ignore the number
+        # that means the store is broken. What makes one rise is enumerated in
+        # errors.NoAppointmentError.
+        self.unbooked_cancel_count = 0
         self.unreadable_status_count = 0
         self.mrn_reresolution_count = 0
         self.mrn_retired_count = 0
@@ -1026,7 +1049,11 @@ class MessageHandler:
             **{t: self._apply_order for t in ORDER_TYPES},
             RESULT_TYPE: self._apply_result,
             SCHEDULE_TYPE: self._apply_schedule,
-            CANCEL_TYPE: self._apply_cancel,
+            # `CANCEL_TYPE` names the HL7 trigger and the peer authority that gates it;
+            # `_apply_unschedule` names what it does to the referral. They differ on
+            # purpose -- the wire says "cancel", the loop hears "un-book" -- and
+            # collapsing them was the defect.
+            CANCEL_TYPE: self._apply_unschedule,
             MERGE_TYPE: self._apply_merge,
         }
         handler = handlers.get(message.message_type)
@@ -1260,17 +1287,19 @@ class MessageHandler:
         """The one loop a scheduling message is about, or None.
 
         At most one, always. An earlier draft applied the transition to every
-        open loop for the patient, which for `SIU^S15` means one cancellation
-        retiring unrelated open orders -- and `CANCELLED` appears in neither
-        `open_loops()` nor `resulted_unacknowledged()`, so those loops leave
-        every worklist while remaining clinically open. That is the failure this
-        product exists to prevent, caused by the product.
+        open loop for the patient, which for `SIU^S15` means one message about
+        one appointment un-booking every other order this patient has open. The
+        loops stay on the worklist now that an S15 lands on `OPEN` rather than
+        `CANCELLED`, so this is no longer the loops-vanishing failure it was; it
+        is the worklist telling a coordinator that four booked patients need
+        booking, on the say-so of a message that spoke about one of them.
 
         Evidence, in order: an exact order identifier the message names, or the
         single unambiguous open loop this patient has. Anything else declines
         and flags. A declined schedule costs a coordinator a lookup; a wrong
-        cancellation costs a patient a missed finding, and the asymmetry decides
-        it -- the same posture as the matcher's confidence floor.
+        un-booking writes a false appointment fact onto a referral the message
+        never mentioned, and the asymmetry decides it -- the same posture as the
+        matcher's confidence floor.
         """
         key = result_key_from_message(message, self.pack, mrn=mrn)
         # `open_loops("")` is not "this patient's open loops", it is *every*
@@ -1312,13 +1341,45 @@ class MessageHandler:
             loop_id, control_id=message.control_id, message_at=self._message_at(message)
         )
 
-    def _apply_cancel(self, message: ParsedMessage, *, mrn: str, submitted_mrn: str) -> None:
+    def _apply_unschedule(self, message: ParsedMessage, *, mrn: str,
+                          submitted_mrn: str) -> None:
+        """`SIU^S15` -- the appointment went away, the referral did not.
+
+        `registry.unschedule`, never `registry.cancel`. An S15 cancels a *booking*;
+        CANCELLED is spec 6.1's "the referring side withdrew the referral", a clinical
+        decision by a person. Driving one from the other meant the most benign path
+        there is -- a patient rings the specialist's office to move their CT -- retired a
+        clinically open referral into a state on neither `open_loops()` nor
+        `resulted_unacknowledged()`, terminal, with every guard in this module satisfied.
+        """
         loop_id = self._target_loop(message, mrn, "SIU^S15")
         if loop_id is None:
             return
-        self.registry.cancel(
-            loop_id, control_id=message.control_id, message_at=self._message_at(message)
-        )
+        try:
+            self.registry.unschedule(
+                loop_id, control_id=message.control_id, message_at=self._message_at(message)
+            )
+        except NoAppointmentError as exc:
+            # `_target_loop`'s posture -- count, warn, change nothing, answer AA -- for the
+            # same reason: the listener holds evidence it cannot act on. Why this gets a
+            # counter of its own rather than `untargeted_count` is argued where the counter
+            # is declared; what the causes are is argued in errors.NoAppointmentError.
+            #
+            # Caught here rather than left to `handle`'s generic ReferralLoopError clause,
+            # which would count it as `apply_failure_count` beside a store fault and log it
+            # at ERROR. Nothing failed. A scheduling feed that emits these daily would read
+            # as an interface in trouble, and this is the one place any of it surfaces:
+            # no MessageHandler counter is exported anywhere, so the number below, and only
+            # the number below, is what an operator will ever see.
+            self.unbooked_cancel_count += 1
+            logger.warning(
+                "SIU^S15 %r names a loop that carries no appointment to cancel (%s); "
+                "no loop changed, flagged for review. %d so far -- usually an SIU^S12 "
+                "stream that is not reaching us, or one this listener declined, which "
+                "logs as 'resolves to no single open loop' or 'Refused a clinically "
+                "older message'.",
+                message.control_id, exc, self.unbooked_cancel_count,
+            )
 
     def _apply_merge(self, message: ParsedMessage, *, mrn: str, submitted_mrn: str) -> None:
         prior = _prior_mrn(message, self.pack)

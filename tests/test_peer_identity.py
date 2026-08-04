@@ -392,31 +392,58 @@ def test_a_refused_merge_is_written_to_the_immutable_audit_trail(handler, pki, p
 # ==================================================== exploit 3: mass cancellation
 
 
-def test_siu_s15_from_a_peer_without_cancel_authority_leaves_the_loop_open(handler, pki, peers):
-    """`CANCELLED` appears in neither `open_loops()` nor
-    `resulted_unacknowledged()`, so a cancellation removes a clinically open
-    loop from every coordinator queue while it is still waiting on a result.
-    A results-only feed has no business emitting one."""
+def test_siu_s15_from_a_peer_without_cancel_authority_leaves_the_appointment(
+    handler, pki, peers
+):
+    """An `SIU^S15` is the receiving organisation's account of its own diary.
+
+    The loop is booked first, and that is the whole of what makes this test say
+    anything. An S15 no longer drives `CANCELLED` -- it un-books to `OPEN` -- so a
+    lab firing one at an unbooked loop leaves it `OPEN` whether the refusal happened
+    or not, and the assertion would hold against a listener with no authority check
+    at all. Booked, the two answers are `SCHEDULED` and `OPEN` and only the refusal
+    produces the first.
+
+    A results-only feed has no business emitting one: forged, it makes a booked
+    patient read as needing a booking, so somebody chases them, books a second slot,
+    or tells them there is no appointment when there is.
+    """
     engine = client_context(pki, pki.ris)
     lab = client_context(pki, pki.lab)
 
     with serving(handler, peers) as address:
         deliver(address, order(control_id="ORM_1"), engine)
-        ack = deliver(address, scheduling("S15_1", "SIU^S15", placer="PLACER987"), lab)
+        deliver(address, scheduling("S12_1", "SIU^S12", placer="PLACER987",
+                                    message_at="20260725120000"), engine)
+        ack = deliver(address, scheduling("S15_1", "SIU^S15", placer="PLACER987",
+                                          message_at="20260725130000"), lab)
 
     assert "|AA|" in ack
-    assert loops_of(handler)[0].state is LoopState.OPEN
+    assert loops_of(handler)[0].state is LoopState.SCHEDULED
     assert handler.unauthorized_cancel_count == 1
 
 
-def test_siu_s15_from_the_peer_that_holds_cancel_authority_still_cancels(handler, pki, peers):
+def test_siu_s15_from_the_peer_that_holds_cancel_authority_still_unschedules(
+    handler, pki, peers
+):
+    """The positive control for the test above, and it needs the booking for the same
+    reason: `OPEN` is also where a refused S15 leaves the loop, so this asserts the
+    `unscheduled` event rather than the projection alone."""
     engine = client_context(pki, pki.ris)
 
     with serving(handler, peers) as address:
         deliver(address, order(control_id="ORM_1"), engine)
-        deliver(address, scheduling("S15_1", "SIU^S15", placer="PLACER987"), engine)
+        deliver(address, scheduling("S12_1", "SIU^S12", placer="PLACER987",
+                                    message_at="20260725120000"), engine)
+        deliver(address, scheduling("S15_1", "SIU^S15", placer="PLACER987",
+                                    message_at="20260725130000"), engine)
 
-    assert loops_of(handler)[0].state is LoopState.CANCELLED
+    loop = loops_of(handler)[0]
+    assert loop.state is LoopState.OPEN
+    assert handler.unauthorized_cancel_count == 0
+    assert [event.event_type for event in handler.store.events_for(loop.loop_id)][-1] == (
+        "unscheduled"
+    )
 
 
 # ======================================================== exploit 4: forged result

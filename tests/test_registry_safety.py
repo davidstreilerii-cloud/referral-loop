@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from referral_loop.core.states import ReferralState
 from referral_loop.errors import (
     LoopNotFoundError,
     ReferralLoopError,
@@ -453,7 +454,13 @@ def test_a_future_dated_result_cannot_deafen_a_loop_to_its_own_correction(regist
 def test_an_unstamped_cancel_cannot_regress_a_watermarked_loop(registry):
     """H2. `CANCELLED` appears in neither open_loops() nor
     resulted_unacknowledged(), so an unstamped SIU^S15 naming a scheduled loop
-    took a clinically open referral off every coordinator queue at once."""
+    took a clinically open referral off every coordinator queue at once.
+
+    Past tense on the S15, deliberately: it drives `unschedule` now and never arrives
+    here. The guard stays on `cancel` because what it protects is destructiveness, not
+    a message type, and `cancel` is still the transition that ends a referral outright
+    -- so a caller plan 2c wires to it inherits the remediation rather than rediscovering
+    the incident."""
     loop_id = registry.open_loop(mrn="MRN1", control_id="C1", message_at=T0)
     registry.schedule(loop_id, control_id="C2", message_at=T2)
     with pytest.raises(StaleMessageError):
@@ -1072,6 +1079,14 @@ def test_cancel_still_demands_a_readable_clock_once_a_loop_has_a_watermark(regis
     open_loops() and resulted_unacknowledged() alike -- clinically open, on no coordinator
     queue at all. Routing the state guard through the machine must not disturb it, so it
     is asserted here before the routing rather than assumed after.
+
+    The S15 has since been routed away to `unschedule`, which sets no such flag because
+    `SCHEDULED -> OPEN` hides nothing. That does not retire this test. The flag guards
+    destructiveness rather than a message type, `cancel` still ends a referral outright
+    and still lands it on no worklist, and the transition has no production caller until
+    plan 2c wires the withdrawal path -- which is exactly the condition under which a
+    control gets quietly dropped and then has to be rediscovered by the incident that
+    motivated it the first time.
     """
     loop_id = registry.open_loop(mrn="MRN9", modality="CT", control_id="W-ORM")
     registry.schedule(loop_id, control_id="W-SIU", message_at=T1)
@@ -1203,3 +1218,148 @@ def test_a_loop_with_no_result_at_all_is_not_acknowledgeable(registry):
     with pytest.raises(ReferralLoopError):
         registry.acknowledge(loop_id, actor="a", role="r", control_id="A-ACK")
     assert registry.get(loop_id).state is LoopState.OPEN
+
+
+# ------------------------------------------- an S15 un-schedules, it does not cancel
+
+
+def test_a_cancelled_appointment_leaves_the_referral_on_the_worklist(registry, store):
+    """The defect this method exists for, as a regression test.
+
+    A patient rings the specialist's office and moves their CT. The office sends an
+    SIU^S15 for the old slot. Routed to `cancel`, that drove the loop to CANCELLED, which
+    is in neither `open_loops()` nor `resulted_unacknowledged()` and is terminal in
+    LEGAL_TRANSITIONS -- so the referral was clinically open, still needed the scan, and
+    was on no coordinator queue at all, permanently. Every existing guard passed: the
+    right loop was resolved, the clock was readable, and SCHEDULED -> CANCELLED is a legal
+    edge. Nothing refused it, because nothing was asked the right question.
+
+    The appointment went away; the referral did not. So the loop keeps ageing on the same
+    queue it was on before it was ever booked.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)
+    registry.schedule(loop_id, control_id="U-S12", message_at=T1)
+
+    registry.unschedule(loop_id, control_id="U-S15", message_at=T2)
+
+    assert registry.get(loop_id).state is LoopState.OPEN
+    assert [loop.loop_id for loop in store.open_loops("MRN1")] == [loop_id]
+
+
+def test_an_unschedule_is_attributed_to_the_counterparty_that_sent_it(registry, store):
+    """The provenance half, which the projection cannot show.
+
+    The scheduler at the receiving organisation is reporting on its own diary -- the same
+    party that sent the S12 behind `schedule`. HUMAN would put a coordinator at this site
+    behind a claim nobody here made, and this is the log spec 8.2 answers "who said so"
+    from, so a wrong source there is not recoverable from the loop's state.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)
+    registry.schedule(loop_id, control_id="U-S12", message_at=T1)
+    registry.unschedule(loop_id, control_id="U-S15", message_at=T2)
+
+    assert store.fold_transitions(loop_id) is ReferralState.ACCEPTED
+    rows = store._read(
+        "SELECT to_state, assertion_source FROM transition_events "
+        "WHERE referral_id = ? ORDER BY seq", (loop_id,))
+    assert [tuple(row) for row in rows] == [
+        ("scheduled", "receiving-org"), ("accepted", "receiving-org")
+    ]
+
+
+def test_an_s15_for_a_loop_that_was_never_scheduled_is_refused(registry, store):
+    """There is no appointment to cancel, and the machine will not catch this one.
+
+    `LoopState.OPEN` maps to `ReferralState.SENT`, and SENT -> ACCEPTED is a legal edge
+    for its own unrelated and correct reasons -- a receiving organisation accepting a
+    referral it was sent. So an S15 naming a loop nobody ever booked would sail through
+    `machine.apply()` and record an *acceptance* the receiving org never asserted, off a
+    message that said the opposite. The refusal has to be `unschedule`'s own.
+
+    Asserted on the state AND on the log: the loop is already OPEN, so a check that only
+    looked at the projection would pass while an `unscheduled` event and a
+    provenance row for a transition into ACCEPTED sat in the history.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)
+    before = [event.event_type for event in store.events_for(loop_id)]
+
+    with pytest.raises(ReferralLoopError, match="no appointment"):
+        registry.unschedule(loop_id, control_id="U-S15", message_at=T2)
+
+    assert registry.get(loop_id).state is LoopState.OPEN
+    assert [event.event_type for event in store.events_for(loop_id)] == before
+
+
+def test_an_s15_then_an_s12_is_a_reschedule_expressed_in_two_messages(registry):
+    """The collapsed form -- an S12 for the new slot with no S15 first -- is already legal
+    as SCHEDULED -> SCHEDULED. This is the same reschedule sent as two messages, which is
+    what a scheduler that cancels before it rebooks emits, and refusing the intermediate
+    state while admitting the collapsed one would be incoherent."""
+    loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)
+    registry.schedule(loop_id, control_id="U-S12", message_at=T0)
+    registry.unschedule(loop_id, control_id="U-S15", message_at=T1)
+    registry.schedule(loop_id, control_id="U-S12B", message_at=T2)
+
+    assert registry.get(loop_id).state is LoopState.SCHEDULED
+
+
+_UNSCHEDULE_ACCEPTS = frozenset({LoopState.SCHEDULED})
+
+
+@pytest.mark.parametrize("state", [s for s in LoopState if s is not LoopState.CLOSED])
+def test_unschedule_accepts_only_a_scheduled_loop_and_refuses_the_rest(registry, state):
+    """The state axis alone, swept the way `schedule` and `cancel` are swept above.
+
+    Two different mechanisms do the refusing here and both are meant to. RESULTED,
+    ACKNOWLEDGED and CANCELLED have no edge into ACCEPTED in LEGAL_TRANSITIONS, which is
+    the machine's question; OPEN has one and is refused by `unschedule`'s own
+    no-appointment check, which is an evidence question. The sweep asserts the outcome
+    they share -- nothing moves -- and the OPEN case has its own test above that pins
+    which of the two answered.
+
+    The refusal type is asserted for the reason schedule's sweep gives: three of these
+    states leave the referral vocabulary under spec 6.5, and a ValueError escaping in
+    place of a ReferralLoopError changes what listener.py answers the sending engine.
+    """
+    loop_id = _loop_in(registry, state)
+    assert registry.get(loop_id).state is state
+
+    if state in _UNSCHEDULE_ACCEPTS:
+        registry.unschedule(loop_id, control_id="U-NEW", message_at=T2)
+        assert registry.get(loop_id).state is LoopState.OPEN
+    else:
+        with pytest.raises(ReferralLoopError):
+            registry.unschedule(loop_id, control_id="U-NEW", message_at=T2)
+        assert registry.get(loop_id).state is state, "a refused unschedule moved the loop"
+
+
+def test_an_unstamped_unschedule_is_applied_rather_than_refused(registry, store):
+    """The staleness posture, and it is `schedule`'s rather than `cancel`'s.
+
+    `cancel` demands a readable MSH-7 because it is destructive: a blank one turned off
+    the only anti-replay control in the system and a replayed S15 took a scheduled loop
+    off every queue. Unscheduling hides nothing -- OPEN and SCHEDULED are both in the
+    store's `_OPEN_STATES`, so the loop stays exactly where a coordinator already sees it
+    -- so refusing an unreadable clock would buy no protection at the price of leaving the
+    loop advertising an appointment that no longer exists.
+    """
+    loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)
+    registry.schedule(loop_id, control_id="U-S12", message_at=T1)
+
+    registry.unschedule(loop_id, control_id="U-S15", message_at=None)
+
+    assert registry.get(loop_id).state is LoopState.OPEN
+    assert [loop.loop_id for loop in store.open_loops("MRN1")] == [loop_id]
+
+
+def test_a_clinically_older_unschedule_is_still_refused(registry):
+    """Failing open on an *absent* clock is not failing open on a *readable and older*
+    one. An S15 for a slot that a later S12 already replaced must not un-book the booking
+    that superseded it, and that ordering question is the watermark's, not the machine's."""
+    loop_id = registry.open_loop(mrn="MRN1", modality="CT", control_id="U-ORM", message_at=T0)
+    registry.schedule(loop_id, control_id="U-S12", message_at=T2)
+
+    with pytest.raises(StaleMessageError):
+        registry.unschedule(loop_id, control_id="U-S15", message_at=T1)
+
+    assert registry.get(loop_id).state is LoopState.SCHEDULED

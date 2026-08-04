@@ -503,20 +503,24 @@ def _unattributable(hits: list[Loop], tier: int, reason: str) -> MatchResult:
       coordinator can attach it deliberately through `attach_orphan` -- which
       also records the label the flywheel reads (spec section 7).
 
-    **Scheduling messages reach this too, and for `SIU^S12` it costs recall.**
-    `listener._target_loop` matches an `SIU` on its order number through the
-    same tiers, so an appointment message carrying a valid `ORC-2` and no
-    readable `PID-3` now declines here rather than scheduling the loop it names:
-    the loop stays OPEN and `untargeted_count` rises where it previously went
-    SCHEDULED. That is a real loss on a benign shape and it is accepted rather
-    than special-cased. `S12` and `S15` arrive through one path and are the same
-    evidence -- an order number and no patient -- so a matcher that scheduled on
-    it would have to decline the cancel by some rule other than the evidence,
-    and `S15` on that evidence retires a clinically open loop into a state no
-    worklist shows. A missed schedule leaves the loop on the queue it was
-    already on, visible and still aging; it is the direction that stays safe,
-    the same asymmetry `_target_loop` argues for refusing tier-3 evidence. The
-    cost is counted and logged, never silent.
+    **Scheduling messages cannot reach this.** `listener._target_loop` builds its
+    candidate list as `open_loops(mrn) if mrn else []`, so an `SIU` naming no
+    readable patient arrives with no candidates: no tier fires, the answer is
+    tier 5 "no candidate loop", and the `unattributed` list this function needs is
+    empty by construction. An unverified MRN and an empty candidate list are the
+    same condition for an `SIU`. True since H3, and measured rather than reasoned.
+
+    A note here used to claim otherwise and to carry the argument for the `S12`
+    recall loss -- worth paying, it said, because `S12` and `S15` are the same
+    evidence and an `S15` on it "retires a clinically open loop into a state no
+    worklist shows". Both halves are now dead: the path is unreachable, and an
+    `S15` drives `unschedule` and lands on `OPEN`, so a wrong one writes a false
+    appointment fact rather than emptying a worklist. The recall loss is real and
+    still paid; it is `_target_loop`'s decision, argued in `_target_loop`'s own
+    docstring, and this was a second copy that drifted from it.
+
+    Nothing here changes. This function's decision is about results, which do
+    reach it, and it stands on the argument above.
 
     Confidence 0.0, not a pack-relative demotion. Scoring it just under
     `pack.confidence_floor` would route it to review through `_resolve`'s floor

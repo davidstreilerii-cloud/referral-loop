@@ -362,7 +362,21 @@ def test_the_gapless_invariant_holds_across_a_populated_store(tmp_path):
 
 def test_the_projection_equals_the_fold_across_a_populated_store(tmp_path):
     """Spec 9.3 invariant 2, on the same populated store: what the registry reports and
-    what the transition chain folds to must agree for every referral."""
+    what the transition chain folds to must agree, for the paths this fixture drives.
+
+    That scoping is doing real work and is not a hedge. The fixture reaches `open_loop`,
+    `schedule`, `cancel` and `record_result`, and the invariant holds across all four.
+    It does not reach `unschedule` -- whose divergence is deliberate and pinned twenty
+    lines below -- and it does not reach `reverse_acknowledgement` or `undo_match`, which
+    diverge for an unrelated reason: they append projection-moving events with no
+    `transition=`, so the chain is never told. Both have a non-None fold, so this sweep
+    would fail on either if the fixture generated it. It is not excluding them; it does
+    not produce them, and saying so is the difference between a scoped claim and a
+    universal one that happens to be untested.
+
+    Widening this test to tolerate any of the three would retire the invariant for every
+    path in order to cover a few. Keeping them separate is what makes each exception
+    visible when the thing that causes it is fixed."""
     from referral_loop.migration import canonical_state
 
     store, registry = _registry(tmp_path)
@@ -383,6 +397,36 @@ def test_the_projection_equals_the_fold_across_a_populated_store(tmp_path):
             f"{loop.loop_id}: projection {loop.state} folds to {folded}")
         checked += 1
     assert checked == 40, f"only {checked} referrals had a chain to check"
+
+
+def test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold(tmp_path):
+    """The known exception to the test above, pinned rather than left to be rediscovered.
+
+    `registry.unschedule` asserts ACCEPTED on the transition chain and projects the loop
+    to `LoopState.OPEN`, which `canonical_state` reads back as SENT. That is not a bug in
+    either write: the legacy nine-state vocabulary has no member for ACCEPTED at all --
+    `migration.WITHOUT_LEGACY_SOURCE` names it as one of the six the old machine cannot
+    represent -- and OPEN is the only projection that keeps a referral whose appointment
+    was cancelled on `open_loops()`, which is the entire point of the method.
+
+    So the divergence is the cost of the two vocabularies coexisting, and it is bounded:
+    it lasts until Plan 2c collapses the two logs and `LoopState` goes away, at which
+    point ACCEPTED is expressible and this test should fail and be deleted. Written as a
+    test so that day is loud. It is deliberately NOT a widening of the invariant above --
+    that one must keep holding for every other path.
+    """
+    from referral_loop.migration import canonical_state
+
+    store, registry = _registry(tmp_path)
+    loop_id = registry.open_loop(mrn="M1", modality="CT", control_id="O1")
+    registry.schedule(loop_id, control_id="S1")
+    registry.unschedule(loop_id, control_id="X1")
+
+    assert store.fold_transitions(loop_id) is ReferralState.ACCEPTED
+    assert canonical_state(registry.get(loop_id).state) is ReferralState.SENT
+    assert [loop.loop_id for loop in store.open_loops("M1")] == [loop_id], (
+        "the projection the divergence buys: the referral is still on the worklist"
+    )
 
 
 def test_a_failure_writing_the_provenance_row_rolls_back_the_event_too(tmp_path, monkeypatch):

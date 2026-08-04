@@ -114,7 +114,7 @@ refused acknowledgement on a preliminary read is exactly the event a risk
 officer asks about, and an audit that only records successes cannot answer them.
 
 Nothing else here is audited. The message-driven transitions -- open_loop,
-orphan, schedule, cancel, record_result -- are already held verbatim and durably
+orphan, schedule, unschedule, cancel, record_result -- are already held verbatim and durably
 in the raw archive, so copying them into a second exportable database would
 double the PHI footprint for no added assurance.
 
@@ -141,7 +141,12 @@ from .core import machine
 from .core.machine import RejectionReason, TransitionRejected
 from .core.states import DocumentationStatus, ReferralState
 from .core.transitions import ActorRef, AssertionSource, Transition
-from .errors import MrnRetiredError, ReferralLoopError, StaleMessageError
+from .errors import (
+    MrnRetiredError,
+    NoAppointmentError,
+    ReferralLoopError,
+    StaleMessageError,
+)
 from .events import LabelType, Loop, LoopEvent, LoopState
 from .migration import canonical_state, to_referral
 from .store import LoopStore
@@ -186,14 +191,22 @@ _RESULT_EVENTS = frozenset({"resulted", "reopened"})
 
 # The only state a match may be undone from. Not ACKNOWLEDGED, deliberately: see
 # the module note on undo_match versus reverse_acknowledgement.
-# NOT superseded. The only from-state guard core.machine does not own, and the one
-# still enforcing its own rule -- so it is live code, deliberately not labelled like
-# the five that went. undo_match resists expression as a Transition for a reason that
-# is a finding rather than an obstacle: it detaches a result and mints a replacement
-# orphan, so it is one operation over *two* aggregates, and machine.apply() takes one
-# Referral and returns one. Its referral half would also need DOCUMENTED -> SENT, a
-# backward edge deliberately absent from LEGAL_TRANSITIONS -- adding it to admit this
-# one operation would weaken "a result cannot be un-ordered" for every other caller.
+# NOT superseded. Task 5 retired five from-state frozensets because each was a second
+# opinion on state legality that core.machine already owned and could drift from; this
+# one survived because it is not that. It enforces a rule the machine has no way to
+# express -- see below -- so retiring it would lose the rule rather than deduplicate it,
+# which is why it is live code and deliberately not labelled like the five that went.
+#
+# No count is offered of what else guards a from-state anywhere in this file. Several
+# methods make an inline check, they answer to their own reasons, and a tally here would
+# be stale the first time somebody added one without knowing to come and update it.
+#
+# undo_match resists expression as a Transition for a reason that is a finding rather
+# than an obstacle: it detaches a result and mints a replacement orphan, so it is one
+# operation over *two* aggregates, and machine.apply() takes one Referral and returns
+# one. Its referral half would also need DOCUMENTED -> SENT, a backward edge
+# deliberately absent from LEGAL_TRANSITIONS -- adding it to admit this one operation
+# would weaken "a result cannot be un-ordered" for every other caller.
 # Design spec 6.5 shaped, and therefore Plan 2c's.
 _UNMATCHABLE_FROM = frozenset({LoopState.RESULTED})
 
@@ -769,18 +782,149 @@ class Registry:
                 transition=transition,
             )
 
+    def unschedule(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
+        """An SIU^S15: the appointment went away. The referral did not.
+
+        Spec 6.1 glosses CANCELLED as "the referring side withdraws" -- a clinical
+        judgement by a person here that this referral is dead. An S15 is a counterparty
+        scheduler reporting that a booking no longer exists, which is close to the
+        opposite: the patient still needs the visit, so somebody has to book it again.
+        Collapsing the two onto CANCELLED meant the most benign path there is -- a patient
+        rings the specialist's office and moves their CT -- drove a clinically open
+        referral into a state that appears in neither open_loops() nor
+        resulted_unacknowledged(), and that no later message can undo because CANCELLED is
+        terminal in LEGAL_TRANSITIONS. On no queue, permanently, with every existing guard
+        satisfied.
+
+        So an S15 returns the referral to ACCEPTED: the receiving organisation still
+        holds it and has not booked it, which is exactly what a cancelled appointment
+        leaves behind. **Not back to where it was before it was booked** -- the chain
+        said SENT then, and SCHEDULED -> SENT is deliberately absent from
+        LEGAL_TRANSITIONS. Nor would it be right: an organisation that booked a patient
+        has demonstrably accepted the referral, and a cancelled slot does not un-accept
+        it.
+
+        Two vocabularies meet in that sentence, so: ACCEPTED is the *transition chain*.
+        The **projection** goes to `LoopState.OPEN`. Not SCHEDULED, which is in
+        `_OPEN_STATES` too and would keep the referral on the worklist just as well --
+        it is the state being *left*, and projecting there would re-assert the booking
+        this message says has gone away. OPEN keeps the referral on the queue without
+        claiming an appointment for it, which is the whole of what an S15 asserts.
+
+        `migration.canonical_state` reads that OPEN back as SENT, not as the ACCEPTED
+        the chain holds, because the legacy nine-state vocabulary has no member for
+        ACCEPTED at all (`migration.WITHOUT_LEGACY_SOURCE`). So chain and projection
+        disagree here, and spec 9.3 invariant 2 does not hold for an unscheduled
+        referral -- pinned by
+        test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold and
+        resolved when Plan 2c collapses the two logs.
+
+        That divergence is a disagreement between the two vocabularies about a state
+        that genuinely exists. It is not the same thing as
+        `reverse_acknowledgement` and `undo_match`, which also end with chain and
+        projection apart but for an unrelated reason: both append a projection-moving
+        event with no `transition=` at all, so the chain never records the move rather
+        than recording it in a word the projection cannot spell. A reader of 2c needs
+        the difference -- this one closes when ACCEPTED becomes expressible, those two
+        close only when something writes their transitions.
+
+        Either way the loop keeps ageing on the coordinator's queue, which is the
+        definition of work outstanding. `cancel` keeps CANCELLED for the withdrawal it
+        always meant.
+        """
+        with self._lock:
+            loop = self.get(loop_id)
+
+            # There has to have BEEN an appointment for one to be cancelled, and this is
+            # the guard core.machine cannot make. LoopState.OPEN maps to
+            # ReferralState.SENT, and SENT -> ACCEPTED is a legal edge for its own
+            # unrelated and correct reason: a receiving organisation accepting a referral
+            # it was sent. So an S15 naming a loop nobody ever booked would be applied
+            # and would record an *acceptance* the receiving org never asserted, off a
+            # message that said the opposite.
+            #
+            # This is NOT a regression to the from-state frozensets Task 5 retired. Those
+            # were a second opinion on *state legality*, which core.machine owns, which is
+            # exactly why they could drift out of agreement with it. This asks a different
+            # question -- whether the evidence for the assertion exists at all -- and it
+            # is the class of refusal listener._target_loop makes when it declines
+            # ambiguous evidence, not the class the machine makes. `_UNMATCHABLE_FROM`
+            # above is the existing precedent: a live guard, deliberately unretired and
+            # annotated as such, for a rule the machine has no way to express.
+            #
+            # It answers first, so it also speaks for the three states that leave the
+            # referral vocabulary under spec 6.5. That is not a loss of the 6.5 message:
+            # an orphan has no appointment either, and both refusals reach the sending
+            # engine the same way.
+            #
+            # `NoAppointmentError` rather than a bare `ReferralLoopError`, and it is a
+            # subclass so nothing that catches the base changes. listener._apply_unschedule
+            # has to tell three failures apart out of this one call -- no appointment, a
+            # clinically older message, and the store falling over -- and only the first is
+            # the ordinary rhythm of a scheduling feed rather than something an operator
+            # should be woken for. Matching on the message text below would be the fragile
+            # way to draw that line; see errors.NoAppointmentError.
+            if loop.state is not LoopState.SCHEDULED:
+                raise NoAppointmentError(
+                    f"Loop {loop_id} is in state {loop.state.value}, so there is no appointment "
+                    "to cancel. An SIU^S15 asserts only that a booking went away; a loop that "
+                    "was never booked has none to lose, and treating one as an acceptance would "
+                    "attribute to the receiving organisation a claim it never made."
+                )
+
+            transition = self._refuse_illegal_transition(
+                loop,
+                ReferralState.ACCEPTED,
+                # The same counterparty scheduler that sends the S12 behind `schedule`.
+                # Not HUMAN: no coordinator at this site clicked anything, and this is the
+                # receiving organisation reporting on its own diary.
+                AssertionSource.RECEIVING_ORG,
+                _ENGINE_ACTOR_REF,
+                message_at or _now(),
+            )
+            # `schedule`'s staleness posture, not `cancel`'s, and destructiveness is the
+            # whole of the difference. `cancel` demands a readable clock because CANCELLED
+            # is on no worklist, so a replayed S15 with a blank MSH-7 took a clinically
+            # open loop off every queue at once -- the H2 exploit. Unscheduling hides
+            # nothing: OPEN and SCHEDULED are both in the store's _OPEN_STATES, so the
+            # loop stays exactly where the coordinator already sees it. Refusing it on an
+            # unreadable clock would buy no protection and would leave the loop
+            # advertising an appointment that no longer exists.
+            self._refuse_if_stale(loop_id, message_at, "unschedule")
+            self.store.append_event(
+                LoopEvent(
+                    loop_id, "unscheduled", _now(), control_id,
+                    self._stamp({}, message_at, control_id),
+                ),
+                transition=transition,
+            )
+
     def cancel(self, loop_id: str, control_id: str, message_at: datetime | None = None) -> None:
         with self._lock:
             loop = self.get(loop_id)
-            # RECEIVING_ORG because listener._apply_cancel drives this from SIU^S15 --
-            # the same counterparty scheduler that sends the S12 behind `schedule`. Not
-            # HUMAN: no coordinator at this site clicked anything.
+            # The withdrawal path, and nothing but. Spec 6.1 glosses CANCELLED as "the
+            # referring side withdrew the referral" -- a clinical judgement by a person
+            # that this patient no longer needs the study. The referral is over, so
+            # CANCELLED being terminal and on no worklist is the correct answer rather
+            # than the hazard it is everywhere else.
             #
-            # Recorded as a mismatch to resolve, not resolved here: spec 6.1 glosses
-            # CANCELLED as "referring side withdraws", but an S15 cancels an
-            # *appointment*, which is not the referral being withdrawn. The legacy machine
-            # collapses both onto CANCELLED and this commit preserves that exactly;
-            # separating them is a vocabulary change, not a routing change.
+            # SIU^S15 used to arrive here and no longer does. An S15 is a counterparty
+            # scheduler reporting that a *booking* went away, which is close to the
+            # opposite claim: the patient still needs the visit. It routes to
+            # `unschedule`, which carries that argument in full.
+            #
+            # **This method has no production caller today, and that is deliberate.**
+            # Nothing in v1 observes a referring clinician withdrawing a referral -- there
+            # is no message for it and no UI action -- so wiring one is plan 2c's work.
+            # It is kept rather than deleted because deleting it would leave the only
+            # transition into CANCELLED unreachable and unproven, and 2c would rebuild it
+            # from a blank page against the same spec line, without the state sweep and
+            # the anti-replay guard below that already pin it. Coverage tooling reporting
+            # this as unreferenced is reporting the schedule, not dead code.
+            #
+            # RECEIVING_ORG is left as it stands for the same reason it is not yet HUMAN:
+            # changing it would be asserting who does the withdrawing before 2c decides
+            # what drives it, and the source is what spec 8.2 answers "who said so" from.
             transition = self._refuse_illegal_transition(
                 loop,
                 ReferralState.CANCELLED,
@@ -1534,19 +1678,32 @@ class Registry:
         (`clock.is_readable_clock`). `require_message_time` refuses that unknown
         once the loop carries a watermark, and the two destructive transitions
         set it, because the fail-open *was* the exploit: a blank MSH-7 turned off
-        the only anti-replay control in the system, and a replayed `SIU^S15`
-        naming a scheduled loop then cancelled it out of `open_loops()` and
+        the only anti-replay control in the system, and a replayed message naming
+        a scheduled loop then took it out of `open_loops()` and
         `resulted_unacknowledged()` alike -- clinically open, on no coordinator
         queue at all. The stated justification for failing open here ("Task 10's
         listener does not yet pass MSH-7") expired when the listener started
         passing it on every message-driven transition.
 
-        Three callers deliberately do not set it:
+        The message that produced that incident was a replayed `SIU^S15`, and it
+        no longer reaches a caller that sets this: an S15 routes to `unschedule`,
+        which lands on `OPEN` and hides nothing, so there is nothing left for a
+        replay of one to take away. The flag survives the message that motivated
+        it because the property it guards is destructiveness, not message type --
+        `cancel` still ends a referral outright, and a final result still arms
+        acknowledgement -- and re-deriving that from the next destructive
+        transition somebody adds is how a control gets left off one.
+
+        Four callers deliberately do not set it:
 
           * `schedule`. `OPEN -> SCHEDULED` hides nothing -- both states are in
             the store's `_OPEN_STATES` and both are staleable -- so a replayed
             `SIU^S12` costs a coordinator nothing, where refusing it would buy no
             protection at the price of real refusals.
+          * `unschedule`, for the mirror of that reason and argued in full there:
+            `SCHEDULED -> OPEN` is inside the same `_OPEN_STATES`, so refusing an
+            unreadable clock would buy nothing and would leave the loop
+            advertising an appointment that no longer exists.
           * `attach_orphan`, through `record_result`'s `attached_from`. That is a
             coordinator's decision, not a replayed message, and it carries no
             MSH-7 for the same reason `acknowledge` carries none. Refusing it

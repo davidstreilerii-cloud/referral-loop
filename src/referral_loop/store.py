@@ -578,6 +578,21 @@ _EVENT_STATE = {
     # still in the event log. A conditional restore would need two event types
     # to say one thing, and would make replay depend on a lookup.
     "unmatched": LoopState.OPEN,
+    # An SIU^S15: the counterparty's scheduler saying the appointment went away. OPEN
+    # rather than CANCELLED, and that is the whole of the fix -- the patient still needs
+    # the visit, so the loop returns to the queue it was on before it was booked and keeps
+    # ageing there. CANCELLED is in neither _OPEN_STATES nor resulted_unacknowledged(),
+    # so projecting an appointment cancellation onto it put a clinically open referral on
+    # no worklist at all. registry.unschedule carries the argument in full.
+    #
+    # Named for what it does to the referral, and it pairs with "scheduled" above rather
+    # than reading as a variant of "cancelled" four lines up. The first draft called it
+    # "appointment_cancelled", which put a name one prefix away from "cancelled" -- the
+    # referral is dead and off every worklist -- onto the event that means the referral is
+    # alive and back on it. That is this defect's own conflation, and an event type is the
+    # single worst place to keep it: these strings are the durable log, so a later reader
+    # cannot revise one without a migration.
+    "unscheduled": LoopState.OPEN,
 }
 
 # No event type maps to LoopState.CLOSED, and that is the whole of the v1
@@ -1343,6 +1358,28 @@ class LoopStore:
         None rather than a default: a referral with no transitions has no state the log
         ever asserted, and answering DRAFT would invent one. Spec 9.3 invariant 2 compares
         the projection against this.
+
+        **A divergence from the projection is not by itself corruption**, and a caller
+        reaching for this function to check invariant 2 needs to know that before it
+        reads one. Two unrelated causes produce one:
+
+          * The vocabularies disagree about a state that genuinely exists.
+            `registry.unschedule` writes ACCEPTED here and projects `LoopState.OPEN`,
+            which `canonical_state` reads back as SENT, because the legacy vocabulary
+            has no member for ACCEPTED (`migration.WITHOUT_LEGACY_SOURCE`). Deliberate,
+            argued in full at `registry.unschedule`, and it ends when Plan 2c collapses
+            the two logs. Pinned by
+            test_an_unscheduled_referral_is_the_one_place_invariant_two_does_not_hold.
+          * **The chain was never written.** `reverse_acknowledgement` and `undo_match`
+            append events that move the projection while passing no `transition=`, so
+            the chain still folds to whatever the last recorded transition said --
+            RECONCILED against a projection of DOCUMENTED, and DOCUMENTED against SENT,
+            respectively. Nothing here is asserting two things; one side simply has no
+            entry. That is a gap in the write path rather than a vocabulary cost, and it
+            closes when something writes those transitions, not when 2c lands.
+
+        Only the first is intended, so a new divergence is worth reading as the second
+        until shown otherwise.
         """
         rows = self._read(
             "SELECT to_state FROM transition_events WHERE referral_id = ? ORDER BY seq",
