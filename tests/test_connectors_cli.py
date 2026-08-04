@@ -126,3 +126,13 @@ def test_a_connector_id_shared_with_a_configured_peer_warns(tmp_path, monkeypatc
         main(["connectors", "--connectors", str(path), "--peers", str(peers)])
     assert "example-ris" in caplog.text
     assert "peer id cross-check: skipped" not in capsys.readouterr().out
+
+
+def test_the_report_says_which_connectors_can_be_queried(tmp_path, monkeypatch, capsys):
+    """A preflight-only connector is a legitimate configuration. What must not happen is
+    discovering it by a query that comes back empty."""
+    monkeypatch.delenv("REFERRAL_PACK_PUBKEY", raising=False)
+    path = _connector_file(tmp_path)
+    main(["connectors", "--connectors", str(path)])
+    out = capsys.readouterr().out
+    assert "preflight-only" in out

@@ -25,6 +25,14 @@ class ServerBehaviour:
     redirect_metadata_to: str | None = None
     redirect_token_to: str | None = None
     requests: list = field(default_factory=list)
+    # Bundles keyed by path+query, so one server can answer a Patient search and two resource
+    # searches differently within a single test.
+    bundles: dict = field(default_factory=dict)
+    # Status codes to return before behaving normally, popped one per request. [429, 503] means
+    # fail twice then succeed -- which is what a retry test needs to assert on.
+    transient_failures: list = field(default_factory=list)
+    retry_after: str | None = None
+    operation_outcome: dict | None = None
 
 
 def _handler_for(behaviour: ServerBehaviour):
@@ -42,6 +50,16 @@ def _handler_for(behaviour: ServerBehaviour):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_with_headers(self, status: int, payload: dict, extra: dict) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            for name, value in extra.items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+
         def _redirect(self, target: str) -> None:
             self.send_response(302)
             self.send_header("Location", target)
@@ -50,6 +68,26 @@ def _handler_for(behaviour: ServerBehaviour):
 
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's interface
             behaviour.requests.append(("GET", self.path))
+            if behaviour.transient_failures:
+                status = behaviour.transient_failures.pop(0)
+                if behaviour.retry_after is not None:
+                    self._send_with_headers(
+                        status,
+                        behaviour.operation_outcome or {"resourceType": "OperationOutcome"},
+                        {"Retry-After": behaviour.retry_after},
+                    )
+                else:
+                    self._send(status, behaviour.operation_outcome or {"resourceType": "OperationOutcome"})
+                return
+
+            key = self.path
+            if key in behaviour.bundles:
+                self._send(200, behaviour.bundles[key])
+                return
+            if behaviour.operation_outcome is not None:
+                self._send(400, behaviour.operation_outcome)
+                return
+
             if not self.path.endswith("/metadata"):
                 self._send(404, {"resourceType": "OperationOutcome"})
                 return
@@ -94,3 +132,42 @@ def fhir_server(certfile, keyfile, behaviour: ServerBehaviour | None = None):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def bundle(*resources, next_url: str | None = None) -> dict:
+    """A searchset Bundle. `next_url` is what the pagination walk will be handed -- tests point
+    it off-allowlist, at itself, and at a real next page, because those are three different
+    failures and only one of them is legitimate."""
+    payload = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "total": len(resources),
+        "entry": [{"resource": r} for r in resources],
+        "link": [],
+    }
+    if next_url is not None:
+        payload["link"].append({"relation": "next", "url": next_url})
+    return payload
+
+
+def document_reference(doc_id: str, patient_id: str = "p1") -> dict:
+    return {
+        "resourceType": "DocumentReference",
+        "id": doc_id,
+        "status": "current",
+        "subject": {"reference": f"Patient/{patient_id}"},
+        "content": [{"attachment": {"contentType": "application/pdf", "url": f"Binary/{doc_id}"}}],
+    }
+
+
+def diagnostic_report(report_id: str, patient_id: str = "p1") -> dict:
+    return {
+        "resourceType": "DiagnosticReport",
+        "id": report_id,
+        "status": "final",
+        "subject": {"reference": f"Patient/{patient_id}"},
+    }
+
+
+def patient(patient_id: str = "p1") -> dict:
+    return {"resourceType": "Patient", "id": patient_id}
