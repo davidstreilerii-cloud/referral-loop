@@ -56,7 +56,12 @@ from typing import NamedTuple
 
 from . import eval as eval_harness
 from .encryption_check import verify_encryption_at_rest
-from .errors import PackVerificationError, ReferralLoopError, StoreUnavailableError
+from .errors import (
+    PackConceptMissingError,
+    PackVerificationError,
+    ReferralLoopError,
+    StoreUnavailableError,
+)
 from .listener import FileDropSource, MessageHandler
 from .mllp_server import make_mllp_server
 from .pack import RulePack, load_pack
@@ -280,7 +285,23 @@ def _run_eval(stack: BootedStack, args, public_key_hex: str) -> int:
               "A pack ships on a measured delta against the pack it replaces.")
         return EVAL_ALLOWED
 
-    baseline_pack = load_pack(Path(args.baseline_pack_dir), _public_key(public_key_hex))
+    try:
+        baseline_pack = load_pack(Path(args.baseline_pack_dir), _public_key(public_key_hex))
+    except PackConceptMissingError as exc:
+        # The signature verified and the field map is well-formed; this pack is
+        # older than the build, not corrupt. Reworded here rather than in
+        # `load_pack` because the two callers need opposite advice: a *running*
+        # site on such a pack has to fix the pack it is running, while a gate
+        # has a second, cheaper way out -- pick a later baseline. An operator
+        # reading the load-time wording at 3am would go looking for a tamper.
+        concepts = ", ".join(exc.missing)
+        raise PackVerificationError(
+            f"the baseline pack at {args.baseline_pack_dir} verified, but its field_map "
+            f"predates this build: it does not name {concepts}, which this build reads on "
+            f"every message. It is too old to replay the corpus through, not corrupt. "
+            f"Either re-sign that baseline with {concepts} added to its field_map, or gate "
+            f"against a later baseline that already carries it."
+        ) from exc
     baseline = eval_harness.replay(cases, baseline_pack, labels=labels)
     print(eval_harness.format_report(baseline, title="baseline"))
 

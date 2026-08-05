@@ -31,6 +31,32 @@ class PackVerificationError(ReferralLoopError):
     """Pack signature missing, invalid, or altered. Refuse to boot."""
 
 
+class PackConceptMissingError(PackVerificationError):
+    """A pack whose signature verified but whose field_map omits a concept this
+    build reads without an `in pack.field_map` guard.
+
+    A *subclass*, so every `except PackVerificationError` in the boot path keeps
+    refusing exactly as it did -- this is still "the pack must not run". Typed
+    separately for the reason MrnRetiredError is: a caller has to tell two
+    failures apart out of one call, and matching on an error string is the
+    fragile version of that. Here the two are "this pack is corrupt" and "this
+    pack is older than this build", and they send an operator to different
+    people -- whoever signed it, or whoever picks the baseline to gate against.
+    `cli._run_eval` is the caller that needs the distinction.
+
+    Carries the concept names, not only a message, because the caller naming a
+    remedy needs the list and re-deriving it from the text is the same fragility
+    one layer down.
+    """
+
+    def __init__(self, missing: tuple[str, ...] | list[str]) -> None:
+        self.missing = tuple(missing)
+        super().__init__(
+            "Pack field_map is missing concept(s) this build reads on every message: "
+            + ", ".join(self.missing)
+        )
+
+
 class StoreUnavailableError(ReferralLoopError):
     """Durable write failed. Respond AE so the engine queues. Never ACK."""
 

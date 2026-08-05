@@ -16,8 +16,36 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .audit import SYSTEM_ACTOR, SYSTEM_ROLE, AuditAction, audited
-from .errors import PackVerificationError
+from .errors import PackConceptMissingError, PackVerificationError
 from .parse_hl7 import ALLOWED_SEGMENTS
+
+# The concepts this build reads through `matcher.concept_value` with no
+# `in pack.field_map` guard. A pack omitting one would otherwise load clean and
+# raise `PackVerificationError` out of `field_candidates` on the first message
+# that needed it -- a booted, ACKing site failing partway through ingest, worded
+# as if the pack were corrupt when it is merely older than the build. Refusing
+# here makes it the same class of failure as a concept pointed at the wrong
+# segment, and for the same reason given below: a pack defect must fail before
+# the first message rather than on it.
+#
+# Concepts read *behind* such a guard are deliberately absent: each has a
+# fallback placement, so an old pack still reads the right field and has no
+# business being refused (`listener._prior_mrn`, `matcher._observed_at`).
+#
+# Exhaustive against the source, and said here only because
+# `test_pack.py::test_required_concepts_matches_the_unguarded_reads_in_src`
+# walks `src/` for those calls and fails on any difference in either direction.
+# A hand-maintained set drifts the moment a read is added without a thought for
+# this line, and the drift is invisible until a site boots a pack from last year.
+REQUIRED_CONCEPTS = frozenset({
+    "appointment_id",
+    "filler_order_number",
+    "modality",
+    "mrn",
+    "ordering_provider",
+    "placer_order_number",
+    "service_code",
+})
 
 # SEG-N or SEG-N.C: a 3-character HL7 segment id (a letter followed by two
 # alphanumeric characters -- HL7 segment ids are not always all-letters, e.g.
@@ -73,6 +101,11 @@ class RulePack:
         Raises PackVerificationError for an unknown concept rather than returning
         an empty tuple -- a typo'd concept silently matching nothing is exactly the
         failure mode that turns a tier into a false negative.
+
+        `load_pack` refuses a pack lacking any of REQUIRED_CONCEPTS, so a caller
+        reading one of those no longer gets here on a loaded pack. What still
+        does: a typo, a RulePack built by hand rather than loaded, and an
+        optional concept read without its `in pack.field_map` guard.
 
         Behaviour note for callers walking this list (the matcher, Task 8): a
         candidate naming a segment-field absent from the message is not an
@@ -181,6 +214,14 @@ def _load_pack(pack_dir: Path, public_key_raw: bytes) -> RulePack:
                     f"field_map['{concept}'] names segment {segment!r}, which is "
                     f"outside ALLOWED_SEGMENTS; refusing to widen the parser's read surface"
                 )
+
+    # Checked after the shape rules above, so a pack that is both malformed and
+    # old is reported as malformed first: a bad field reference is a defect in
+    # the pack in front of you, while a missing concept is usually a defect in
+    # the choice of pack.
+    missing_concepts = sorted(REQUIRED_CONCEPTS - field_map.keys())
+    if missing_concepts:
+        raise PackConceptMissingError(missing_concepts)
 
     try:
         return RulePack(
