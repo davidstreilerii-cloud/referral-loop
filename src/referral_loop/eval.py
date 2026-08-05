@@ -609,10 +609,18 @@ def _order(
 
 def _schedule(*, control: str, mrn: str, placer: str, filler: str,
               when: str = _SYNTH_ORDERED_AT) -> str:
-    # No SCH segment, matching `_cancel` below: nothing in the ingest path reads one --
-    # `_target_loop` resolves an SIU on ORC/OBR order numbers alone -- and a segment
-    # present in one of a matched pair and absent from the other invites a later reader
-    # to think the difference is load-bearing.
+    # No SCH segment, matching `_cancel` below, and a segment present in one of a
+    # matched pair and absent from the other invites a later reader to think the
+    # difference is load-bearing.
+    #
+    # `content_key` does read SCH now, through `appointment_id`, so the older form of
+    # this note -- that nothing in the ingest path reads one -- has stopped being true.
+    # It does not change what belongs here: this corpus measures *matching*, and
+    # `_target_loop` still resolves an SIU on ORC/OBR order numbers alone. An absent
+    # SCH keys these cases on the tuple they were always keyed on. Adding one would
+    # buy the harness no new signal either, because the rebooking collision it would
+    # exercise is a suppressed message rather than a false match, an orphan or a
+    # dismissal, and those are the outcomes `EvalResult` counts.
     return _message(
         _msh("SIU^S12", control, when),
         _pid(mrn),

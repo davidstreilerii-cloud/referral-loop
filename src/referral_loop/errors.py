@@ -115,8 +115,9 @@ class NoAppointmentError(ReferralLoopError):
         on anything the `S15` carries.
 
     Not a redelivery of the S15 itself, in the ordinary case: `content_key` hashes the
-    message type, ORC-1, the order numbers and the MRN but not MSH-10, so a second copy
-    from the same peer is answered as a content duplicate before `_apply` is reached.
+    message type, ORC-1, the order numbers, the appointment identifier and the MRN but
+    not MSH-10, and a second copy names the same appointment because it is the same
+    message, so it is answered as a content duplicate before `_apply` is reached.
     It becomes reachable only across peers, since both dedup scopes are keyed on
     `peer_id` -- which needs two peers holding cancel authority for one order, and is
     rare enough that an operator handed it as a first hypothesis would be sent looking
