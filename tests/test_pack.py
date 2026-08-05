@@ -103,6 +103,20 @@ def test_shipped_pack_and_signature_both_exist():
     )
 
 
+def test_the_signing_script_points_at_the_pack_it_signs():
+    """`--sign` is exercised by hand, months apart, and only when a pack changes.
+
+    Its `PACK_DIR` survived the extraction pointing at the pre-extraction layout
+    and `--sign` exited "No pack at ..." for anyone who tried, which nobody did
+    until a pack needed re-signing. Asserting the two paths agree is the cheapest
+    thing that fails on the wrong side of a move rather than at the next release.
+    """
+    from scripts.sign_pack import PACK_DIR
+
+    assert PACK_DIR.resolve() == SHIPPED_PACK.resolve()
+    assert (PACK_DIR / "pack.json").is_file()
+
+
 def test_missing_pack_file_refuses(tmp_path):
     with pytest.raises(PackVerificationError, match="No pack"):
         load_pack(tmp_path, b"\x00" * 32)
