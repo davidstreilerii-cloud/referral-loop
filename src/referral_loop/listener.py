@@ -171,8 +171,9 @@ _EXACT_TIERS = (1, 2)
 # Concepts read through the pack's field map. `prior_patient_id` is optional in
 # exactly the way `observation_datetime` is in the matcher: spec section 5's
 # field map names six concepts and not this one, so a pack that carries it wins
-# and a pack that does not falls back to the standard MRG-1 placement, without
-# inventing a required concept load_pack does not validate.
+# and a pack that does not falls back to the standard MRG-1 placement. Its
+# absence from `pack.REQUIRED_CONCEPTS` is that fallback restated: a concept
+# with a working default placement has no business refusing a pack at load.
 #
 # `appointment_id` is read the other way round -- straight through
 # `concept_value`, with no `in pack.field_map` guard -- and the asymmetry is the
@@ -180,16 +181,19 @@ _EXACT_TIERS = (1, 2)
 # that omits it still reads the right field. There is no fallback placement for
 # an appointment: a pack that omits the concept would make `content_key` read
 # nothing, which is precisely the collision this key was widened to stop, and it
-# would do so silently on a system that looked upgraded. Unguarded,
-# `field_candidates` raises `PackVerificationError` on the first message instead.
+# would do so silently on a system that looked upgraded. So the concept is in
+# `pack.REQUIRED_CONCEPTS`, and `load_pack` refuses such a pack before the
+# process is serving rather than leaving `field_candidates` to raise on the
+# first message that carries an SCH.
 #
 # The cost, paid deliberately: `eval --baseline-pack-dir` replays the corpus
-# through a *historical* pack, and one signed before this concept existed now
-# refuses there rather than producing a baseline to measure against. The pack a
-# site runs on carries the concept; the pack it ran on last year need not. So a
-# gate against such a baseline needs it re-signed with the concept, or a later
-# baseline chosen -- and the alternative buys that convenience by letting a
-# production pack that forgot the concept boot clean and eat a rebooking.
+# through a *historical* pack, and one signed before this concept existed cannot
+# serve as a baseline. The pack a site runs on carries the concept; the pack it
+# ran on last year need not. So such a gate needs the baseline re-signed with the
+# concept, or a later baseline chosen -- `cli._run_eval` says exactly that, since
+# the refusal is otherwise indistinguishable from a corrupt pack. The alternative
+# buys that convenience by letting a production pack that forgot the concept boot
+# clean and eat a rebooking.
 _CONCEPT_MRN = "mrn"
 _CONCEPT_PRIOR_MRN = "prior_patient_id"
 _CONCEPT_APPOINTMENT_ID = "appointment_id"

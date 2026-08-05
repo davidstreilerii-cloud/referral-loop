@@ -958,6 +958,43 @@ def test_eval_mode_is_listed_in_help(eval_env, tmp_path, capsys):
     assert "--baseline-pack-dir" in out
 
 
+def test_a_baseline_older_than_the_build_is_refused_as_old_not_as_corrupt(
+    eval_env, tmp_path, capsys
+):
+    """A baseline signed before `appointment_id` existed, driven through `main`.
+
+    The refusal used to arrive from `field_candidates` partway through the
+    replay, worded "Unknown field-map concept" -- which sends an operator
+    looking for a tampered pack when the pack is simply older than the build,
+    and would say the same thing again at every future concept. What this pins
+    is the wording, because the exit code was already 2 and the concept was
+    already named: an operator has to be able to tell "this pack is broken" from
+    "this pack is old", and be told the two ways out.
+    """
+    pre_1_2_0 = {
+        k: v for k, v in _shipped_pack_body()["field_map"].items() if k != "appointment_id"
+    }
+    baseline_dir = tmp_path / "baseline"
+    candidate_dir = tmp_path / "candidate"
+    _sign_into(baseline_dir, eval_env, {"version": "1.1.0", "field_map": pre_1_2_0})
+    _sign_into(candidate_dir, eval_env)
+    code = main(["eval", "--db", str(tmp_path / "loops.db"),
+                 "--pack-dir", str(candidate_dir),
+                 "--baseline-pack-dir", str(baseline_dir)])
+    captured = capsys.readouterr()
+    assert code == 2, captured.out
+    assert "appointment_id" in captured.err
+    assert "not corrupt" in captured.err
+    assert "re-sign" in captured.err and "later baseline" in captured.err
+    assert "Unknown field-map concept" not in captured.err, (
+        "the mid-replay wording is back; the baseline is being read message by "
+        "message again instead of refused at load"
+    )
+    assert "baseline" not in captured.out, (
+        "a baseline report was printed, so the replay ran before the refusal"
+    )
+
+
 def test_a_missing_baseline_pack_is_a_refusal_not_a_traceback(eval_env, tmp_path, capsys):
     pack_dir = tmp_path / "candidate"
     _sign_into(pack_dir, eval_env)

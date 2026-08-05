@@ -53,6 +53,15 @@ Reproduce with `referral-loop eval --pack-dir src/referral_loop/rules
   dismissal rate   0.0000   (no site labels)
 ```
 
+**That command needs one more step on any build after `4fbe3f7`.** `appointment_id`
+is read on every message with no `in pack.field_map` guard, so it is in
+`pack.REQUIRED_CONCEPTS` and `load_pack` refuses a baseline whose field map
+omits it — before the replay starts, and saying which of "old" and "corrupt" it
+is. Sign a copy of the 1.1.0 body with `appointment_id: ["SCH-1", "SCH-2"]`
+added and gate against that. The outcome above is unchanged when you do:
+identical metrics on both packs and *"BLOCKED: no target metric improved"*,
+re-measured that way rather than assumed.
+
 Those are the numbers for *both* packs, and they are not the ones recorded below
 for 1.1.0 on 2026-07-26: the synthetic corpus has grown since, so matchable went
 6 -> 7 and orphans 8 -> 7 with no pack change at all. The section below is a

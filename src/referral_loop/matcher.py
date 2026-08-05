@@ -269,8 +269,13 @@ def _observed_at(message: ParsedMessage, pack: RulePack) -> datetime | None:
     Spec section 5's field map names six concepts and not this one, yet tiers 3-4
     key on the window it defines -- so the one placement the tiers depend on was
     the one still hardcoded. Reading it from the field map *when a pack carries
-    it* closes that without requiring a pack revision, and without inventing a
-    required concept that load_pack does not validate.
+    it* closes that without requiring a pack revision.
+
+    Guarded, and so deliberately absent from `pack.REQUIRED_CONCEPTS`: OBR-7 is
+    a real fallback, so a pack that never names the concept still reads the right
+    field, and refusing it at load would cost a site its boot to buy nothing.
+    Promoting the concept into the required set to make the reads uniform is the
+    tempting simplification, and it would do exactly that.
     """
     if _CONCEPT_OBSERVED_AT in pack.field_map:
         return hl7_datetime(concept_value(message, pack, _CONCEPT_OBSERVED_AT))
