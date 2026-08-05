@@ -1,9 +1,9 @@
 """Sign a referral rule pack. Private key stays outside the repo, always.
 
 Usage:
-    python scripts/sign_referral_pack.py --keygen        # once, writes to ~/.config
-    python scripts/sign_referral_pack.py --sign          # signs rules/pack.json
-    python scripts/sign_referral_pack.py --pubkey        # prints hex for REFERRAL_PACK_PUBKEY
+    python scripts/sign_pack.py --keygen        # once, writes to ~/.config
+    python scripts/sign_pack.py --sign          # signs rules/pack.json
+    python scripts/sign_pack.py --pubkey        # prints hex for REFERRAL_PACK_PUBKEY
 """
 from __future__ import annotations
 
@@ -13,9 +13,16 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+# Named for the repository this package was extracted from, and left that way
+# deliberately: this is where the signing key already sits on the machines that
+# hold one. Renaming the directory would strand those keys, and a key that
+# cannot be found is a pack that cannot be re-signed.
 KEY_DIR = Path.home() / ".config" / "healthcare-rag"
 PRIVATE_KEY = KEY_DIR / "referral_pack_ed25519.key"
-PACK_DIR = Path(__file__).parent.parent / "healthcare_rag" / "referral_loop" / "rules"
+# The extraction moved the pack to src/ and this path did not follow, so --sign
+# exited "No pack at ..." rather than signing anything. It went unnoticed because
+# signing happens by hand only when a pack changes, which was not for months.
+PACK_DIR = Path(__file__).parent.parent / "src" / "referral_loop" / "rules"
 
 
 def keygen() -> None:

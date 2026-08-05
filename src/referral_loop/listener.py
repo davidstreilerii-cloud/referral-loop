@@ -173,8 +173,26 @@ _EXACT_TIERS = (1, 2)
 # field map names six concepts and not this one, so a pack that carries it wins
 # and a pack that does not falls back to the standard MRG-1 placement, without
 # inventing a required concept load_pack does not validate.
+#
+# `appointment_id` is read the other way round -- straight through
+# `concept_value`, with no `in pack.field_map` guard -- and the asymmetry is the
+# point. `prior_patient_id` has a standard placement to fall back on, so a pack
+# that omits it still reads the right field. There is no fallback placement for
+# an appointment: a pack that omits the concept would make `content_key` read
+# nothing, which is precisely the collision this key was widened to stop, and it
+# would do so silently on a system that looked upgraded. Unguarded,
+# `field_candidates` raises `PackVerificationError` on the first message instead.
+#
+# The cost, paid deliberately: `eval --baseline-pack-dir` replays the corpus
+# through a *historical* pack, and one signed before this concept existed now
+# refuses there rather than producing a baseline to measure against. The pack a
+# site runs on carries the concept; the pack it ran on last year need not. So a
+# gate against such a baseline needs it re-signed with the concept, or a later
+# baseline chosen -- and the alternative buys that convenience by letting a
+# production pack that forgot the concept boot clean and eat a rebooking.
 _CONCEPT_MRN = "mrn"
 _CONCEPT_PRIOR_MRN = "prior_patient_id"
+_CONCEPT_APPOINTMENT_ID = "appointment_id"
 _DEFAULT_PRIOR_MRN_REF = f"MRG-{MRG_PRIOR_PATIENT_ID}.1"
 
 _MSH_DATETIME_REF = f"MSH-{MSH_DATETIME}"
@@ -221,7 +239,15 @@ _AUTHORITY_COUNTER = {
 # not silently make every message in flight look new *or* look like a duplicate
 # of something it is not; bumping this makes the discontinuity explicit and
 # dated in the changelog rather than inferred from a spike in the counters.
-_CONTENT_KEY_VERSION = "rl-content-v1"
+#
+# v2 adds the appointment identifier. The tag is itself inside the hashed
+# payload, so the bump moves *every* key, including those of messages carrying
+# no `SCH` at all -- which is why the read is dual-versioned. See `_dedup_keys`.
+_CONTENT_KEY_VERSION = "rl-content-v2"
+
+# The version a read still consults and a write never produces. Retirement
+# condition and the argument for carrying it are in `_legacy_content_key`.
+_LEGACY_CONTENT_KEY_VERSION = "rl-content-v1"
 
 # Archive key for bytes that never became a message. Content-addressed so a
 # sender retransmitting the same garbage does not fill the archive with rows,
@@ -336,6 +362,25 @@ def _obx_tuples(message: ParsedMessage) -> list[list[str]]:
     ]
 
 
+def _hashed(payload: list) -> str:
+    """SHA-256 over the payload, serialised the one way every version serialises.
+
+    JSON rather than a delimiter join: a separator character appearing inside a
+    field makes ("A|B", "C") and ("A", "B|C") the same key, and HL7 escape
+    sequences put arbitrary bytes in fields.
+
+    Shared by both key versions, unlike the payloads, and the difference is not
+    an inconsistency. A payload can gain a field for one version alone, so the
+    legacy one is written out where nothing can edit it by accident. A
+    serialisation cannot: every stored row was hashed through this, so a change
+    here invalidates all of them at once and is a version bump by definition
+    rather than something a version could survive.
+    """
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def content_key(message: ParsedMessage, pack: RulePack, *, mrn: str) -> str | None:
     """A hash over the message's identifying tuple, or None when it has none.
 
@@ -345,7 +390,7 @@ def content_key(message: ParsedMessage, pack: RulePack, *, mrn: str) -> str | No
     has happened -- the case it exists for.
 
     Beyond the tuple spec section 6 names (filler, placer, MRN, the OBX set),
-    three fields are included because leaving them out creates collisions
+    four fields are included because leaving them out creates collisions
     between messages that are not duplicates, and a false duplicate is a
     silently discarded message:
 
@@ -354,16 +399,73 @@ def content_key(message: ParsedMessage, pack: RulePack, *, mrn: str) -> str | No
       * **the retired MRN** -- two A40s merging different patients into the same
         survivor otherwise collide, and the second one's loops stay stranded.
       * **ORC-1 order control** -- a new order and a cancellation carry the same
-        identifiers. v1 does not act on ORC-1, so this only ever *narrows* what
-        counts as a duplicate, which is the safe direction to be wrong in.
+        identifiers. The product's v1 does not act on ORC-1, so this only ever
+        *narrows* what counts as a duplicate, which is the safe direction to be
+        wrong in. (Not `rl-content-v1`, which is the key version below.)
+      * **the appointment identifier** -- a specialist rebooking a patient sends
+        a second `SIU^S12` carrying the same order numbers, because the order
+        has not changed, and a new `SCH`. Without it the rebooking hashes to the
+        key the original already spent and is swallowed, leaving the loop
+        reading as un-booked while the patient holds an appointment. A rebooking
+        that also mints a new filler order number was already distinguished;
+        this is the case where only the slot moves.
+
+    The appointment is empty for a non-scheduling message and for a scheduling
+    system that omits `SCH`. Such messages are separated by exactly the fields
+    that separated them before, because the element they gained is the same
+    empty string in all of them: the widening narrows what counts as a
+    duplicate and never the reverse.
+
+    The concept is read straight through, with no `in pack.field_map` guard --
+    see `_CONCEPT_APPOINTMENT_ID` for why that asymmetry with `prior_patient_id`
+    is deliberate, and what it costs.
 
     Returns None when nothing identifying is present. An empty tuple would hash
     to one value shared by every such message, making all but the first a
     duplicate -- dedup silently becoming a drop.
+    """
+    placer = concept_value(message, pack, "placer_order_number")
+    filler = concept_value(message, pack, "filler_order_number")
+    appointment = concept_value(message, pack, _CONCEPT_APPOINTMENT_ID)
+    prior = _prior_mrn(message, pack)
+    obx = _obx_tuples(message)
 
-    JSON rather than a delimiter join: a separator character appearing inside a
-    field makes ("A|B", "C") and ("A", "B|C") the same key, and HL7 escape
-    sequences put arbitrary bytes in fields.
+    if not any((placer, filler, appointment, mrn, prior)) and not obx:
+        return None
+
+    return _hashed(
+        [
+            _CONTENT_KEY_VERSION,
+            message.message_type,
+            field_value(message, _ORDER_CONTROL_REF),
+            placer,
+            filler,
+            appointment,
+            mrn,
+            prior,
+            obx,
+        ]
+    )
+
+
+def _legacy_content_key(message: ParsedMessage, pack: RulePack, *, mrn: str) -> str | None:
+    """The `rl-content-v1` key for this message: the shape before `SCH` was read.
+
+    **Retirable once no `v1` row remains inside the redelivery window any peer is
+    configured for.** Rows are written by `record_applied` and only ever under
+    the current version, so the last `v1` row is as old as the deploy that
+    bumped it; past the longest window an engine will redeliver across, no
+    redelivery can still be answered by one and this function and its call in
+    `_dedup_keys` come out together. Named because a dual-read with no stated
+    end becomes permanent by default -- the failure mode
+    `migration.translate_to_legacy` is being watched for.
+
+    Written out rather than derived from `content_key` with a different version
+    tag, which is the tempting shape and the wrong one. This payload is a
+    historical fact about bytes already in the database. Derived, the next edit
+    to the live key -- a fifth field, a reordering -- would silently change what
+    a stored `v1` row hashes to, and the migration would stop suppressing the
+    redeliveries it exists to suppress with nothing failing to say so.
     """
     placer = concept_value(message, pack, "placer_order_number")
     filler = concept_value(message, pack, "filler_order_number")
@@ -373,9 +475,9 @@ def content_key(message: ParsedMessage, pack: RulePack, *, mrn: str) -> str | No
     if not any((placer, filler, mrn, prior)) and not obx:
         return None
 
-    payload = json.dumps(
+    return _hashed(
         [
-            _CONTENT_KEY_VERSION,
+            _LEGACY_CONTENT_KEY_VERSION,
             message.message_type,
             field_value(message, _ORDER_CONTROL_REF),
             placer,
@@ -383,11 +485,34 @@ def content_key(message: ParsedMessage, pack: RulePack, *, mrn: str) -> str | No
             mrn,
             prior,
             obx,
-        ],
-        separators=(",", ":"),
-        ensure_ascii=False,
+        ]
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _dedup_keys(message: ParsedMessage, pack: RulePack, *, mrn: str,
+                key: str | None) -> tuple[str, ...]:
+    """The keys a dedup read consults: this message's, and its legacy spelling.
+
+    Sibling of `store._dedup_scopes`, and the same argument in the other
+    dimension. Reads look at both; writes only ever land in the first. A row
+    written before `_CONTENT_KEY_VERSION` moved still suppresses a redelivery of
+    the message it recorded, so an upgrade cannot cause an already-applied
+    message to be applied a second time -- and because nothing writes `v1`
+    again, the legacy set only shrinks.
+
+    That matters beyond scheduling traffic: the version tag is inside the hashed
+    payload, so the bump moves the key of every message, including those
+    carrying no `SCH`. Without the legacy read, a redelivery under a fresh
+    `MSH-10` of any message applied before the deploy would match no stored row
+    and be applied again -- for a result, a second `record_result`. `MSH-10`
+    dedup bounds that to redeliveries the engine re-stamps, which is the case
+    content keying exists for in the first place.
+
+    `key` is passed in rather than recomputed so the read is keyed on exactly
+    what the write will store.
+    """
+    legacy = _legacy_content_key(message, pack, mrn=mrn)
+    return tuple(candidate for candidate in (key, legacy) if candidate)
 
 
 class MessageHandler:
@@ -658,8 +783,11 @@ class MessageHandler:
             )
 
         key = content_key(message, self.pack, mrn=mrn)
-        if key is not None:
-            owner = self.store.content_key_owner(key, peer_id=peer.peer_id)
+        # The write below stores `key` alone; the read consults the legacy
+        # spelling too, and stops at the first version that answers. See
+        # `_dedup_keys` for why an upgrade would otherwise re-apply a message.
+        for candidate in _dedup_keys(message, self.pack, mrn=mrn, key=key):
+            owner = self.store.content_key_owner(candidate, peer_id=peer.peer_id)
             if owner is not None:
                 self.duplicate_content_key_count += 1
                 logger.warning(

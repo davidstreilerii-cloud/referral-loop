@@ -1,4 +1,4 @@
-<!-- healthcare_rag/referral_loop/rules/CHANGELOG.md -->
+<!-- src/referral_loop/rules/CHANGELOG.md -->
 # Rule pack changelog
 
 Every entry records what changed and the eval delta that justified it. Replayed
@@ -17,6 +17,49 @@ one metric it did not move.
 Nothing closes in v1 — `CLOSED` is v2 — so a metric named for closure described
 something the system does not do. Same definition, same veto.*
 
+## 1.2.0 — 2026-08-05
+
+Added `appointment_id: ["SCH-1", "SCH-2"]` to `field_map`.
+
+`SCH` is parsed on every scheduling message and then discarded, because no
+concept read it. A specialist's office rebooking a patient sends a second
+`SIU^S12` carrying the same `ORC-2`/`ORC-3` — the *order* has not changed — and a
+new `SCH`. What tells the two messages apart is the appointment identifier, and
+until now nothing could read it. Two candidates in preference order for the same
+reason `placer_order_number` lists two: which field a site's scheduler populates
+depends on its interface engine, not on HL7.
+
+**This revision improves no metric the eval harness measures, and the release
+gate blocks it.** Recorded rather than worked around. Replayed against the
+shipped synthetic corpus with 1.1.0 as `--baseline-pack-dir`, both packs score
+identically and `gate_pack_release` returns *"BLOCKED: no target metric
+improved"* — correctly, on the numbers it has. Nothing reads `appointment_id`
+yet, so a field map that gains it cannot move a match metric; and what it will
+move once read is a content-key collision that swallows a rebooking, which is
+not a false match, an orphan or a dismissal and so is not in the harness's
+vocabulary at all. Section 7's conditions 1 and 2 — the two vetoes — hold: false-
+match rate and precision both unchanged at 0.0000 and 1.0000.
+
+Reproduce with `referral-loop eval --pack-dir src/referral_loop/rules
+--baseline-pack-dir <1.1.0> --synthetic-only`:
+
+```
+  cases                13   matchable 7
+  false-match rate 0.0000   (0)
+  precision        1.0000   (6/6)
+  recall           0.8571   (6/7)
+  auto-match rate  0.8571   (floor is pack data)
+  orphan rate      0.5385   (7)
+  dismissal rate   0.0000   (no site labels)
+```
+
+Those are the numbers for *both* packs, and they are not the ones recorded below
+for 1.1.0 on 2026-07-26: the synthetic corpus has grown since, so matchable went
+6 -> 7 and orphans 8 -> 7 with no pack change at all. The section below is a
+measurement of a corpus that no longer exists, which is worth knowing before
+comparing a future revision against its numbers rather than re-measuring the
+pack it replaces.
+
 ## Baseline measurement for 1.1.0 — 2026-07-26
 
 No pack change. The eval harness the gate depends on now exists, so 1.1.0's
@@ -24,8 +67,9 @@ numbers against the shipped synthetic corpus are recorded here — every later
 revision is measured against these, and a revision with no delta to show against
 them does not ship.
 
-Reproduce with `referral-loop eval --pack-dir healthcare_rag/referral_loop/rules
---synthetic-only`:
+Reproduce with `referral-loop eval --pack-dir src/referral_loop/rules
+--synthetic-only` (repathed and renamed after the extraction; it no longer
+reproduces the numbers below, see 1.2.0):
 
 ```
   cases                13   matchable 6

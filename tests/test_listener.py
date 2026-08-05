@@ -24,6 +24,7 @@ the test states.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import socket
 import subprocess
@@ -173,22 +174,45 @@ def result_naming_no_patient(control_id: str = "CTRL_NO_PID", placer: str = "",
 
 
 def scheduling(control_id: str, message_type: str, mrn: str = MRN,
-               placer: str = "", message_at: str = RESULTED_AT) -> str:
+               placer: str = "", message_at: str = RESULTED_AT,
+               appointment: str = "APPT1") -> str:
+    """An `SIU` naming an appointment in SCH and leaving ORC-3 empty.
+
+    `appointment` is a parameter because it is the field that separates a
+    rebooking from a retransmit once `content_key` reads it: the order numbers
+    are identical across both, which is the shape a scheduling feed actually
+    emits and the one that used to collide.
+    """
     segments = [msh(message_type, control_id, message_at), pid(mrn),
-                segment("SCH", {1: "APPT1", 2: "APPT1"})]
+                segment("SCH", {1: appointment, 2: appointment})]
     if placer:
         segments.append(segment("ORC", {1: "SC", 2: placer}))
     return message(*segments)
 
 
-def rebooking(control_id: str, placer: str, appointment: str, message_at: str) -> str:
-    """An `SIU^S12` for a *new* slot: same order, a new appointment number in ORC-3.
+def scheduling_without_sch(control_id: str, message_type: str, placer: str,
+                           message_at: str = RESULTED_AT) -> str:
+    """The same `SIU` from a scheduling system that sends no `SCH` segment at all.
 
-    `scheduling()` leaves ORC-3 empty, and two of those for one order hash to the
-    same content key, which dedup swallows -- see
-    test_a_rebooking_that_names_no_new_appointment_is_eaten_by_content_dedup. A
-    real rebooking names the new booking, which is both what a scheduling system
-    emits and what makes it a different message rather than a retransmit.
+    Legal, and the case `content_key` has to keep hashing as it always did: an
+    absent segment leaves `appointment_id` empty rather than unavailable, so
+    such a feed is deduped on exactly the tuple it was deduped on before.
+    """
+    return message(
+        msh(message_type, control_id, message_at),
+        pid(),
+        segment("ORC", {1: "SC", 2: placer}),
+    )
+
+
+def rebooking(control_id: str, placer: str, appointment: str, message_at: str) -> str:
+    """An `SIU^S12` for a *new* slot, naming it in both SCH-1 and ORC-3.
+
+    A real rebooking names the new booking in both places, which is what a
+    scheduling system emits. Either one alone now separates it from the original
+    -- `content_key` reads the appointment identifier, and ORC-3 is a filler
+    order number candidate -- so a test that means to exercise the SCH read
+    specifically uses `scheduling(appointment=...)`, which leaves ORC-3 empty.
     """
     return message(
         msh("SIU^S12", control_id, message_at),
@@ -514,6 +538,153 @@ def test_a_message_with_no_identifying_content_is_not_content_deduped(handler):
     """An empty tuple would make every such message a duplicate of the first."""
     bare = parse_hl7_text(message(msh("ORU^R01", "C1"), segment("OBR", {1: "1"})))
     assert content_key(bare, PACK, mrn="") is None
+
+
+# ---------------------------------------------- the appointment in the content key
+
+
+def test_two_bookings_for_one_order_differ_only_in_the_appointment(handler):
+    """The unit behind the rebooking sequence: `SCH` alone separates the keys.
+
+    Both messages carry the same placer, no filler, the same patient and the same
+    ORC-1, because the order has not changed -- only the slot has. The equality on
+    the end is what makes the inequality mean something: without it the builder
+    could be varying anything at all and the test would still be green.
+    """
+    first = parse_hl7_text(scheduling("S1", "SIU^S12", placer=PLACER, appointment="A55"))
+    second = parse_hl7_text(scheduling("S2", "SIU^S12", placer=PLACER, appointment="A78"))
+    again = parse_hl7_text(scheduling("S3", "SIU^S12", placer=PLACER, appointment="A55"))
+
+    assert content_key(first, PACK, mrn=MRN) != content_key(second, PACK, mrn=MRN)
+    assert content_key(first, PACK, mrn=MRN) == content_key(again, PACK, mrn=MRN), (
+        "and a second delivery of the same booking is still one key"
+    )
+
+
+def test_a_message_with_no_sch_keys_on_the_tuple_it_always_keyed_on(handler):
+    """Non-scheduling traffic, and schedulers that send no `SCH`, are undisturbed.
+
+    Two spellings of an absent appointment -- no `SCH` segment at all, and an `SCH`
+    that names no appointment in SCH-1 or SCH-2 -- reach the same key, because
+    `concept_value` returns "" for a field the message does not carry and the widened
+    element is then an empty slot that never fills. An absent *field* is benign in
+    exactly this way; an absent *concept* is not, which is why `field_candidates`
+    raises on one and not the other, and why `tests/_pack.py` maps `appointment_id`
+    rather than the read tolerating its absence.
+
+    The dedup behaviour that follows is asserted end to end by the ORU tests above,
+    which key on a message type that carries no appointment at all.
+    """
+    no_sch = parse_hl7_text(scheduling_without_sch("S1", "SIU^S12", placer=PLACER))
+    # SCH-7 carries the appointment reason and nothing this key reads, and it is here
+    # so the segment survives: `parse_hl7_text` drops a segment with no data fields at
+    # all. Written without it, this test compared a message to itself and was green
+    # against an implementation that keyed the two cases differently on purpose.
+    unnamed_sch = parse_hl7_text(message(
+        msh("SIU^S12", "S2"),
+        pid(),
+        segment("SCH", {7: "ROUTINE"}),
+        segment("ORC", {1: "SC", 2: PLACER}),
+    ))
+    assert "SCH" not in no_sch.segments
+    assert "SCH" in unnamed_sch.segments, "or these are two spellings of one message"
+
+    assert content_key(no_sch, PACK, mrn=MRN) == content_key(unnamed_sch, PACK, mrn=MRN)
+
+
+def test_a_redelivered_booking_under_a_fresh_control_id_is_still_suppressed(handler):
+    """Widening the key must not stop it recognising a genuine retransmit.
+
+    Identical `SCH`, fresh `MSH-10`: the shape an interface engine produces when it
+    re-stamps its outbound queue. `duplicate_control_id_count` staying at zero is the
+    load-bearing assertion -- it is what says the content layer refused this and not
+    the `MSH-10` check one step earlier, which would make the test green against a
+    content key that had stopped working entirely.
+    """
+    handler.handle(order())
+    loop_id = loops(handler)[0].loop_id
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, appointment="A55"))
+
+    handler.handle(scheduling("S1-RETRY", "SIU^S12", placer=PLACER, appointment="A55"))
+
+    assert handler.duplicate_content_key_count == 1
+    assert handler.duplicate_control_id_count == 0, (
+        "a fresh MSH-10, so it was the content key that refused this and not the "
+        "control-id check that runs before it"
+    )
+    assert events_of(handler, loop_id).count("scheduled") == 1, (
+        "and a second `scheduled` is what a swallowed refusal would have written: "
+        "SCHEDULED -> SCHEDULED is legal, so the machine would not have stopped it"
+    )
+
+
+def test_the_current_and_legacy_key_versions_are_different_strings():
+    """What the version tag is for, and the one thing about it a test can hold.
+
+    The tag does not make the two schemes hash differently -- their payloads already
+    do that, so reverting the bump changes no key and breaks no other test. What it
+    buys is that a stored row says which scheme produced it, which is how a spike in
+    `duplicate_content_key_count` after a deploy gets attributed rather than guessed
+    at. Equal tags would take that away silently, and this is what notices.
+    """
+    assert listener_module._CONTENT_KEY_VERSION != listener_module._LEGACY_CONTENT_KEY_VERSION
+
+
+_V1_CONTENT_KEY_VERSION = "rl-content-v1"
+
+
+def _v1_content_key(message_type: str, order_control: str, placer: str, filler: str,
+                    mrn: str, prior: str = "", obx: list | None = None) -> str:
+    """The content key as `rl-content-v1` built it, spelled out rather than imported.
+
+    A pre-deploy row is a historical fact about bytes already in a database.
+    Importing `listener._legacy_content_key` to build one would make this test agree
+    with the implementation by construction, and pass just as happily if the two
+    drifted together -- which is precisely the drift the dual-read cannot survive.
+    """
+    payload = json.dumps(
+        [_V1_CONTENT_KEY_VERSION, message_type, order_control, placer, filler, mrn,
+         prior, obx or []],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_a_v1_row_still_suppresses_a_redelivery_after_the_version_bump(handler):
+    """The migration's whole claim, and the thing a version bump silently gets wrong.
+
+    The version tag is inside the hashed payload, so bumping it moves the key of
+    every message -- including the ones that carry no appointment and had nothing to
+    do with this change. A redelivery under a fresh `MSH-10` of a result applied
+    before the deploy would hash to a `v2` key matching no stored row and be applied
+    a second time: a duplicate `record_result` on a loop a coordinator has already
+    worked. Reads consult both versions; writes only ever land in `v2`.
+
+    The row is written through `record_applied`, which is the same call the listener
+    made before the deploy, so what is on file here is what would really be on file.
+    """
+    handler.handle(order())
+    loop_id = loops(handler)[0].loop_id
+    pre_deploy_key = _v1_content_key(
+        "ORU^R01", "", PLACER, FILLER, MRN,
+        obx=[["71260^CT CHEST^CT", "No acute finding", "F"]],
+    )
+    handler.store.record_applied("ORU_PRE_DEPLOY", pre_deploy_key, "ORU^R01")
+
+    handler.handle(result(control_id="ORU_REDELIVERED"))
+
+    assert content_key(parse_hl7_text(result()), PACK, mrn=MRN) != pre_deploy_key, (
+        "the guard on this test: if the bump had not moved the key there would be "
+        "no migration to prove and the v1 read would be doing no work"
+    )
+    assert handler.duplicate_content_key_count == 1
+    assert handler.duplicate_control_id_count == 0, (
+        "the redelivery carries an MSH-10 nothing has seen, so the control-id check "
+        "cannot be what suppressed it"
+    )
+    assert "resulted" not in events_of(handler, loop_id), "no second transition"
+    assert loops(handler)[0].state is LoopState.OPEN
 
 
 # ------------------------------------------------------------------- dispatch
@@ -893,30 +1064,40 @@ def test_an_s15_then_an_s12_reschedules_through_the_listener(handler):
     assert handler.duplicate_content_key_count == 0
 
 
-def test_a_rebooking_that_names_no_new_appointment_is_eaten_by_content_dedup(handler):
-    """A gap this fix exposes rather than causes, recorded so it is not rediscovered.
+def test_a_rebooking_that_keeps_the_order_numbers_is_not_content_deduped(handler):
+    """The sequence the appointment identifier was added to the content key for.
 
-    `content_key` hashes the message type, ORC-1, the order numbers and the MRN. It does
-    not hash MSH-7 or the SCH appointment identifier, so two `SIU^S12`s for one order
-    that differ only in *which slot* they book are one content key, and the second is a
-    no-op. Before the un-schedule fix that was invisible: the S15 in between drove the
-    loop to CANCELLED, which no S12 could leave anyway. Now the reschedule is legal, and
-    the loop stays `OPEN` -- reading as un-booked while the patient holds an appointment.
+    A specialist's office rebooks: `S12` books A55, `S15` cancels A55, `S12` books A78.
+    `ORC-2` and `ORC-3` identify the *order*, which has not changed, so every field the
+    key used to hash is identical across the first and third messages and the rebooking
+    hashed to a key the original had already spent. It was answered AA, applied to
+    nothing, and the loop finished `OPEN` -- reading as un-booked, ageing on a
+    coordinator's worklist, while the patient held an appointment.
 
-    Asserted rather than fixed, because widening the key means bumping
-    `_CONTENT_KEY_VERSION`, which makes every message in flight look new, and that is a
-    dedup change owed its own before/after rather than a rider on a routing commit.
+    Before the un-schedule fix that was invisible: the S15 in between drove the loop to
+    CANCELLED, which no S12 could leave anyway, so the collision had nothing to be wrong
+    about. Fixing the worse defect downstream is what made this one reachable.
+
+    MSH-7 is still not in the key, deliberately, so it is the `SCH` identifier doing the
+    work here and not the clock: a scheduler re-emitting the same booking a minute later
+    is a retransmit, and a timestamp in the tuple would make dedup a no-op for any
+    sender whose engine re-stamps one.
     """
     handler.handle(order())
-    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, message_at="20260725120000"))
-    handler.handle(scheduling("S2", "SIU^S15", placer=PLACER, message_at="20260725130000"))
+    handler.handle(scheduling("S1", "SIU^S12", placer=PLACER, appointment="A55",
+                              message_at="20260725120000"))
+    handler.handle(scheduling("S2", "SIU^S15", placer=PLACER, appointment="A55",
+                              message_at="20260725130000"))
+    assert loops(handler)[0].state is LoopState.OPEN, "the cancellation un-booked it"
 
-    handler.handle(scheduling("S3", "SIU^S12", placer=PLACER, message_at="20260725140000"))
+    handler.handle(scheduling("S3", "SIU^S12", placer=PLACER, appointment="A78",
+                              message_at="20260725140000"))
 
-    assert loops(handler)[0].state is LoopState.OPEN, (
-        "the rebooking was swallowed; this is the gap, not the intended behaviour"
+    assert loops(handler)[0].state is LoopState.SCHEDULED, (
+        "the rebooking applied; the loop and the patient agree about the appointment"
     )
-    assert handler.duplicate_content_key_count == 1
+    assert handler.duplicate_content_key_count == 0
+    assert events_of(handler, loops(handler)[0].loop_id)[-1] == "scheduled"
 
 
 def test_siu_with_no_order_number_falls_back_to_a_single_open_loop(handler):

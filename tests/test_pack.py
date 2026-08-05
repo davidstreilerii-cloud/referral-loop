@@ -79,16 +79,16 @@ SHIPPED_PACK = Path(__file__).parent.parent / "src" / "referral_loop" / "rules"
 def test_shipped_pack_verifies_against_the_shipped_public_key():
     """A pack that cannot verify is a pack that cannot boot."""
     pack = load_pack(SHIPPED_PACK, bytes.fromhex(os.environ["REFERRAL_PACK_PUBKEY"]))
-    assert pack.version == "1.1.0"
+    assert pack.version == "1.2.0"
     assert pack.confidence_floor == 0.9
 
 
 @pytest.mark.skipif(
     not os.environ.get("REFERRAL_PACK_PUBKEY"), reason="REFERRAL_PACK_PUBKEY not set"
 )
-def test_shipped_pack_is_1_1_0_and_exposes_field_map():
+def test_shipped_pack_is_1_2_0_and_exposes_field_map():
     pack = load_pack(SHIPPED_PACK, bytes.fromhex(os.environ["REFERRAL_PACK_PUBKEY"]))
-    assert pack.version == "1.1.0"
+    assert pack.version == "1.2.0"
     assert pack.field_candidates("placer_order_number") == ("OBR-2", "ORC-2")
     assert pack.field_candidates("filler_order_number") == (
         "OBR-3", "ORC-3", "OBR-18", "OBR-19",
@@ -96,11 +96,48 @@ def test_shipped_pack_is_1_1_0_and_exposes_field_map():
     assert pack.min_auto_match_rate == 0.5
 
 
+def _shipped_body() -> dict:
+    return json.loads((SHIPPED_PACK / "pack.json").read_bytes())
+
+
+def test_the_shipped_body_loads_and_names_the_appointment():
+    """`appointment_id` reaches a constructed pack, in preference order.
+
+    Re-signed here with a throwaway key rather than checked against the shipped
+    signature: that the shipped bytes verify against the shipped key is a
+    property test_boot_gates and test_spec_proofs already hold, and pinning the
+    public key in one more module would widen what a rotation breaks without
+    buying coverage. What this adds is that the real body survives the checks
+    `_load_pack` runs before construction -- SCH has to be in ALLOWED_SEGMENTS
+    for it to, so removing SCH from the parser's read surface fails here rather
+    than at a site's boot.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        tmp_path = Path(d)
+        pubkey = _write_pack(tmp_path, _shipped_body())
+        pack = load_pack(tmp_path, pubkey)
+    assert pack.field_candidates("appointment_id") == ("SCH-1", "SCH-2")
+
+
 def test_shipped_pack_and_signature_both_exist():
     assert (SHIPPED_PACK / "pack.json").is_file()
     assert (SHIPPED_PACK / "pack.sig").is_file(), (
         "load_pack refuses an unsigned pack; shipping pack.json alone cannot boot"
     )
+
+
+def test_the_signing_script_points_at_the_pack_it_signs():
+    """`--sign` is exercised by hand, months apart, and only when a pack changes.
+
+    Its `PACK_DIR` survived the extraction pointing at the pre-extraction layout
+    and `--sign` exited "No pack at ..." for anyone who tried, which nobody did
+    until a pack needed re-signing. Asserting the two paths agree is the cheapest
+    thing that fails on the wrong side of a move rather than at the next release.
+    """
+    from scripts.sign_pack import PACK_DIR
+
+    assert PACK_DIR.resolve() == SHIPPED_PACK.resolve()
+    assert (PACK_DIR / "pack.json").is_file()
 
 
 def test_missing_pack_file_refuses(tmp_path):
