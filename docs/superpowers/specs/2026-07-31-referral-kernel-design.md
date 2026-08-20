@@ -126,21 +126,18 @@ expensive:
 ### 3.1 Repo
 
 - **Name:** `referral-loop`
-- **Visibility:** private. Consistent with the earlier visibility split (`the public surface doc` shares the
-  surface layer while eval and verification harnesses stay internal). The false-match-rate release
-  gate and the rule-pack design are the parts most worth getting right. Reconsider visibility after the
-  demo.
-- **Basis:** extraction and productization of `healthcare_rag/referral_loop/`, not greenfield.
+- **Visibility:** private at extraction time. Reconsider visibility after the demo.
+- **Basis:** extraction and productization of an existing internal package, not greenfield.
 
 ### 3.2 Extraction mechanics
 
-Use `git filter-repo` to extract `healthcare_rag/referral_loop/` and `tests/referral_loop/` with
-full commit history. `git blame` keeps working, the evolution of the 782 tests stays visible, and
-the code's own provenance is auditable — which matters when a hospital security reviewer asks
-where this came from.
+Use `git filter-repo` to extract the source package and its tests with full commit history.
+`git blame` keeps working, the evolution of the 782 tests stays visible, and the code's own
+provenance is auditable — which matters when a hospital security reviewer asks where this came
+from.
 
-The source repo is at `$UPSTREAM_REPO` on branch `feature/referral-loop`. Filter
-from a fresh clone; never run `filter-repo` against the working repo.
+Filter from a fresh clone of the upstream repository; never run `filter-repo` against a working
+repo.
 
 ### 3.3 PHI posture
 
