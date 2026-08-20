@@ -97,6 +97,7 @@ from .events import (
     LoopState,
 )
 from .peers import COORDINATOR, LOCAL, UNATTRIBUTED
+from .phi_files import create_private_file
 
 logger = logging.getLogger(__name__)
 
@@ -859,6 +860,7 @@ class LoopStore:
     def __init__(self, db_path: Path | str):
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        self._make_file_private()
         conn = None
         try:
             conn = self._connect()
@@ -870,6 +872,37 @@ class LoopStore:
         finally:
             if conn is not None:
                 conn.close()
+
+    def _make_file_private(self) -> None:
+        """Put the database on disk owner-only, before sqlite3 can put it there 0644.
+
+        Audit finding M3. `sqlite3.connect()` is lazy -- the file is really
+        created by the first statement, at 0644 under a default umask -- and the
+        driver takes no mode argument, so the file is created here instead:
+        empty, `O_EXCL`, 0600. An empty file is a valid empty SQLite database,
+        so `_connect` opens what is already there and never picks a mode at all,
+        and there is no instant at which a readable file exists. A `chmod` after
+        connecting would leave one; nothing would be in it yet, but the window
+        does not need to exist and closing it is one call either way.
+
+        A file already on disk is tightened rather than created. That is the
+        upgrade path and it is not optional: every database written before this
+        change is 0644 and would stay 0644 for the life of the deployment.
+
+        **Fails closed.** A file whose permissions cannot be set is not one this
+        process will write patient data into. StoreUnavailableError because that
+        is what every other failure in this module answers with, and what the
+        listener turns into AE -- so a misconfigured deployment queues at the
+        interface engine rather than losing messages or, worse, storing them
+        readable.
+        """
+        try:
+            create_private_file(self.db_path)
+        except OSError as exc:
+            raise StoreUnavailableError(
+                f"Cannot create {self.db_path} with owner-only permissions ({exc}); "
+                "refusing to store PHI in a file this process cannot keep private"
+            ) from exc
 
     def _connect(self) -> sqlite3.Connection:
         """Open a connection, or raise StoreUnavailableError. Never a raw sqlite3 error.
@@ -1671,12 +1704,24 @@ class LoopStore:
             # The opposite direction is on file: this message says B retires
             # into A while A is already retired into B. Refuse; see
             # CircularMergeError. Nothing is written, including no event.
+            #
+            # Named by MSH-10 and not by MRN -- audit finding M4, and the same
+            # rule registry.py already applies to the merge-into-itself
+            # warning. Every refusal in this module and in the registry is
+            # caught by `MessageHandler._process` and logged with `%s`, so an
+            # identifier in the message is an identifier in a log file: a
+            # different artifact, with a different audience, and none of the
+            # retention, encryption or purge machinery this database has. The
+            # control id finds the message and the message is in
+            # `raw_messages`, which is where identifiers belong. Filtering at
+            # the log call instead would leave `str(exc)` loaded for the next
+            # caller to print, return or re-raise.
             raise CircularMergeError(
-                f"Refusing ADT^A40 {retired_mrn} -> {surviving_mrn}: {surviving_mrn} already "
-                f"resolves to {target}, so applying this would make the identity cyclic. "
-                "Both claims cannot hold and choosing between them would strand every loop "
-                "on the losing side. The alias table is unmodified and no loop moved; "
-                "registration must correct this and a human must review it."
+                f"Refusing ADT^A40 {established_by}: the surviving identifier it names is "
+                "already retired into the prior one, so applying this would make the "
+                "identity cyclic. Both claims cannot hold and choosing between them would "
+                "strand every loop on the losing side. The alias table is unmodified and no "
+                "loop moved; registration must correct this and a human must review it."
             )
 
         # Compression. Every row already pointing at the source now points past
@@ -1702,8 +1747,8 @@ class LoopStore:
             "SELECT 1 FROM mrn_aliases WHERE retired_mrn = surviving_mrn LIMIT 1"
         ).fetchone():
             raise CircularMergeError(
-                f"Refusing ADT^A40 {retired_mrn} -> {surviving_mrn}: compressing it would "
-                "leave an identifier pointing at itself. Refused whole; a human must review."
+                f"Refusing ADT^A40 {established_by}: compressing it would leave an "
+                "identifier pointing at itself. Refused whole; a human must review."
             )
         return source, target
 
@@ -1727,13 +1772,18 @@ class LoopStore:
         reverse_alias, an explicit administrative act with a named actor, never
         by deletion and never by time passing.
         """
+        # Which endpoint was empty, not what the other one was -- M4. "Empty"
+        # is the whole diagnosis here and the surviving MRN adds nothing to it
+        # that the archived message does not already say.
         if not retired_mrn or not surviving_mrn:
             raise StoreUnavailableError(
-                f"Refusing to record an alias with an empty MRN: "
-                f"retired={retired_mrn!r} surviving={surviving_mrn!r}"
+                f"Refusing to record an alias with an empty MRN (ADT^A40 {established_by}): "
+                f"prior empty={not retired_mrn}, surviving empty={not surviving_mrn}"
             )
         if retired_mrn == surviving_mrn:
-            raise CircularMergeError(f"Refusing to alias MRN {retired_mrn!r} to itself")
+            raise CircularMergeError(
+                f"Refusing ADT^A40 {established_by}: it aliases an MRN to itself"
+            )
 
         with self._lock:
             conn = self._guarded()
@@ -1792,7 +1842,8 @@ class LoopStore:
         surviving = self.resolve_mrn(retired_mrn)
         if surviving == retired_mrn:
             raise ReferralLoopError(
-                f"MRN {retired_mrn} is not retired; there is no merge to reverse"
+                "The MRN named for reversal is not retired; there is no merge to reverse "
+                f"(control id {control_id!r})"
             )
         with self._lock:
             conn = self._guarded()

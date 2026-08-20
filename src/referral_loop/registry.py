@@ -358,9 +358,18 @@ class Registry:
                 # the listener has to answer AE here and AA elsewhere. Still a
                 # ReferralLoopError, so existing callers catching that keep
                 # working.
+                #
+                # The control id and not the MRN, for the reason merge_patient
+                # states thirty lines further down and audit finding M4
+                # records: the listener logs `%s` of this exception, a log
+                # record is one of the artifacts spec test 14 greps, and an
+                # identifier is an identifier whether it arrived on a page or
+                # in a log line. The MSH-10 names the message and the message
+                # is in the raw archive.
                 raise MrnRetiredError(
-                    f"MRN {mrn} was retired between ingest and this write; re-resolve and "
-                    "retry. Storing the loop here would hide it from the surviving patient."
+                    f"The MRN carried by {control_id} was retired between ingest and this "
+                    "write; re-resolve and retry. Storing the loop here would hide it from "
+                    "the surviving patient."
                 )
             self.store.append_event(
                 LoopEvent(
@@ -494,9 +503,15 @@ class Registry:
             # loop is then returned by no patient-scoped query. An empty prior
             # MRN would select every unattributed orphan and sweep them onto a
             # patient at random.
+            # Which endpoint is missing, not what the other one holds. The
+            # rule stated for the merge-into-itself warning below applies here
+            # too and this refusal predated it (M4): `handle` catches it as a
+            # plain ReferralLoopError and logs `%s`, so the surviving MRN went
+            # into a log file every time an interface sent an A40 with an
+            # empty MRG-1.
             raise ReferralLoopError(
-                "A merge needs both a prior and a surviving MRN; "
-                f"got prior={prior_mrn!r} surviving={surviving_mrn!r}"
+                f"ADT^A40 {control_id}: a merge needs both a prior and a surviving MRN "
+                f"(prior empty={not prior_mrn}, surviving empty={not surviving_mrn})"
             )
 
         if prior_mrn == surviving_mrn:

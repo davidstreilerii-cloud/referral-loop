@@ -66,6 +66,7 @@ from .listener import FileDropSource, MessageHandler
 from .mllp_server import make_mllp_server
 from .pack import RulePack, load_pack
 from .peers import PeerRegistry, load_peer_registry
+from .phi_files import create_private_directory
 from .registry import Registry
 from .retention import RAW_DAYS_ENV, RESOLVED_DAYS_ENV, RetentionPolicy
 from .retention import purge as run_purge
@@ -159,18 +160,25 @@ def _prepared_db_path(db_path: Path | str) -> Path:
     a fresh install. Creating it is the app owning its own data directory; the
     encryption gate has already passed by the time this runs, so this cannot
     create a PHI file on a volume that failed attestation.
+
+    Owner-only, at 0700, and every intermediate level too -- audit finding M3.
+    The database file carries its own 0600, so this is the second line rather
+    than the first, but a directory nothing else can traverse is what covers
+    the files SQLite creates for itself inside it. A directory that already
+    exists is left exactly as it is; see `phi_files.create_private_directory`
+    for why this process re-permissions only what it created.
     """
     path = Path(db_path)
     parent = path.parent
     if parent and not parent.exists():
         try:
-            parent.mkdir(parents=True, exist_ok=True)
+            create_private_directory(parent)
         except OSError as exc:
             raise StoreUnavailableError(
                 f"Cannot create the database directory {parent} ({exc}); "
                 "create it and make it writable by this process"
             ) from exc
-        logger.info("Created database directory %s", parent)
+        logger.info("Created database directory %s, readable only by this account", parent)
     return path
 
 

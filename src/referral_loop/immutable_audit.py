@@ -75,6 +75,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from .phi_files import create_private_directory, create_private_file
+
 # The audit database does not live inside the package. A package directory is read-only
 # in a container and may be on a different volume from the one the encryption gate
 # attests; putting PHI-adjacent state there would put it outside the boundary that gate
@@ -328,8 +330,18 @@ def init_audit_db() -> None:
     the widened authorizer has no lifetime beyond `_create_schema` and no other
     connection -- in this thread or any other -- is affected by it. Nothing
     inside the window is caller-supplied: the statements are literals.
+
+    The directory and the file are both created owner-only (audit finding M3).
+    This database is PHI-adjacent rather than PHI -- spec test 14 greps its raw
+    bytes for planted identifiers precisely because a leak into it would be a
+    leak into a file with nothing else protecting it -- and it names loops,
+    actors, roles and times, which is not a list to leave world-readable beside
+    a database that is already 0600.
     """
-    os.makedirs(os.path.dirname(AUDIT_DB), exist_ok=True)
+    directory = os.path.dirname(AUDIT_DB)
+    if directory:
+        create_private_directory(directory)
+    create_private_file(AUDIT_DB)
     with _db_lock:
         conn = _get_connection()
         try:
