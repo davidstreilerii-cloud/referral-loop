@@ -409,8 +409,20 @@ anyway, and the first thing any handler would do is convert it back into a `Proo
 
 **The assertion JWT and the bearer token are redacted at the logging boundary, not at the call
 sites.** A call site that forgets is the entire failure mode, and there will eventually be a call
-site that forgets. All logging routes through the existing scrubber per parent spec §11.5, which
-already strips PHI and escapes CR/LF.
+site that forgets.
+
+⚠ **Correction (2026-08-20).** An earlier revision of this section claimed "all logging routes
+through the existing scrubber per parent spec §11.5, which already strips PHI and escapes CR/LF."
+**That control does not exist in this codebase.** `cli.py` calls plain `logging.basicConfig` with no
+filter attached, and there is no `logging.Filter` anywhere in `src/`. §11.5 of the parent spec is
+design intent that was never implemented here, and this section inherited it as though it had been.
+
+The boundary-redaction design above is therefore aspirational, not implemented. What *is* implemented
+is the M4 fix (`729ffb6`): PHI is kept out of the exceptions that reach log records in the first
+place, at the raise sites. That is narrower than a scrubber — it covers the enumerated refusal paths
+rather than every call site — and the reasoning is deliberate: a scrubber post-filters a record that
+already contains PHI and has to know every identifier format to work. Treat any future logging call
+site as unprotected by default.
 
 ## 8. Testing
 

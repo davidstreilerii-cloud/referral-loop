@@ -33,7 +33,8 @@ actual situation disagree, and no operator is told.
 The gap is narrower than "reschedules are broken". A rebooking that mints a new filler
 order number is already distinguished, because `filler_order_number` is in the key. This
 is specifically the case where the order numbers are stable and only the slot moves --
-which, per HL7 v2 scheduling practice, is the common one.
+which HL7 v2 scheduling practice suggests is the common one. This is an assumption about
+realistic `SIU` traffic, not a measurement -- no production feed has been observed.
 
 Pinned green today by `test_a_rebooking_that_names_no_new_appointment_is_eaten_by_content_dedup`,
 which records the gap rather than endorsing it. That test inverts as part of this work.

@@ -82,7 +82,7 @@ def test_a_missing_auth_field_refuses(key):
         _registry(_profile(auth=auth))
 
 
-@pytest.mark.parametrize("bad", ["EXAMPLE-MED", "-ku", "ku med", "k" * 65, "", "ku/med"])
+@pytest.mark.parametrize("bad", ["EXAMPLE-MED", "-ex", "ex med", "e" * 65, "", "ex/med"])
 def test_a_malformed_connector_id_refuses(bad):
     """The id lands in audit rows and log lines, so it is constrained once here rather than
     sanitized at each site -- the same argument peers.py makes for a peer id."""

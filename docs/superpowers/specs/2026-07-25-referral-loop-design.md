@@ -26,12 +26,12 @@ A state machine with a risk overlay. v1 builds the state machine. Risk scoring i
 | Ingress | HL7 v2 from the hospital's interface engine | `REF`/`ORU`/`SIU` already flow through Mirth/Rhapsody/Cloverleaf. No vendor approval, no marketplace listing |
 | v1 scope | Loop tracking + results matching | Fully deterministic. Fastest to something installable, easiest security review |
 | User surface | Local Flask worklist for coordinators | Referral coordinators live in queues; a dedicated one fits their day. Clinicians would reject a second screen — coordinators do not |
-| IP protection | Rules-as-data, signed and versioned | On-prem means shipping source. Keeping matching rules as a signed, separately-versioned artifact lets a rule change ship and be audited without a code release |
+| Rule distribution | Rules-as-data, signed and versioned | On-prem means shipping source. Keeping matching rules as a signed, separately-versioned artifact lets a rule change ship and be audited without a code release |
 | Structure | Separate deployable, shared primitives | Reuses tested PHI-handling machinery without dragging unrelated components into this deployment's security review |
 
 **Explicitly not integrating with Epic In Basket.** It is the hardest possible ingress and Epic-mediated. The messages that populate the inbox already flow through the interface engine; consuming that feed gives the same information without the dependency.
 
-**This is a different regulatory stage** than software that never touches PHI. This product holds patient data by design. It belongs to the SOC 2 → HITRUST → BAA path, not the pre-SOC-2 path.
+**This system holds patient data by design**, which places it in a different compliance posture than software that never touches PHI. The relevant path is SOC 2 → HITRUST → BAA, and that requirement shapes several decisions below — notably the on-prem deployment model and the decision to persist raw messages under an explicit retention policy rather than treat them as transient.
 
 **Risk scoring (v2) may be regulated CDS.** The 21st Century Cures Act exemption requires a clinician be able to independently review the basis for a recommendation. The citation-and-confidence architecture satisfies that, but it must be designed in when risk scoring is specced — not retrofitted.
 

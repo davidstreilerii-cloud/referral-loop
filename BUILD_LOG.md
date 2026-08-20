@@ -31,3 +31,19 @@ under the measured value as platform margin rather than slack. `encryption_check
 per-platform OS-detection branches, so a Linux runner covers a different subset than win32. A CI
 figure between 90 and 95 is that difference, not a regression — check which lines moved before
 adjusting the floor.
+
+## 2026-08-20 — pre-publication pass
+
+Suite after the M3/M4 fixes:
+
+```
+1815 passed, 5 skipped, 11 deselected in 795.91s (0:13:15)
+Required test coverage of 90.0% reached. Total coverage: 95.55%
+```
+
+- Closed audit findings M3 (owner-only PHI files) and M4 (MRNs out of logs), `729ffb6`.
+- Corrected a false claim that logging routes through a PHI scrubber. No such control exists
+  in this codebase; the M4 fix keeps PHI out of the records instead.
+- Renamed the connector worked-example from a real named health system to `example-med`.
+- Added Apache-2.0 LICENSE; hiring-facing README and `docs/security-model.md` are the landing
+  docs, with the previous technical README preserved as `README-technical.md`.

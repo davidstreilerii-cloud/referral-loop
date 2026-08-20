@@ -86,9 +86,10 @@ These are errors in the source spec that this design corrects. They should be fi
    classification, no handling of multi-page mixed-patient faxes.
 7. **§10 "No PHI at rest anywhere in the default deployment path" is unachievable for this
    product** and contradicts `store.py`'s `raw_messages` table. Resolved in §3.3.
-8. **Missing ROI anchor.** "Closing the Referral Loop: Receipt of Specialist Report" was a MIPS
-   quality measure (ID 374). Verify its current status; aligning to a recognized measure is a stronger
-   basis for comparison than an internal count.
+8. **No external quality-measure alignment.** "Closing the Referral Loop: Receipt of Specialist
+   Report" was a MIPS quality measure (ID 374). Verify its current status; aligning the system's
+   own metric definitions to a recognized measure makes results comparable across sites rather
+   than only internally meaningful.
 9. **Da Vinci timing understated.** CMS-0057-F requires impacted payers to expose FHIR Prior
    Authorization APIs by 2027-01-01. This does not change the H-over-G anchor decision but is
    relevant to backlog sequencing.
@@ -126,7 +127,7 @@ expensive:
 ### 3.1 Repo
 
 - **Name:** `referral-loop`
-- **Visibility:** private at extraction time. Reconsider visibility after the demo.
+- **Visibility:** private at extraction time; published subsequently.
 - **Basis:** extraction and productization of an existing internal package, not greenfield.
 
 ### 3.2 Extraction mechanics
@@ -920,12 +921,29 @@ HL7. Any local account reads every patient's identifiers and results. Volume enc
 newly load-bearing given §3.3's decision to persist PHI. *Fix:* `chmod 0600` on files, `0700` on
 directories, plus a boot gate symmetric with the existing three.
 
+*Closed — `729ffb6`.* Implemented without the boot gate. `sqlite3.connect()` cannot be handed a
+mode, so `phi_files.create_private_file` pre-creates through `os.open` with `O_CREAT | O_EXCL` at
+`0600` and SQLite opens what is already there — an empty file is a valid empty database, and
+`O_EXCL` means there is no instant at which a readable one exists. Opening also tightens a `0644`
+database an earlier build left behind, which is the self-healing case a boot gate would otherwise
+have to make an operator satisfy. Directories are created `0700` a level at a time; `os.makedirs`
+applies `mode` only to the leaf. Verified on Linux that the rollback journal (`journal_mode=delete`)
+inherits `0600` and does hold the identifier.
+
 **M4 — MRNs reach application logs through four exception paths.** `listener.py:336,409,424,428`
 log `%s` of exceptions whose messages interpolate MRNs (`CircularMergeError`, `MrnRetiredError`,
 `ReferralLoopError`, `StoreUnavailableError`). Triggered by ordinary wire traffic — two `ADT^A40`
 messages forming a merge cycle, which registration interfaces really do produce. `registry.py:456`
 applies the correct rule ("the control id and not the MRN") two lines below one of the leaks. The
 covering test passes vacuously because it uses a non-sentinel MRN.
+
+*Closed — `729ffb6`.* Fixed at the raise sites, not the log sites: the identifier never enters the
+exception, so there is no record to filter. Control id, message type and a discriminating keyword
+survive, and the tests assert they do — a refusal that logs nothing useful trades one defect for
+another. `test_phi_in_logs.py` sweeps the refusal sites with a sentinel MRN the way `test_machine.py`
+already sweeps `TransitionRejected`, which is what makes the vacuous-test failure above
+non-repeatable. Two of the three end-to-end paths need no monkeypatching: an `ADT^A40` with an empty
+`MRG-1` is ordinary wire traffic and leaked on every occurrence.
 
 **M5 — Bare LF is treated as a segment terminator.** `parse_hl7.py:85` normalizes `\n` → `\r`.
 HL7 v2 terminates on CR only, so a newline inside narrative OBX-5 text — extremely common in real
@@ -979,6 +997,8 @@ they carry through `git filter-repo` with history. Fifteen commits, `015e43f`..`
 | H5 DNS rebinding + CSRF | `95c35a7`, `54bd493` | Closed |
 | H6 archive + connection DoS | `55ad80c`, `78f1c3d` | Closed |
 | H7 AE-wedge | `55ad80c` | Closed |
+| M3 world-readable PHI files | `729ffb6` | Closed |
+| M4 MRNs in application logs | `729ffb6` | Closed |
 
 The last of these was the TLS handshake running in `MLLPServer.get_request` — on socketserver's
 single-threaded accept loop, *before* `verify_request`. One TCP connection sending zero bytes
@@ -1107,6 +1127,6 @@ Da Vinci / X12 · TEFCA query exchange · fax and OCR ingest.
    projection rather than leaving aged-out referrals `in-progress`.
 2. **Epic's current supported CDS Hooks list** — verify before slice 4 whether any hook can carry
    the note-quality service.
-3. **MIPS measure 374 status** — confirm current status before using it as the ROI anchor.
+3. **MIPS measure 374 status** — confirm current status before aligning metric definitions to it.
 4. **Retention default** — the existing module requires retention be configured and never
    defaulted. Confirm that stays true given PHI is now explicitly persisted.
