@@ -496,6 +496,24 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
         if registry.requires_tls:
             certificate = self.request.getpeercert(binary_form=True)
             peer = registry.resolve_certificate(certificate)
+            if peer is not None and not registry.address_permitted(peer.peer_id, address):
+                # A second condition on an identification the certificate has
+                # already made, and the only place it can be applied: under mTLS
+                # nothing knows which peer this is until the handshake has
+                # finished, so unlike the plaintext allowlist -- enforced in
+                # `verify_request`, before a slot is spent -- this one costs a
+                # connection slot and a handshake before it can refuse. That is
+                # the right trade: the alternative is not enforcing it, and a
+                # site that pins a certificate to a host has said something
+                # about a stolen key that we would otherwise ignore.
+                logger.error(
+                    "Closing a connection from %s: it presented %s's pinned certificate, but "
+                    "that peer's registry entry allows only its declared source addresses. "
+                    "Alert: either the certificate is in use somewhere it was not issued for, "
+                    "or the peer has moved and the registry has not. Nothing was read and "
+                    "nothing was acknowledged.", address, peer.peer_id,
+                )
+                return None
         else:
             peer = registry.resolve_address(address)
         if peer is None:

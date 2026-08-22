@@ -16,6 +16,13 @@ from datetime import datetime, timezone
 
 from .errors import FramingError
 
+# One bound on MSH-10, read rather than restated. parse_hl7 applies it at the
+# two places a control id is read out of a message; this module applies the same
+# number to whatever a caller hands it, so an ACK and an archive key can never
+# be cut at different lengths. See parse_hl7.MAX_CONTROL_ID for why the bound
+# belongs at the read and not only here.
+from .parse_hl7 import MAX_CONTROL_ID as _MAX_CONTROL_ID
+
 VT = b"\x0b"   # start block
 FS = b"\x1c"   # end block
 CR = b"\x0d"   # carriage return
@@ -23,7 +30,6 @@ CR = b"\x0d"   # carriage return
 # MSH-10 is at most 20 characters and carries no delimiters. Anything else is
 # either a malformed sender or an injection attempt.
 _SAFE_CONTROL_ID = re.compile(r"[^A-Za-z0-9._-]")
-_MAX_CONTROL_ID = 20
 
 
 def frame(message: str) -> bytes:

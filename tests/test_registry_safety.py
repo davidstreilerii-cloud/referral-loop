@@ -4,7 +4,10 @@ The first six tests are the plan's specified set. Everything after
 SPEC TESTS END is an adversarial probe: each one exists because a plausible
 sequence of real messages reaches an unsafe state without it.
 """
+import inspect
 import itertools
+import logging
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +15,7 @@ import pytest
 
 from referral_loop.core.states import ReferralState
 from referral_loop.errors import (
+    CircularMergeError,
     LoopNotFoundError,
     ReferralLoopError,
     ReservedStateError,
@@ -736,8 +740,41 @@ def test_a_log_containing_a_closed_event_refuses_to_replay(tmp_path):
         LoopStore(db).replay("L1")
 
 
+_MERGE_SUFFIX = "-S"
+
+
+def _merge(reg, lid):
+    """ADT^A40 on whatever MRN the loop currently carries.
+
+    Reads the MRN back off the loop rather than closing over the seed value so that a
+    second merge in the same sequence merges the surviving record onward instead of
+    re-merging a retired identifier -- the sequence merge->merge is then two real merges,
+    which is the case worth sweeping.
+    """
+    mrn = reg.get(lid).mrn
+    reg.merge_patient(
+        prior_mrn=mrn, surviving_mrn=mrn + _MERGE_SUFFIX, control_id="X"
+    )
+
+
+def _reverse_merge(reg, lid):
+    """The administrative undo of the above.
+
+    When no merge preceded it there is no alias to reverse and the registry refuses,
+    which the sweep catches and keeps going -- refusals are what it is sweeping over.
+    """
+    mrn = reg.get(lid).mrn
+    retired = mrn[: -len(_MERGE_SUFFIX)] if mrn.endswith(_MERGE_SUFFIX) else mrn
+    reg.reverse_merge(
+        retired_mrn=retired, actor="a", role="r", reason="w", control_id="X"
+    )
+
+
 _OPS = [
     ("schedule", lambda reg, lid: reg.schedule(lid, control_id="X")),
+    # SIU^S15. Added to the sweep late, and only after the completeness test below caught
+    # its absence -- which is the whole argument for having that test.
+    ("unschedule", lambda reg, lid: reg.unschedule(lid, control_id="X")),
     ("cancel", lambda reg, lid: reg.cancel(lid, control_id="X")),
     ("result:P", lambda reg, lid: reg.record_result(lid, obx11="P", control_id="X")),
     ("result:F", lambda reg, lid: reg.record_result(lid, obx11="F", control_id="X")),
@@ -755,26 +792,102 @@ _OPS = [
     # succeeds, and a refusal that left state half-applied is exactly the kind of
     # path a hand-written test does not think to try.
     ("attach_self", lambda reg, lid: reg.attach_orphan(lid, lid, actor="a", role="r")),
+    # The two identity operations. They are addressed by MRN rather than loop id, but they
+    # move the loop under test and are as public and as mutating as anything above -- and
+    # "state never changes across a merge" is precisely the kind of claim that deserves a
+    # sweep rather than the say-so of the merge tests.
+    ("merge", _merge),
+    ("reverse_merge", _reverse_merge),
 ]
+
+# Public Registry methods the sweep deliberately does not drive, and why. This is not an
+# allowlist of things to get round to -- it is the docstring's "does not cover" clause in
+# executable form, and the completeness test below is what stops a new mutator being added
+# to Registry without somebody deciding, on the record, which of these two lists it joins.
+_NOT_SWEPT = {
+    "get": "read-only; returns a Loop and appends nothing",
+    "open_loop": (
+        "creates a new loop rather than transitioning the one under test -- it is the "
+        "sweep's own seed, and calling it mid-sequence would only add an unrelated loop "
+        "to the store whose state no assertion here reads"
+    ),
+    "orphan": "the sweep's other seed, for the same reason",
+}
+
+
+def _methods_the_sweep_invokes() -> set[str]:
+    """The Registry methods `_OPS` actually calls, read out of the lambdas themselves.
+
+    Derived rather than listed alongside `_OPS`: a hand-maintained companion list is
+    exactly the thing that drifts, and a completeness test that consults a stale list
+    reports the coverage somebody intended instead of the coverage there is.
+    """
+    invoked: set[str] = set()
+    for _name, call in _OPS:
+        invoked.update(re.findall(r"\breg\.([A-Za-z_]+)\(", inspect.getsource(call)))
+    return invoked
+
+
+def test_the_sweep_drives_every_public_mutating_registry_method():
+    """The sweep's claim is "every public mutating call". That is a claim about
+    `Registry`'s surface, so it has to be checked against `Registry`'s surface -- when
+    `unschedule` was added for SIU^S15 it was not added here, and the sweep went on
+    advertising a completeness it no longer had. Nothing in the suite noticed.
+
+    A new mutator now has exactly two ways to land: in `_OPS`, or in `_NOT_SWEPT` with a
+    reason. Silently narrowing the claim is no longer one of them.
+    """
+    public = {
+        name
+        for name, member in inspect.getmembers(Registry, callable)
+        if not name.startswith("_")
+    }
+    uncovered = public - _methods_the_sweep_invokes() - set(_NOT_SWEPT)
+    assert not uncovered, (
+        f"these public Registry methods are neither swept nor listed in _NOT_SWEPT with a "
+        f"reason: {sorted(uncovered)}"
+    )
+    # And the exclusion list cannot outlive the method it excuses.
+    assert not set(_NOT_SWEPT) - public, (
+        f"_NOT_SWEPT names methods Registry no longer has: {sorted(set(_NOT_SWEPT) - public)}"
+    )
 
 
 @pytest.mark.parametrize("seed_orphan", [False, True])
 def test_closed_is_unreachable_by_any_sequence_of_coordinator_actions(registry, seed_orphan):
     """Spec test 5. Every sequence of every public mutating call, to depth 3,
-    from both a real loop and an orphan -- 1110 sequences each. No message, no
+    from both a real loop and an orphan -- 2379 sequences each. No message, no
     coordinator action and no replay path reaches CLOSED.
 
     A sweep rather than a hand-picked path: CLOSED being unreachable is a claim
     about paths nobody thought of, which is exactly what a hand-written test
     cannot cover.
+
+    Precisely what "every public mutating call" covers, so that the claim can be
+    checked rather than trusted: every public method of `Registry` except `get`,
+    which is read-only, and `open_loop`/`orphan`, which seed the sweep instead of
+    transitioning the loop under test. `_NOT_SWEPT` records those exclusions and
+    `test_the_sweep_drives_every_public_mutating_registry_method` fails the build
+    if a mutator is added to `Registry` and to neither list.
+
+    What it does not cover: interleavings across two loops, concurrency (spec test
+    on the lock covers that separately), and calls with argument values other than
+    the ones bound in `_OPS` -- `merge` merges onto a fresh surviving MRN derived
+    from the loop's own, so a merge between two independently seeded patients is
+    outside this sweep and is tested by the merge tests directly.
+
+    Each sequence gets its own MRN. Sharing one across all of them would make each
+    `merge` carry every loop the sweep had created so far, turning a linear sweep
+    quadratic for no added coverage.
     """
     checked = 0
     for length in (1, 2, 3):
         for combo in itertools.product(_OPS, repeat=length):
+            mrn = f"MRN{checked}"
             if seed_orphan:
-                loop_id = registry.orphan(control_id="C0", mrn="MRN1", detail={"obx11": "F"})
+                loop_id = registry.orphan(control_id="C0", mrn=mrn, detail={"obx11": "F"})
             else:
-                loop_id = registry.open_loop(mrn="MRN1", control_id="C0", message_at=T0)
+                loop_id = registry.open_loop(mrn=mrn, control_id="C0", message_at=T0)
             for _name, call in combo:
                 try:
                     call(registry, loop_id)
@@ -784,7 +897,7 @@ def test_closed_is_unreachable_by_any_sequence_of_coordinator_actions(registry, 
                 assert state is not LoopState.CLOSED, f"reached CLOSED via {combo}"
             checked += 1
     ops = len(_OPS)
-    assert checked == ops + ops**2 + ops**3 == 1110
+    assert checked == ops + ops**2 + ops**3 == 2379
 
 
 # --------------------------------- spec test 6: acknowledgement is reversible
@@ -1363,3 +1476,70 @@ def test_a_clinically_older_unschedule_is_still_refused(registry):
         registry.unschedule(loop_id, control_id="U-S15", message_at=T1)
 
     assert registry.get(loop_id).state is LoopState.SCHEDULED
+
+
+# ------------------------------- MSH-10 on its way into an operator's log line
+
+# parse_hl7's `_SEGMENT` is `[^\r\n]+`, so a control id cannot carry a CR and
+# this is not log-line forgery. Everything else gets through: an ANSI erase-
+# display, a NUL, a right-to-left override that reverses the rest of the line in
+# the terminal reading it. `parse_hl7.py:229` already wrote the rule for exactly
+# this value -- "!r, not str: this is unvalidated sender bytes on its way into an
+# operator's log line" -- and `listener.py` follows it at every site. The merge
+# paths in `registry.py` and `store.py` did not.
+_HOSTILE_CONTROL_ID = "A40\x1b[2J\x00‮GNIDLOH"
+
+
+def _hostile_bytes_are_escaped(text: str) -> bool:
+    """repr() renders these as backslash sequences, so none survives literally."""
+    return not any(ch in text for ch in ("\x1b", "\x00", "‮"))
+
+
+def test_a_merge_into_itself_logs_the_control_id_repred(registry, caplog):
+    """Site one of four. An MRN merged into itself is the case most likely to be
+    a field-map error, so it is the one an operator actually reads."""
+    caplog.set_level(logging.INFO)
+    registry.merge_patient("MRNA", "MRNA", control_id=_HOSTILE_CONTROL_ID)
+    assert caplog.records, "nothing was logged at all"
+    assert _hostile_bytes_are_escaped(caplog.text), caplog.text
+    assert "A40" in caplog.text, "the control id must still be identifiable"
+
+
+def test_an_unknown_surviving_mrn_logs_the_control_id_repred(registry, caplog):
+    """Sites three and four: the surviving-MRN notice and the closing count."""
+    caplog.set_level(logging.INFO)
+    registry.merge_patient("MRNA", "MRNB", control_id=_HOSTILE_CONTROL_ID)
+    assert caplog.records
+    assert _hostile_bytes_are_escaped(caplog.text), caplog.text
+
+
+def test_a_repeated_a40_logs_the_control_id_repred(registry, caplog):
+    """Site two: the same A40 delivered twice, which an interface engine does
+    after a timeout -- so this line is drawn by ordinary traffic, not only by an
+    attacker's."""
+    registry.merge_patient("MRNA", "MRNB", control_id="A40-FIRST")
+    caplog.set_level(logging.INFO)
+    registry.merge_patient("MRNA", "MRNB", control_id=_HOSTILE_CONTROL_ID)
+    assert "already retired" in caplog.text
+    assert _hostile_bytes_are_escaped(caplog.text), caplog.text
+
+
+def test_an_empty_mrg_refusal_does_not_carry_raw_sender_bytes(registry):
+    """The exception text, not a log call -- but `MessageHandler._process`
+    catches this and logs `%s`, so the two are the same artifact one frame
+    apart."""
+    with pytest.raises(ReferralLoopError) as caught:
+        registry.merge_patient("", "MRNB", control_id=_HOSTILE_CONTROL_ID)
+    assert _hostile_bytes_are_escaped(str(caught.value)), str(caught.value)
+    assert "A40" in str(caught.value)
+
+
+def test_a_circular_merge_refusal_does_not_carry_raw_sender_bytes(registry):
+    """`store.py`'s CircularMergeError interpolates `established_by`, which is
+    the control id of the A40 being refused -- and a refusal is precisely the
+    message an operator is going to read."""
+    registry.merge_patient("MRNA", "MRNB", control_id="A40-FIRST")
+    with pytest.raises(CircularMergeError) as caught:
+        registry.merge_patient("MRNB", "MRNA", control_id=_HOSTILE_CONTROL_ID)
+    assert _hostile_bytes_are_escaped(str(caught.value)), str(caught.value)
+    assert "A40" in str(caught.value)

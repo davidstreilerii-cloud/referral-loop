@@ -867,3 +867,65 @@ def test_the_redirect_survives_a_test_calling_monkeypatch_undo(registry, monkeyp
 
     registry.merge_patient("ZZA", "ZZB", control_id="A40-1")
     assert len(_rows(AuditAction.PATIENT_MERGED)) == 1
+
+
+# ------------------------------------------- interrupts are not audit failures
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit],
+                         ids=["ctrl-c", "sys.exit"])
+def test_an_interrupt_landing_in_an_audit_write_is_re_raised_not_absorbed(
+    monkeypatch, interrupt
+):
+    """`_emit` fails open, and that decision is about *the audit failing*.
+
+    Ctrl-C is not the audit failing. A `BaseException` catch with no re-raise
+    absorbs it, so an operator interrupting a purge at 3am gets "audit write
+    dropped" in the log and a process that carries on -- and the same hold for
+    `SystemExit`, which would turn a shutdown into a no-op. `store.py`'s
+    transition writer re-raises both, and so does `audited` one function below;
+    this is the one place that did not.
+    """
+    before = audit.write_failures()
+
+    def interrupted(_event):
+        raise interrupt()
+
+    monkeypatch.setattr(audit._module(), "log_guardrail_event", interrupted)
+
+    with pytest.raises(interrupt):
+        audit._emit(
+            AuditAction.ACKNOWLEDGED,
+            audit.Outcome.SUCCESS,
+            loop_id="L-0123456789ab",
+            actor="a",
+            role="r",
+            reason_required=False,
+            scope=AuditScope(),
+        )
+
+    assert audit.write_failures() == before, (
+        "an interrupt was counted as a dropped audit write"
+    )
+
+
+def test_an_ordinary_error_still_fails_open_after_the_interrupt_narrowing(monkeypatch):
+    """The control case for the test above. Narrowing the catch must not turn an
+    unwritable audit database into something that blocks a coordinator."""
+    before = audit.write_failures()
+
+    def explode(_event):
+        raise OSError("audit volume is full")
+
+    monkeypatch.setattr(audit._module(), "log_guardrail_event", explode)
+
+    landed = audit._emit(
+        AuditAction.ACKNOWLEDGED,
+        audit.Outcome.SUCCESS,
+        loop_id="L-0123456789ab",
+        actor="a",
+        role="r",
+        reason_required=False,
+        scope=AuditScope(),
+    )
+    assert landed is False
+    assert audit.write_failures() == before + 1

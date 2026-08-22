@@ -43,11 +43,37 @@ class ConnectorCannotResolvePatients(ReferralLoopError):
     """
 
 
-class PatientNotFoundAtConnector(ReferralLoopError):
+class _PatientResolutionRefused(ReferralLoopError):
+    """Shared shape for the two answers that are neither a patient nor a fault.
+
+    **The MRN is an attribute, never part of the message.** `FhirRequestFailed` below
+    states the rule for the whole module and these two are the reason it needs restating
+    here: `str(exc)` on a `ReferralLoopError` is what every caller in this package logs --
+    `registry.py`, `store.py` and `MessageHandler._process` all do it with `%s` -- so an
+    identifier interpolated into the message is an identifier in a log file the first time
+    anybody wires this module up. Nothing in `src/` calls it yet, which makes this a
+    landmine rather than a leak, and a landmine is the thing to remove before publication
+    rather than after the first caller.
+
+    Carried on the object because a caller resolving identity across two sites genuinely
+    may need to know *which* identifier missed. The point of the move is that reaching for
+    it is now a deliberate act at a call site that can decide where it goes, instead of the
+    default consequence of logging the exception.
+    """
+
+    def __init__(self, message: str, *, connector_id: str = "", mrn: str = ""):
+        super().__init__(message)
+        self.connector_id = connector_id
+        # Not in `args`, so `repr(exc)` does not carry it either -- a traceback is
+        # an artifact too, and tracebacks render `args`.
+        self.mrn = mrn
+
+
+class PatientNotFoundAtConnector(_PatientResolutionRefused):
     """The identifier matched nobody here. Not the same as having no documents."""
 
 
-class PatientAmbiguousAtConnector(ReferralLoopError):
+class PatientAmbiguousAtConnector(_PatientResolutionRefused):
     """The identifier matched more than one patient. Refused rather than resolved.
 
     Picking one is how another patient's consult note gets attached to this referral. Choosing
@@ -168,19 +194,27 @@ def resolve_patient(
     cache: TokenCache | None = None,
 ) -> str:
     """Hop 1. Returns the remote's Patient id, or raises -- never returns nothing."""
-    system = profile.mrn_system
     url = patient_search_url(profile, mrn)  # raises ConnectorCannotResolvePatients if undeclared
     found = _entries(_authorized_get(registry, profile, url, cache=cache or TokenCache()), url)
 
+    # The connector and the candidate count, and nothing that identifies the patient. Both
+    # numbers are what an operator acts on -- which remote answered, and whether the answer
+    # was "nobody" or "several" -- and the MRN adds nothing to either decision while adding
+    # a patient identifier to every log line that renders this. See
+    # `_PatientResolutionRefused`: it rides on the exception instead.
     if not found:
         raise PatientNotFoundAtConnector(
-            f"{profile.connector_id} does not know patient {mrn} in {system}. This is not the "
-            "same as having no documents for them."
+            f"{profile.connector_id} does not know the patient this referral names. This is "
+            "not the same as having no documents for them.",
+            connector_id=profile.connector_id,
+            mrn=mrn,
         )
     if len(found) > 1:
         raise PatientAmbiguousAtConnector(
-            f"{profile.connector_id} matched {len(found)} patients for {mrn} in {system}; "
-            "refusing to choose between them"
+            f"{profile.connector_id} matched {len(found)} patients for one identifier; "
+            "refusing to choose between them",
+            connector_id=profile.connector_id,
+            mrn=mrn,
         )
 
     patient_id = found[0].get("id")

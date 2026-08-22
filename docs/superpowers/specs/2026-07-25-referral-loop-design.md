@@ -4,11 +4,25 @@
 **Status:** Approved for planning
 **Scope:** v1 — deterministic referral/order loop tracking and results matching, on-premise, no PHI egress, no model calls.
 
+> **Read this against the monorepo, not against this repository.** This spec was written while the
+> subsystem lived inside `healthcare_rag/`, and every path it names is a pre-extraction path. Where
+> it says `guardrails/immutable_audit.py` and `encryption_check.py`, this repository has
+> `src/referral_loop/immutable_audit.py` and `src/referral_loop/encryption_check.py` — both vendored
+> during the extraction, which is what severed the last two couplings to the parent. Where it names
+> `guardrails/phi_redactor.py`, `guardrails/step_up_auth.py`, `guardrails/tenant_isolation.py`,
+> `db.py`, `audit_trail.py`, `api.py`, `Dockerfile.referral`, or Revenue Integrity, **those files do
+> not exist here and never will** — they are parent-repo modules, and the arguments below for *not*
+> importing most of them are why. The extraction is written up in
+> `docs/superpowers/plans/2026-08-01-referral-loop-extraction.md`; the same caveat applies to
+> `docs/superpowers/plans/2026-07-25-referral-loop.md`, which is this spec's implementation plan.
+> Kept as written: rewriting a design document's paths after the fact would make it a worse record
+> of the decision than it is a map of the tree.
+
 ---
 
 ## 1. Problem
 
-A patient is referred or an order is placed, and nobody confirms they were seen or that the result came back. Failure to follow up on test results is a leading source of malpractice claims, and Joint Commission carries a National Patient Safety Goal on communicating critical results.
+A patient is referred or an order is placed, and nobody confirms they were seen or that the result came back. Failure to follow up on test results is a leading source of malpractice claims, and the Joint Commission carries an accreditation goal on communicating critical results. *(Naming it correctly as of 2026: effective 2026-01-01 the Joint Commission renamed the chapter from National Patient Safety Goals to **National Performance Goals** and renumbered this requirement to **NPG.01.02.01** for the Hospital and Critical Access Hospital programs. It remains **NPSG.02.03.01** in the Laboratory program. This spec was written under the old numbering; both citations are given because a reader checking one program's manual will not find the other's number in it.)*
 
 Three capabilities were requested — track referral updates, auto-map arriving imaging results, identify high-risk care gaps. They are **one pipeline, not three subsystems**:
 

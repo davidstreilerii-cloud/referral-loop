@@ -56,8 +56,8 @@ decision:
   },
   "peers": [
     {
-      "peer_id": "example-ris",
-      "organization": "Example Radiology",
+      "peer_id": "example-radiology",
+      "organization": "Example Radiology Group",
       "certificate_sha256": ["<sha256 of the client cert's DER encoding>"],
       "sending_application": "EHR",
       "sending_facility": "HOSP",
@@ -124,6 +124,17 @@ valid.
 file gets committed and pasted into tickets; the signing key is the whole proof of our
 identity to the remote.
 
+The `scopes` above are written in **SMART v1** syntax. SMART App Launch v2.2.0 replaced
+`.read` / `.write` with granular `.cruds` letters, so the v2 spelling of that line is
+`["system/Patient.rs", "system/DocumentReference.rs"]`. v1 syntax remains widely accepted,
+so the example is left in the form most deployed servers are registered for — but it is the
+remote, not this software, that decides. `scopes` is joined verbatim into the token
+request's `scope` parameter and is never rewritten here, deliberately: a client that
+"helpfully" translated a scope would be choosing what to ask for on the site's behalf. If a
+remote refuses the grant, the v2 spelling is the first thing to try. `connectors` preflight reports a scope
+refusal as a failed credential proof rather than a reachability failure, which is the
+distinction that makes this diagnosable.
+
 `authorities` uses the same three names as `peers.json` — `merge`, `cancel`, `result` —
 and for the same reason. A FHIR endpoint whose documents can close a loop is asserting
 what an MLLP peer asserts, and a rule that survives only one transport was never a rule.
@@ -151,18 +162,20 @@ Each of these refuses the boot rather than assuming a value:
 | `REFERRAL_RAW_RETENTION_DAYS` | ages out the raw HL7 archive |
 | `REFERRAL_RESOLVED_RETENTION_DAYS` | ages out resolved loops |
 
-### A known disagreement: the worklist port
+### The worklist port
 
-`cli.py` defaults `--worklist-port` to **5055** and passes it through, so that is
-what a command line or a container actually binds, and it is what the Dockerfile
-`EXPOSE`s. `make_worklist_server`'s own signature defaults to **5057**, which the
-worklist tests use throughout; that default is reached only by an in-process
-caller that omits the argument.
+**5055**, everywhere: `cli.py`'s `--worklist-port`, `make_worklist_server`'s signature
+default, and the Dockerfile's `EXPOSE`.
 
-The two have disagreed since both were written. This is recorded rather than
-reconciled — picking one is a code change and belongs to the restructure, not to
-the extraction that found it. Pass `--worklist-port` explicitly and the question
-does not arise.
+It was not always one number. `make_worklist_server` defaulted to **5057** for as long as
+both files existed, so an in-process caller that omitted the argument bound a port nothing
+else in the project used. The extraction that discovered this recorded the disagreement
+rather than reconciling it, reasoning that picking one was a code change outside its scope.
+Reconciled before publication instead: two defaults that disagree read as an accident no
+matter how carefully the comment explains them.
+
+Some worklist tests still spell `5057` in request URLs. Those exercise `Host` and `Origin`
+handling, where the port is incidental and any value serves.
 
 ### Installed deployments
 

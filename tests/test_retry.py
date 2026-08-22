@@ -95,3 +95,39 @@ def test_attempts_are_bounded_and_the_last_response_is_returned():
     got = fetch_retrying(None, None, "https://x/y", _fetch=calls.fetch, _sleep=calls.sleep)
     assert got.status == 503
     assert calls.requests == MAX_ATTEMPTS, "must stop at the cap rather than retrying forever"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["-1", "-5.0", "-0.001", "0", "0.0", "nan", "NaN", "inf", "-inf", "Infinity"],
+    ids=["negative-int", "negative-float", "tiny-negative", "zero", "zero-float",
+         "nan", "nan-mixed-case", "inf", "negative-inf", "infinity-word"],
+)
+def test_a_negative_or_non_finite_retry_after_does_not_reach_sleep(raw):
+    """`float()` accepts far more than a delay.
+
+    `float("-1")`, `float("nan")` and `float("inf")` all parse, and `min()`
+    passes the first two straight through -- `time.sleep(-5.0)` and
+    `time.sleep(nan)` both raise ValueError, out of a helper whose callers
+    (`fetch_retrying`, `acquire_token`, `preflight`) handle transport errors and
+    nothing else. Any FHIR endpoint answering 429 with `Retry-After: -1` crashes
+    the fetch loop with a traceback. A value that is not a positive finite
+    number of seconds is nonsense, and this module already has an answer for
+    nonsense: its own backoff.
+    """
+    calls = _Calls([_retryable(429, retry_after=raw), _ok()])
+    fetch_retrying(None, None, "https://x/y", _fetch=calls.fetch, _sleep=calls.sleep)
+    assert len(calls.slept) == 1
+    waited = calls.slept[0]
+    assert waited == waited, f"slept for a NaN interval from Retry-After: {raw!r}"
+    assert waited > 0, f"slept for {waited} from Retry-After: {raw!r}"
+    assert waited <= float(MAX_RETRY_AFTER_SECONDS)
+
+
+def test_a_hostile_retry_after_reaches_a_real_sleep_without_raising():
+    """The assertion above uses a fake sleep, which accepts anything. This one
+    hands the value to `time.sleep` itself, which is where the ValueError was."""
+    calls = _Calls([_retryable(503, retry_after="-1"), _ok()])
+    got = fetch_retrying(None, None, "https://x/y", _fetch=calls.fetch,
+                         _sleep=lambda s: None if s > 30 else __import__("time").sleep(min(s, 0.01)))
+    assert got.status == 200

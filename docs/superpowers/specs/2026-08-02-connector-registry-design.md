@@ -416,6 +416,8 @@ through the existing scrubber per parent spec §11.5, which already strips PHI a
 **That control does not exist in this codebase.** `cli.py` calls plain `logging.basicConfig` with no
 filter attached, and there is no `logging.Filter` anywhere in `src/`. §11.5 of the parent spec is
 design intent that was never implemented here, and this section inherited it as though it had been.
+(§11.5 itself carried the false sentence uncorrected until 2026-08-22, so for a while this repo
+held a correction pointing at an uncorrected original. The source now carries the same ⚠ note.)
 
 The boundary-redaction design above is therefore aspirational, not implemented. What *is* implemented
 is the M4 fix (`729ffb6`): PHI is kept out of the exceptions that reach log records in the first

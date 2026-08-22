@@ -68,6 +68,27 @@ OBX_RESULT_STATUS = 11
 # cap of its own: without this, one frame of `OBX|1` retained ~1.1 GB.
 MAX_SEGMENTS = 5000
 
+# The most characters of MSH-10 anything downstream will ever see.
+#
+# The number is HL7's own: MSH-10 is an ST of length 20, so a conformant sender
+# is never truncated and one that is has already left the standard behind.
+#
+# It is enforced *here*, at the two places a control id is read out of a
+# message, and that is the whole point of the constant. `mllp.sanitize_control_id`
+# capped it at the same 20 characters and did so only in `build_ack`, so the ACK
+# was bounded and nothing else was: the value that reached `raw_messages.
+# control_id`, `loop_events.control_id`, the coordinator page's `recorded_by`
+# and every operator log line was bounded only by MAX_FRAME_BYTES -- four
+# mebibytes, per message, from a sender that never has to send a valid one.
+# A bound applied at the last mile is not a bound on the value; it is a bound on
+# one rendering of it.
+#
+# `mllp.py` reads this constant rather than restating it. Two spellings of the
+# same limit would drift, and the drift would be silent in the worst way: an ACK
+# echoing MSA-2 at one length while the archive keys the message at another
+# leaves an operator holding an acknowledgement that finds nothing.
+MAX_CONTROL_ID = 20
+
 # A segment is a run of characters between line breaks. Matched lazily rather
 # than with str.split so a frame far over MAX_SEGMENTS is abandoned as soon as
 # the cap is passed instead of being materialised in full first -- the split
@@ -255,7 +276,26 @@ def peek_control_id(text: str) -> str:
     rest of the pipeline never sees.
     """
     found = _msh_segments(text)
-    return _split_msh_fields(found[-1])[MSH_CONTROL_ID] if found else ""
+    if not found:
+        return ""
+    return _bounded_control_id(_split_msh_fields(found[-1])[MSH_CONTROL_ID])
+
+
+def _bounded_control_id(value: str) -> str:
+    """MSH-10, cut to MAX_CONTROL_ID. The one place either reader applies it.
+
+    Truncated rather than refused. A control id longer than the standard allows
+    is a sender being sloppy far more often than a sender being hostile, and
+    refusing the message would discard a clinical result over a field that is
+    only ever a handle -- the failure this whole subsystem exists to prevent.
+    Truncation keeps the message and bounds the handle.
+
+    Both readers go through here so `peek_control_id` and `parse_hl7_text`
+    cannot disagree: the archive is keyed on the first and every event carries
+    the second, and a message filed under a key the pipeline never sees is
+    `test_peek_and_parse_agree_on_a_shifted_msh`'s defect wearing a new hat.
+    """
+    return value[:MAX_CONTROL_ID]
 
 
 def parse_hl7_text(text: str) -> ParsedMessage:
@@ -273,7 +313,7 @@ def parse_hl7_text(text: str) -> ParsedMessage:
 
         if seg_id == "MSH":
             fields = _split_msh_fields(raw)
-            control_id = fields[MSH_CONTROL_ID]
+            control_id = _bounded_control_id(fields[MSH_CONTROL_ID])
             message_type = fields[MSH_MESSAGE_TYPE]
 
         # A segment with no data fields is malformed: skip it, flag it, keep going.

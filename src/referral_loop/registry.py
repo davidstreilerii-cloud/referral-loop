@@ -367,7 +367,7 @@ class Registry:
                 # in a log line. The MSH-10 names the message and the message
                 # is in the raw archive.
                 raise MrnRetiredError(
-                    f"The MRN carried by {control_id} was retired between ingest and this "
+                    f"The MRN carried by {control_id!r} was retired between ingest and this "
                     "write; re-resolve and retry. Storing the loop here would hide it from "
                     "the surviving patient."
                 )
@@ -510,7 +510,7 @@ class Registry:
             # into a log file every time an interface sent an A40 with an
             # empty MRG-1.
             raise ReferralLoopError(
-                f"ADT^A40 {control_id}: a merge needs both a prior and a surviving MRN "
+                f"ADT^A40 {control_id!r}: a merge needs both a prior and a surviving MRN "
                 f"(prior empty={not prior_mrn}, surviving empty={not surviving_mrn})"
             )
 
@@ -525,8 +525,18 @@ class Registry:
             # artifacts spec test 14 greps, and an identifier is an identifier
             # whether it arrived on a page or in a log line; the MSH-10 is
             # enough to find the message, and the message is in the archive.
+            #
+            # `%r` and not `%s`, here and at every other control-id log call in
+            # this module. `parse_hl7.py` states the rule where it first applies
+            # it and `listener.py` follows it throughout: MSH-10 is unvalidated
+            # sender bytes and this is an operator's terminal. It is not line
+            # forgery -- `parse_hl7._SEGMENT` is `[^\r\n]+`, so no CR survives
+            # the parse -- but everything else does: an ANSI erase-display, a
+            # NUL, a right-to-left override that reverses the remainder of the
+            # line for whoever is reading it. repr escapes all three, and the
+            # value stays legible enough to find the message by.
             logger.warning(
-                "ADT^A40 %s merges an MRN into itself; no loops moved", control_id
+                "ADT^A40 %r merges an MRN into itself; no loops moved", control_id
             )
             scope.loops_moved = 0
             return []
@@ -555,13 +565,13 @@ class Registry:
             surviving = self.store.resolve_mrn(surviving_mrn)
             if applied is None:
                 logger.info(
-                    "ADT^A40 %s: the prior MRN is already retired into the surviving one; "
+                    "ADT^A40 %r: the prior MRN is already retired into the surviving one; "
                     "no new alias recorded", control_id,
                 )
 
             if not self.store.loops_for_mrn(surviving):
                 logger.info(
-                    "ADT^A40 %s: surviving MRN is unknown here; carrying loops onto it anyway",
+                    "ADT^A40 %r: surviving MRN is unknown here; carrying loops onto it anyway",
                     control_id,
                 )
 
@@ -607,7 +617,7 @@ class Registry:
                 )
                 moved.append(loop.loop_id)
 
-        logger.info("ADT^A40 %s: carried %d loop(s) to the surviving MRN", control_id, len(moved))
+        logger.info("ADT^A40 %r: carried %d loop(s) to the surviving MRN", control_id, len(moved))
         scope.loops_moved = len(moved)
         return moved
 

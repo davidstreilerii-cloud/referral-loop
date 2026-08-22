@@ -28,9 +28,12 @@ append-only event log. A coordinator sees three queues:
 | **Resulted, unacknowledged** | Result arrived, nobody has confirmed it |
 | **Orphans** | A result arrived that matched no order |
 
-Plus a FHIR read client that answers a further question: *does a document exist on the other side
-that nobody sent us?* This is the only path that produces value with zero cooperation from the
-receiving side — everything else waits for someone to send a message.
+Built alongside that, and scoped honestly: a FHIR read client aimed at a further question — *does a
+document exist on the other side that nobody sent us?* That is the only path that produces value
+with zero cooperation from the receiving side; everything else waits for someone to send a message.
+The client and its connector preflight are built and tested against a test FHIR server, and
+`connectors` mode runs the preflight today. The reconciliation job that would consume the client is
+v2: `find_candidate_documents` has tests and no production caller yet.
 
 ## Why it's built this way
 
@@ -59,9 +62,9 @@ reachable-but-we-agreed-not-to.
 
 | | |
 |---|---|
-| Source | ~16,000 lines, Python |
-| Tests | ~22,500 lines · **1,815 passing** |
-| Coverage | 90% floor, 95% measured |
+| Source | ~17,000 lines, Python |
+| Tests | ~24,500 lines · **1,889 passing** |
+| Coverage | 90% floor, 96% measured |
 | Runtime dependencies | one (`cryptography`) |
 | Standards | HL7 v2 · FHIR · SMART Backend Services · mutual TLS |
 
@@ -70,7 +73,7 @@ reachable-but-we-agreed-not-to.
 Reviewing this in fifteen minutes? In order:
 
 1. **[Security writeup](docs/security-model.md)** — the five trust boundaries, and a defect I
-   found and published rather than quietly fixed.
+   published before I had fixed it, plus the second one that fixing it exposed.
 2. **`src/referral_loop/core/states.py`** — the state model. Every state earns its place.
 3. **`docs/superpowers/specs/`** — five design specs. Scope decomposed, rejected options recorded,
    defects logged with reasoning. If you want to know how I think, read these rather than the code.
@@ -80,9 +83,20 @@ Reviewing this in fifteen minutes? In order:
 ## Status
 
 v1, not deployed to a live site. Built against synthetic HL7 traffic and a test FHIR server.
-Known open defect, tracked in the spec rather than hidden: `SIU^S15` (appointment cancellation) is
-currently mapped to the referral's `CANCELLED` state, which means a routine reschedule can drop a
-clinically open referral off every worklist. Fix in progress.
+
+The defect this section used to advertise as open is closed, and how it closed is the part worth
+reading. `SIU^S15` (appointment cancellation) was mapped to the referral's `CANCELLED` state, so a
+routine reschedule dropped a clinically open referral off every worklist. It now routes to
+`unschedule`, which the store maps to `OPEN` — the loop stays on the queue.
+
+Fixing it then **exposed a second defect the first had been masking.** With `CANCELLED` terminal,
+nothing after an `S15` could be wrong about anything, so nobody could see that content-key dedup
+was swallowing the rebooking: a specialist's office re-books under the *same* order numbers, every
+field the key hashed was identical, and the second `SIU^S12` was discarded as a duplicate. The loop
+then sat on `OPEN` while the patient held an appointment — the inverse error, same class of harm.
+That one is fixed too; the key now hashes the appointment identifier. Both are written up in
+`docs/superpowers/specs/`, reasoning and all. Found it, fixed it, the fix uncovered a second one,
+fixed that too.
 
 ## Running it
 

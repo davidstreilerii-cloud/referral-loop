@@ -5,7 +5,18 @@
 # model client is a product claim, and tests/test_install_closure.py asserts it
 # against the built image rather than against this file -- a Dockerfile that
 # looks right and an image that is right are different things.
-FROM python:3.12-slim
+# Pinned by digest, not just by tag. `python:3.12-slim` is a moving target: the
+# same Dockerfile built a month apart produces different images, which is exactly
+# the ambiguity this file spends the rest of its comments trying to remove. The
+# tag is kept alongside the digest because it is what a reader recognises; the
+# digest is what actually resolves.
+#
+# The cost is that base-image security patches now require a deliberate bump
+# rather than arriving on the next build. That is the intended trade: an image
+# holding PHI should change when someone decides it changes. `.github/dependabot.yml`
+# opens a PR when the digest moves, so the decision is prompted rather than
+# forgotten.
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 
 WORKDIR /app
 
@@ -60,13 +71,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # 2575 MLLP, 5055 coordinator worklist.
 #
-# 5055 is the CLI default (`--worklist-port`), and the CLI is this image's entry
-# point, so 5055 is what a `worklist` container actually binds. Note that
-# `make_worklist_server`'s own signature defaults to 5057 and the worklist tests
-# use 5057 throughout: the library default and the CLI default disagree in the
-# extracted tree exactly as they did in the monorepo. Left alone here on
-# purpose -- reconciling them is a code change, and this extraction does not make
-# any. Pass --worklist-port explicitly and the question does not arise.
+# 5055 is the CLI default (`--worklist-port`), the CLI is this image's entry
+# point, and `make_worklist_server`'s signature now agrees. It defaulted to 5057
+# until publication, so a library caller that omitted the argument bound a port
+# nothing else here used; reconciled rather than left as a footnote.
 EXPOSE 2575 5055
 
 # Required at run time, no defaults, and each refuses the boot rather than
@@ -88,15 +96,26 @@ EXPOSE 2575 5055
 # applied_messages (the idempotency ledger -- deleting a row re-arms double
 # application of a redelivered message) and mrn_alias_events / mrn_aliases (a
 # merge is a permanent fact; expiring one silently re-strands a loop). Both grow
-# without bound for the life of the install. Estimated, and later withdrawn as unmeasurable: ~166
-# bytes/row for applied_messages, ~342 bytes/row for the alias tables combined,
-# both including their indexes. At sustained volumes of 1,000 / 10,000 / 50,000
-# HL7 messages per day, applied_messages alone (one row per applied message, 1:1
-# with traffic) reaches roughly 58MB / 577MB / 2.8GB after one year and
-# 289MB / 2.8GB / 14GB after five -- the alias tables stay well under that even
-# at a generous assumed merge rate. `referral-loop stats --db
-# /app/data/referral_loops.db` reports the real figures for this install rather
-# than the projection above.
+# without bound for the life of the install, and applied_messages grows 1:1 with
+# traffic -- one row per applied message, forever.
+#
+# No per-row byte figure is quoted here, because this project cannot produce an
+# honest one. `stats`'s own docstring says why: it reports SUM(LENGTH(...)), which
+# is a LOWER BOUND on stored column bytes and counts neither the SQLite record
+# header, nor btree page overhead, nor any index -- and applied_messages carries
+# idx_applied_content_key over a 64-character content key. `dbstat`, the one thing
+# that would give an exact per-table figure including indexes, is a compile-time
+# option and is not in this build. An earlier revision of this comment quoted
+# ~166 bytes/row "including indexes" and projected a year and five years of growth
+# from it at three traffic volumes. Those numbers were not reachable from anything
+# this codebase can measure, and the projections built on them under-projected.
+# Deleted rather than adjusted: a capacity figure that a reader cannot reproduce
+# is worse than none, and the structural fact above is the part that drives the
+# decision anyway.
+#
+# `referral-loop stats --db /app/data/referral_loops.db` reports this install's
+# real row counts, its per-table lower bound, and -- exactly -- the whole file's
+# size on disk. Size the volume from that, on the traffic the site actually sees.
 
 # 0.0.0.0 is this container's own network namespace, not the host's. Publish
 # 2575 only to the interface engine. The worklist has no authentication and

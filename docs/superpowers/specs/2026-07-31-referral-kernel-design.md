@@ -3,7 +3,14 @@
 **Product:** `referral-loop` — inbound referral management and interoperability platform
 **Spec version:** 1.0
 **Date:** 2026-07-31
-**Status:** Approved through design review; not yet implemented
+**Status:** Approved through design review. Written before implementation and **left in that tense
+on purpose** — this is the design record, not a description of the tree. Slice 1 has since been
+built: the canonical model and state machine are `src/referral_loop/core/`, the provenance and
+`Task.businessStatus` projections are `src/referral_loop/fhir/`, and the connector and FHIR read
+layers are `src/referral_loop/connect/`. Where a section has been overtaken by events — a defect
+closed, a claim found false — the correction is inline and marked, rather than the section being
+rewritten to look like it was right all along. §11.6a's remediation table is the one place that was
+always retrospective.
 **Supersedes for this scope:** `INTEROP_SPEC.md` Workstream H, slice 1
 
 ---
@@ -62,11 +69,22 @@ Message types currently handled: `REF^I12`, `ORM^O01`, `OMG^O19`, `ORU^R01`, `SI
 These are errors in the source spec that this design corrects. They should be fixed in
 `INTEROP_SPEC.md` itself.
 
-1. **"The harmonized IHE 360X / HL7 BSeR referral Task state machine" does not exist.** They are
-   not harmonized. Deployed 360X is Direct secure messaging plus XDM with CDA/HL7 v2 payloads, and
-   its state model is expressed in message exchanges, not `Task.status`. BSeR is FHIR-native but
-   scoped to preventive and social-service referrals. **This spec treats FHIR R4 `Task` as
-   normative and maps 360X message semantics onto it.**
+1. **"The harmonized IHE 360X / HL7 BSeR referral Task state machine" is not a thing you can
+   implement against.** The harmonization is real but **one-directional**, and the source spec
+   reads it as symmetric. BSeR says so in as many words — its business states "reflect a
+   harmonization of the state machine required by BSeR and the state machine defined by the
+   IHE … 360 Exchange Closed Loop Referral (360X)" — and it ships
+   `CodeSystem/TaskBusinessStatusCS`, whose codes are numbered to the 360X diagram. So BSeR
+   absorbed 360X's states into `Task.businessStatus`. Nothing went the other way: deployed 360X is
+   Direct secure messaging plus XDM with CDA/HL7 v2 payloads, its state model is expressed in
+   message exchanges rather than `Task.status`, and a conformant 360X endpoint emits no `Task` at
+   all. Building to "the harmonized state machine" therefore gets you a vocabulary that one side
+   publishes and the other side never sends. BSeR is FHIR-native but scoped: the IG's own wording
+   is preventive **or therapeutic** services, across six named use cases, not referrals generally.
+   (An earlier revision of this item said flatly "they are not harmonized" and described BSeR as
+   preventive-and-social-service only. Both were wrong in the falsifiable direction — the IG says
+   "harmonization" verbatim — and are corrected above rather than softened.)
+   **This spec treats FHIR R4 `Task` as normative and maps 360X message semantics onto it.**
 2. **The spec's state diagram omits real R4 `Task.status` codes** — `received`, `ready`, and
    `on-hold`. Dropping them makes "receiving org has it but hasn't triaged" and "waiting on
    patient" unrepresentable, and those are exactly what the aging agent must not escalate on.
@@ -315,6 +333,22 @@ Exits: `DECLINED` (receiving org refuses), `CANCELLED` (referring side withdraws
 
 *Found 2026-08-02 while routing `cancel` through the machine. Recorded here rather than fixed,
 because Plan 2b is a zero-behaviour-change exercise. **Plan 2c item.***
+
+> **Closed — `b702547`.** The defect below is fixed; the description is kept in the present tense
+> it was written in, because the reasoning is the record. `listener._apply_unschedule` drives
+> `Registry.unschedule` from `SIU^S15` and never `Registry.cancel`; `store` maps the resulting
+> `unscheduled` transition to `LoopState.OPEN`, so an un-booked referral stays on
+> `open_loops()` instead of leaving every queue.
+> `tests/test_listener.py::test_an_s15_then_an_s12_reschedules_through_the_listener` pins the
+> reschedule end to end. `CANCELLED` is now reachable only from a withdrawal by the referring side.
+>
+> The fix made a **second** defect reachable for the first time: with `CANCELLED` terminal, no
+> message after an `S15` could be wrong, which hid the fact that `content_key` did not hash
+> anything naming the appointment, so a rebooking reusing its order numbers was swallowed as a
+> duplicate and the loop finished on `OPEN` while the patient held a slot. Specced and implemented
+> in `2026-08-05-appointment-identifier-dedup-design.md`. Worth recording as a pattern: a defect
+> can be masked by a worse defect downstream, and fixing the worse one is what makes the first
+> one reachable.
 
 `listener._apply_cancel` drives `Registry.cancel` from `SIU^S15`. But `S15` is an **appointment**
 cancellation, and a cancelled appointment is not a withdrawn referral — the patient still needs to
@@ -778,8 +812,20 @@ where the model path first exists. No LLM is invoked anywhere in slice 1.
 
 ### 11.4 Boundary 4 — persistence
 
-- **Parameterized queries, enforced by test.** An AST check that no `execute()` call receives an
-  f-string, `%`-format, or concatenation.
+- **Parameterized queries, audited — not enforced by test.** Every value reaching SQLite is bound;
+  §11.6's four-way audit inventoried the query surface and found no injection, and a later security
+  review re-confirmed it. What does **not** exist is the control originally written here: an AST
+  check that no `execute()` call receives an f-string, `%`-format, or concatenation. Nothing in the
+  suite fails the build if the property stops holding.
+
+  ⚠ **Correction (2026-08-22).** This bullet read "enforced by test" and named that AST check as
+  though it had been built. It was not, and the design as stated would not survive being built:
+  `store.py` legitimately issues `conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")` and builds its
+  `stats` aggregates by f-string, in both cases from identifiers the module itself owns — code-derived,
+  no external input, safe. An AST check for f-strings at `execute()` would flag exactly those and
+  would need an allowlist, which is a different and weaker control than the one described. The
+  property holds today by audit. Read it as an audited invariant, not a build gate — which is
+  precisely the distinction this project makes about the README everywhere else.
 - The SQLite authorizer is a SQLi *mitigation*, not only an audit control: even a successful
   injection cannot `UPDATE` or `DELETE` `transition_events`.
 - **No pickle anywhere.** `evidence_json` and `actor_json` are schema-validated **on read**, not
@@ -796,6 +842,21 @@ where the model path first exists. No LLM is invoked anywhere in slice 1.
   or CR with `'`. Compliance officers open these in Excel.
 - **Log injection** — escape CR/LF and control characters in every logged value, or an attacker
   forges log lines. All logging routes through a scrubber that also strips PHI.
+
+  ⚠ **Correction (2026-08-22).** That last sentence is false and was never true of this codebase.
+  **No such scrubber exists.** `cli.py` calls plain `logging.basicConfig` with no filter attached,
+  and there is no `logging.Filter` anywhere under `src/`. The sentence is design intent that was
+  never implemented, and `2026-08-02-connector-registry-design.md` §7 inherited it by citing this
+  section by number — so the correction downstream was, until now, pointing at an uncorrected
+  original. Corrected at the source.
+
+  What *is* implemented is the M4 fix (`729ffb6`): PHI is kept out of the exceptions that reach log
+  records at all, at the raise sites rather than at the logging boundary. That is deliberately
+  narrower — it covers the enumerated refusal paths rather than every call site — and the reasoning
+  is that a scrubber post-filters a record that already contains PHI and has to know every
+  identifier format to work. **Treat any logging call site as unprotected by default.** The CR/LF
+  escaping requirement in the first half of this bullet is likewise a requirement, not a shipped
+  control.
 - Rendering rules written now, applied in slice 4: context-aware escaping, CSP, no `innerHTML`,
   note text never rendered as markup.
 - The signed rule pack: **verify signature before parsing.** The pack is data only — no
@@ -985,6 +1046,15 @@ boundary; a 15 MiB MSH-10 reaches the DB key and the log while only the ACK is c
 All nine CRITICAL/HIGH findings were fixed in `healthcare_rag/referral_loop/` before extraction, so
 they carry through `git filter-repo` with history. Fifteen commits, `015e43f`..`e96f42c`. Verified
 `1042 passed, 11 skipped` on `python -m pytest tests/referral_loop -q` (baseline was 881).
+
+**Every hash in the table below is a pre-extraction hash and will not resolve in this repository.**
+`git filter-repo` rewrites the object graph, so each of these commits exists here under a different
+id; the work is present and the history is preserved, but `git show 015e43f` fails with
+`fatal: not a valid object name`. They are kept as written because they are the identifiers the
+audit and the monorepo's own log use, and remapping them by hand would produce a table nobody could
+check against the source it came from. Any other pre-extraction hash cited in this section is
+subject to the same rewrite. `729ffb6` (M3/M4) is the exception — it postdates the extraction and
+resolves normally, as do the later fixes cited elsewhere in this document.
 
 | Finding | Commits | Status |
 |---|---|---|

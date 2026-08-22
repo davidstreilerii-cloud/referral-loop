@@ -10,6 +10,16 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-25-referral-loop-design.md`
 
+> **Pre-extraction plan; its paths are the monorepo's, not this repository's.** This plan was
+> executed inside `healthcare_rag/`, so `guardrails/immutable_audit.py` and `encryption_check.py`
+> are here as `src/referral_loop/immutable_audit.py` and `src/referral_loop/encryption_check.py`
+> (vendored by `docs/superpowers/plans/2026-08-01-referral-loop-extraction.md`), and
+> `guardrails/tenant_isolation.py`, `db.py`, `audit_trail.py`, `AnthropicClientError` and Revenue
+> Integrity are parent-repo things that do not exist here at all. Commit hashes cited below are
+> also pre-extraction and will not resolve — `git filter-repo` rewrote every one of them. Kept as
+> written, because a plan edited to match the tree it produced stops being a record of what was
+> planned.
+
 ---
 
 ## Deviations from the spec, and why

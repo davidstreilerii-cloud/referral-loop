@@ -1717,7 +1717,7 @@ class LoopStore:
             # the log call instead would leave `str(exc)` loaded for the next
             # caller to print, return or re-raise.
             raise CircularMergeError(
-                f"Refusing ADT^A40 {established_by}: the surviving identifier it names is "
+                f"Refusing ADT^A40 {established_by!r}: the surviving identifier it names is "
                 "already retired into the prior one, so applying this would make the "
                 "identity cyclic. Both claims cannot hold and choosing between them would "
                 "strand every loop on the losing side. The alias table is unmodified and no "
@@ -1747,7 +1747,7 @@ class LoopStore:
             "SELECT 1 FROM mrn_aliases WHERE retired_mrn = surviving_mrn LIMIT 1"
         ).fetchone():
             raise CircularMergeError(
-                f"Refusing ADT^A40 {established_by}: compressing it would leave an "
+                f"Refusing ADT^A40 {established_by!r}: compressing it would leave an "
                 "identifier pointing at itself. Refused whole; a human must review."
             )
         return source, target

@@ -38,6 +38,22 @@ class FetchedResource:
 
 @dataclass(frozen=True)
 class DocumentSearch:
+    """One search at one connector, with the provenance to say what was actually asked.
+
+    **`query_urls` carries PHI and that is deliberate.** Its first entry is the hop-1
+    Patient search, which embeds the MRN percent-encoded into the query string; every
+    entry after it names a `Patient/<id>` at the remote. It is not redacted because the
+    field exists to record the real URL rather than a reconstruction -- provenance that is
+    approximated is not provenance, and this is the string a coordinator reads to see what
+    was asked on their behalf.
+
+    So it is labelled instead, and the label is the control. Treat it exactly as the
+    MRN it contains: it belongs on an encrypted volume beside the loop, never in a log
+    line, an audit row, an exported report or a support ticket. `documents.py` keeps the
+    MRN out of its own exception messages for this reason; a field that carries one
+    without saying so is how it gets put back.
+    """
+
     resources: tuple[FetchedResource, ...]
     patient_id: str
     pages_walked: int

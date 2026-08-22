@@ -1,7 +1,9 @@
 import pytest
 
+from referral_loop.mllp import build_ack, sanitize_control_id
 from referral_loop.parse_hl7 import (
     ALLOWED_SEGMENTS,
+    MAX_CONTROL_ID,
     MAX_SEGMENTS,
     MSH_DATETIME,
     OBR_FILLER_ORDER_NUMBER,
@@ -311,3 +313,59 @@ def test_the_listener_answers_ar_to_every_structural_fault(tmp_path):
     assert ack_code(handler.handle(MSH + "OBX|1\r" * MAX_SEGMENTS)) == "AR"
     assert store.raw_count() == 3, "failure matrix: AR, archive raw, alert"
     assert handler.unknown_type_count == 0, "rejected before it could be misread"
+
+
+# ------------------------------------------------- MSH-10 is bounded at the parser
+
+# The bound lives in parse_hl7 and mllp reads it from there, so an ACK and an
+# archive key cannot disagree about how long a control id may be.
+
+
+def _msh_with_control_id(control_id: str) -> str:
+    return (
+        f"MSH|^~\\&|LAB|HOSP|EHR|HOSP|20260725120000||ORU^R01|{control_id}|P|2.5.1\r"
+        "PID|1||MRN123456^^^HOSP^MR||DOE^JANE||19800101|F\r"
+    )
+
+
+def test_an_oversized_control_id_is_bounded_at_the_parser_not_only_at_ack_time():
+    """`sanitize_control_id`'s 20-character cap was applied in `build_ack` and
+    nowhere else, so the value that reached `raw_messages.control_id`,
+    `loop_events.control_id` and every operator log line was bounded only by
+    MAX_FRAME_BYTES -- four mebibytes. A sender does not need a valid message to
+    put a megabyte of anything into a database column and a log file; it needs
+    one MSH.
+    """
+    huge = "A" * 5000
+    message = _msh_with_control_id(huge)
+    assert len(peek_control_id(message)) == MAX_CONTROL_ID
+    assert len(parse_hl7_text(message).control_id) == MAX_CONTROL_ID
+
+
+def test_peek_and_parse_agree_on_an_oversized_control_id():
+    """The archive is keyed on `peek_control_id` and every event on the parse.
+    Bounding one and not the other would file a message under a key the rest of
+    the pipeline never sees -- the same defect `test_peek_and_parse_agree_on_a
+    _shifted_msh` pins for a renumbered header."""
+    message = _msh_with_control_id("B" * 5000)
+    assert peek_control_id(message) == parse_hl7_text(message).control_id
+
+
+def test_a_control_id_at_or_under_the_bound_is_untouched():
+    """The bound must not quietly rewrite ordinary traffic. An interface engine's
+    control id is a handle a human uses to find a message in two systems, and one
+    truncated at 19 characters is a handle that matches nothing."""
+    ordinary = "MSG00000000000001234"  # exactly MAX_CONTROL_ID
+    assert len(ordinary) == MAX_CONTROL_ID
+    assert peek_control_id(_msh_with_control_id(ordinary)) == ordinary
+    assert parse_hl7_text(_msh_with_control_id(ordinary)).control_id == ordinary
+
+
+def test_the_ack_and_the_parser_share_one_bound():
+    """Two copies of this number would drift, and the drift would be silent: an
+    ACK echoing MSA-2 at one length while the archive keyed the message at
+    another is a message an operator cannot find from the acknowledgement."""
+    huge = "C" * 5000
+    control_id = peek_control_id(_msh_with_control_id(huge))
+    assert sanitize_control_id(control_id) == control_id
+    assert f"MSA|AA|{control_id}\r" in build_ack(control_id, "AA")

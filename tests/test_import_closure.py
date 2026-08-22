@@ -129,10 +129,29 @@ EGRESS_MODULE = "connect/egress.py"
 # mllp_server.py to a per-file exemption list instead would have been worse -- an allowlist of
 # exempt files is how this test stops meaning anything -- so the module is dropped from the set
 # that applies to every file rather than one file being excused from the set.
-_NETWORK_MODULES = {"urllib.request", "urllib.error", "http.client", "ftplib"}
+# The third-party clients are in the set even though none of them is installed: this check
+# reads source, not sys.modules, so it costs nothing to name the libraries somebody would
+# actually reach for, and naming them is the difference between a check that fires the day
+# `requests` is added to pyproject.toml and one that has to be remembered and updated then.
+_NETWORK_MODULES = {
+    "urllib.request", "urllib.error", "http.client", "ftplib",
+    "requests", "httpx", "urllib3", "aiohttp",
+}
 
 
 def _imported_modules(path: Path) -> set[str]:
+    """Every module name this file imports, under every spelling of the import.
+
+    `from urllib import request` binds the same callable as `import urllib.request`, so
+    both have to arrive here as "urllib.request" or `_NETWORK_MODULES` polices a naming
+    convention instead of a capability -- and the README points reviewers at this file.
+    Hence the dotted join for each alias of an `ImportFrom`. The bare `node.module` is
+    still recorded alongside it, because `from requests import get` has to be caught by
+    the entry "requests", and dropping it would trade one blind spot for another.
+
+    `node.level == 0` keeps relative imports out: `from . import request` inside this
+    package is not urllib, and joining it onto the parent's name would make it look like it.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[str] = set()
     for node in ast.walk(tree):
@@ -140,6 +159,7 @@ def _imported_modules(path: Path) -> set[str]:
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             found.add(node.module)
+            found.update(f"{node.module}.{alias.name}" for alias in node.names)
     return found
 
 
@@ -156,6 +176,72 @@ def test_only_the_egress_module_imports_a_network_library():
         f"egress must stay confined to {EGRESS_MODULE}; these also import a network "
         f"library: {offenders}"
     )
+
+
+# The control above is only as good as the spellings it recognises. README points reviewers
+# at this file as "a test that fails the build if a second [importer] appears", so a spelling
+# it cannot see is a one-line evasion of an advertised guarantee -- worse than not advertising
+# it. These parametrised cases are the evasions, written as source rather than described:
+# `from urllib import request` binds exactly the same callable as `import urllib.request`,
+# and an AST walk that records only `node.module` sees "urllib" for the first and
+# "urllib.request" for the second.
+_EVASIONS = [
+    ("import urllib.request", "urllib.request"),
+    ("from urllib import request", "urllib.request"),
+    ("from urllib.request import urlopen", "urllib.request"),
+    ("from urllib import error", "urllib.error"),
+    ("import http.client", "http.client"),
+    ("from http import client", "http.client"),
+    ("from http.client import HTTPSConnection", "http.client"),
+    ("import ftplib", "ftplib"),
+    ("from urllib import request as _r", "urllib.request"),
+    ("from urllib import parse, request", "urllib.request"),
+]
+
+
+@pytest.mark.parametrize("source,expected", _EVASIONS)
+def test_the_egress_check_sees_every_spelling_of_a_network_import(tmp_path, source, expected):
+    """Every way of naming the same module has to land in the same set entry, or the
+    closure test above polices a naming convention rather than a capability."""
+    probe = tmp_path / "probe.py"
+    probe.write_text(source + "\n", encoding="utf-8")
+    found = _imported_modules(probe)
+    assert expected in found, f"{source!r} was recorded as {sorted(found)}"
+    assert _imported_modules(probe) & _NETWORK_MODULES, (
+        f"{source!r} would pass the egress closure test unnoticed"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import requests",
+        "from requests import get",
+        "import httpx",
+        "from httpx import AsyncClient",
+        "import urllib3",
+        "from urllib3 import PoolManager",
+        "import aiohttp",
+        "from aiohttp import ClientSession",
+    ],
+)
+def test_third_party_http_clients_count_as_network_libraries(tmp_path, source):
+    """None of these is in the install closure today, which is exactly why the check has
+    to name them: the failure mode is somebody adding `requests` to pyproject.toml and an
+    import of it to a module that is not egress.py, and a stdlib-only set would not notice."""
+    probe = tmp_path / "probe.py"
+    probe.write_text(source + "\n", encoding="utf-8")
+    assert _imported_modules(probe) & _NETWORK_MODULES, (
+        f"{source!r} opens connections and is not treated as a network import"
+    )
+
+
+def test_a_relative_import_is_not_mistaken_for_a_network_module(tmp_path):
+    """`from . import request` inside the package is not urllib. `node.level == 0` is what
+    keeps the check from firing on it, and widening the check must not lose that."""
+    probe = tmp_path / "probe.py"
+    probe.write_text("from . import request\nfrom .errors import x\n", encoding="utf-8")
+    assert not (_imported_modules(probe) & _NETWORK_MODULES)
 
 
 def test_fetch_is_the_only_place_in_egress_that_opens_a_connection():

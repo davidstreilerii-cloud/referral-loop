@@ -93,8 +93,19 @@ The rule pack is **Ed25519-signed and verified before load**. Matching rules are
 of thing that gets hot-edited at 2am during an integration issue, which is exactly why they are
 signed.
 
-PHI has a boot gate: the process refuses to start unless disk encryption is verified, either by
-OS detection or explicit attestation.
+PHI has a boot gate: under `PHI_MODE=full` — the documented operating mode — the process refuses
+to start unless disk encryption is verified, either by OS detection or explicit attestation. Under
+`deidentified` it warns and continues; under `disabled` the gate does not run. The refusal is
+unconditional only in the mode that persists identifiers.
+
+Detection is deliberately narrow. It asks which volume actually backs the database path, and
+requires *that* device to be encrypted — a BitLocker-protected `C:` does not vouch for a database
+on `D:`, and an encrypted swap partition elsewhere on the host vouches for nothing. Anything it
+cannot positively identify is treated as unencrypted, so LVM-on-LUKS reports `lvm` and does not
+auto-detect even though it is genuinely encrypted. Walking the device-mapper tree upward to infer
+otherwise is exactly the reasoning that produces a confident wrong yes. Those sites attest with
+`PHI_ENCRYPTION_VERIFIED=1`, which is also the practical path on Windows, where `manage-bde` is
+often slower than the probe timeout.
 
 ## Boundary 5 — Egress
 
@@ -135,7 +146,7 @@ assertion would be load-bearing for patient safety.
 
 Unreachable-by-construction is better than reachable-but-we-agreed-not-to.
 
-## A defect worth publishing
+## A defect worth publishing, and the one it was hiding
 
 During routing work, a defect surfaced that illustrates why this domain rewards paranoia.
 
@@ -145,16 +156,40 @@ to be seen and the referral still needs rebooking.
 
 `CANCELLED` appears in neither the awaiting-result queue nor the awaiting-acknowledgement queue.
 So on the entirely benign happy path — a specialist's office cancels and reschedules, which
-happens daily — **a clinically open referral silently leaves every coordinator queue.** That is
+happens daily — **a clinically open referral silently left every coordinator queue.** That is
 the precise failure the product exists to prevent, occurring by design rather than by attack.
 
 The part I find most instructive: a security audit had already reached this same fact from the
 other direction. It listed `SIU^S15` mass-cancellation as an exploit *because* `CANCELLED` is on
-no worklist — framing it as something an adversary does. A routine scheduling message does it too,
+no worklist — framing it as something an adversary does. A routine scheduling message did it too,
 every day, with no adversary at all.
 
 Threat modeling found the mechanism and mislabeled the trigger. The most likely cause of a
 security-relevant outcome is usually not an attacker. It is Tuesday.
+
+**It is fixed.** `listener._apply_unschedule` drives `registry.unschedule` from `S15`, never
+`registry.cancel`; the store maps `unscheduled` to `OPEN`, so the loop stays on the awaiting-result
+queue and a reschedule is a visible pending referral rather than a terminal one.
+`tests/test_listener.py::test_an_s15_then_an_s12_reschedules_through_the_listener` holds that
+end to end. `CANCELLED` is now reachable only from an actual withdrawal by the referring side.
+
+**And fixing it uncovered a second defect that the first one had been masking.** With `CANCELLED`
+terminal, nothing arriving after an `S15` could be wrong about anything — so nothing could reveal
+that the content-key dedup was eating the rebooking. A specialist's office re-books under the
+*same* placer and filler order numbers, because the order did not change; only the slot did. Every
+field `content_key` hashed was byte-identical across the two `SIU^S12`s, so the second one hashed
+to a key the first had already spent and was discarded at the duplicate check before it was ever
+applied. The loop finished on `OPEN` while the patient held an appointment: the inverse of the
+`S15` error and the same class of harm, the recorded state and the patient's actual situation
+disagreeing with nobody told.
+
+That is fixed too — `content_key` now hashes an `appointment_id` concept read from `SCH`, under a
+bumped key version with a dual-read migration so a pre-bump row still suppresses a redelivery.
+The design is in `docs/superpowers/specs/2026-08-05-appointment-identifier-dedup-design.md`.
+
+The generalizable lesson is the sequencing, not either defect: **a defect can be masked by a worse
+defect downstream, and fixing the worse one is what makes the first one reachable.** Nothing about
+the dedup code changed. It became wrong because something else stopped being wrong.
 
 ---
 
@@ -173,5 +208,5 @@ Authorities are granted, never inferred. Exactly three exist — `merge` (`ADT^A
 end with a clinically open loop on nobody's queue.** Orders and schedules are strictly additive
 and carry no authority, so they need none.
 
-~16,000 lines of source, ~22,500 lines of tests, 1,815 passing, 90% coverage floor against a
-measured 95%. One runtime dependency.
+~17,000 lines of source, ~24,500 lines of tests, 1,889 passing, 90% coverage floor against a
+measured 96%. One runtime dependency.

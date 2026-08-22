@@ -351,6 +351,17 @@ class PeerRegistry:
         self._identities = dict(identities)
         self._by_fingerprint = dict(by_fingerprint)
         self._by_address = dict(by_address)
+        # The same map read the other way round, for the question mTLS asks:
+        # "this connection is peer P -- may P be here?" rather than "who is at
+        # this address?". Derived rather than passed in, because `from_mapping`
+        # already refuses two peers claiming one address, so the inversion is
+        # exact and a second constructor argument would be a second thing to
+        # keep in step with the first.
+        self._addresses_by_peer: dict[str, frozenset[str]] = {}
+        for address, peer_id in self._by_address.items():
+            self._addresses_by_peer[peer_id] = (
+                self._addresses_by_peer.get(peer_id, frozenset()) | {address}
+            )
         self.tls = tls
 
     # ------------------------------------------------------------- constructors
@@ -488,6 +499,39 @@ class PeerRegistry:
         peer_id = self._by_address.get(normalised)
         return self._identities.get(peer_id) if peer_id else None
 
+    def address_permitted(self, peer_id: str, host: str) -> bool:
+        """Whether this peer, already identified, may be connecting from `host`.
+
+        The mTLS counterpart to `resolve_address`, and a different question: there
+        the address *is* the identification, here it is a second condition on one
+        already made by a certificate.
+
+        `addresses` was parsed and index-validated for every transport and then
+        consulted only on the plaintext path, so an operator who wrote
+        `"addresses": ["10.2.0.7"]` into an mTLS entry -- believing, reasonably,
+        that it constrained where that certificate may be used from -- got
+        nothing at all, and got it silently. The registry already warns about the
+        mirror case (fingerprints declared under plaintext are unchecked); there
+        was no symmetric line for this one, which made the silence the worst
+        available outcome: a control the operator believes they have.
+
+        **An absent allowlist is not an empty one.** A peer that declares no
+        addresses is unconstrained, because every registry written before this
+        existed omits the key and reading omission as "permit nothing" would
+        refuse them all. Declaring it is the opt-in.
+
+        A source address that cannot be normalised fails closed. It cannot be
+        shown to be on the list, and an allowlist that admits what it could not
+        check is not one.
+        """
+        declared = self._addresses_by_peer.get(peer_id)
+        if not declared:
+            return True
+        try:
+            return _address(host) in declared
+        except ReferralLoopError:
+            return False
+
     def allows_address(self, host: str) -> bool:
         """Whether a plaintext connection from `host` may be accepted at all.
 
@@ -527,9 +571,20 @@ class PeerRegistry:
         """One line for the startup log. Never contains a path or a key."""
         who = ", ".join(sorted(self._identities))
         if self.requires_tls:
+            # Whether addresses constrain anything, said out loud. Without this
+            # a registry whose `addresses` were being ignored read exactly like
+            # one where none were declared -- and the whole defect here was that
+            # an operator could not tell those two apart.
+            pinned = sorted(self._addresses_by_peer)
+            constrained = (
+                f" Source addresses are also required for: {', '.join(pinned)}."
+                if pinned
+                else " No peer restricts its source address; a pinned certificate is "
+                     "accepted from anywhere it can reach this port."
+            )
             return (
                 f"MLLP transport: mutual TLS, client certificates required and pinned by "
-                f"SHA-256. {len(self._identities)} peer(s): {who}."
+                f"SHA-256. {len(self._identities)} peer(s): {who}.{constrained}"
             )
         return (
             f"MLLP transport: PLAINTEXT. Traffic on this port is not authenticated and not "

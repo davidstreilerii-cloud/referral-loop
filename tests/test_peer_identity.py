@@ -1284,3 +1284,90 @@ def test_a_declared_expectation_is_not_satisfied_by_an_absent_claim():
     assert identity.claim_mismatch("ANY", "HOSP") == ""
     assert identity.claim_mismatch("ANY", "") == "MSH-4"
     assert identity.claim_mismatch("ANY", "hosp") == "", "case is not identity"
+
+
+# ===================================== addresses declared under mTLS are enforced
+
+
+def _mapping_with_addresses(pki: Pki, addresses: list[str]) -> dict:
+    mapping = _registry_mapping(pki)
+    mapping["peers"][0]["addresses"] = addresses
+    return mapping
+
+
+def test_an_mtls_peer_declaring_addresses_is_held_to_them(handler, pki):
+    """`addresses` was parsed and index-validated for every transport and then
+    consulted only on the plaintext path.
+
+    An operator writing `"addresses": ["10.99.0.7"]` into an mTLS entry is
+    saying "this certificate is only valid from that host" -- a second factor on
+    a stolen key, and the reason to write it at all. They got nothing, silently:
+    no enforcement and, unlike the mirror case, no warning either. `peers.py`
+    already tells an operator that fingerprints declared under plaintext are
+    unchecked; there was no symmetric line for this.
+
+    Enforced rather than warned about, because a declared allowlist that is
+    merely reported is still a control the operator believes they have.
+    """
+    peers = PeerRegistry.from_mapping(_mapping_with_addresses(pki, ["10.99.0.7"]))
+    engine = client_context(pki, pki.ris)
+    with serving(handler, peers) as address:
+        assert refused(address, order(control_id="ORM_1"), engine), (
+            "a certificate pinned to 10.99.0.7 was accepted from 127.0.0.1"
+        )
+    assert loops_of(handler) == []
+
+
+def test_an_mtls_peer_connecting_from_a_declared_address_is_accepted(handler, pki):
+    """The control case. Without it the refusal above could be passing on the
+    address check being broken rather than on it being enforced."""
+    peers = PeerRegistry.from_mapping(_mapping_with_addresses(pki, ["127.0.0.1"]))
+    engine = client_context(pki, pki.ris)
+    with serving(handler, peers) as address:
+        assert "|AA|" in deliver(address, order(control_id="ORM_1"), engine)
+    assert loops_of(handler)[0].state is LoopState.OPEN
+
+
+def test_an_mtls_peer_that_declares_no_addresses_is_not_constrained(handler, pki, peers):
+    """An absent allowlist is not an empty one.
+
+    Every existing mTLS registry omits `addresses`, and reading omission as
+    "permit nothing" would refuse every one of them. The declaration is the
+    opt-in, exactly as it is for `sending_facility`.
+    """
+    engine = client_context(pki, pki.ris)
+    with serving(handler, peers) as address:
+        assert "|AA|" in deliver(address, order(control_id="ORM_1"), engine)
+    assert loops_of(handler)[0].state is LoopState.OPEN
+
+
+def test_the_address_check_is_per_peer_not_registry_wide(pki):
+    """One peer's allowlist must not constrain another's. Asserted at the
+    registry, because the wire test above can only exercise one peer at a
+    time."""
+    peers = PeerRegistry.from_mapping(_mapping_with_addresses(pki, ["10.99.0.7"]))
+    assert peers.address_permitted(RIS, "10.99.0.7")
+    assert not peers.address_permitted(RIS, "127.0.0.1")
+    assert peers.address_permitted(LAB, "127.0.0.1"), (
+        "a peer that declared no addresses was constrained by another peer's list"
+    )
+
+
+def test_an_unparseable_source_address_fails_closed_against_a_declared_list(pki):
+    """`_address` refuses anything that is not an IP. A source we cannot
+    normalise cannot be shown to be on the list, and an allowlist that admits
+    what it could not check is not one."""
+    peers = PeerRegistry.from_mapping(_mapping_with_addresses(pki, ["10.99.0.7"]))
+    assert not peers.address_permitted(RIS, "not-an-address")
+
+
+def test_describe_says_whether_addresses_constrain_an_mtls_listener(pki):
+    """`describe()` is the one line an operator reads at every start, and its
+    mTLS branch did not mention addresses at all -- so a registry where they
+    were being ignored looked exactly like one where they were not declared."""
+    unconstrained = PeerRegistry.from_mapping(_registry_mapping(pki)).describe()
+    constrained = PeerRegistry.from_mapping(
+        _mapping_with_addresses(pki, ["10.99.0.7"])
+    ).describe()
+    assert "address" in constrained.lower()
+    assert constrained != unconstrained

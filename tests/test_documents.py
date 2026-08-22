@@ -93,7 +93,10 @@ def test_no_match_is_not_the_same_as_no_documents(certs, tmp_path):
     )
     with fhir_server(certfile, keyfile, behaviour) as (base, _b):
         registry = _registry(base, key_path, ca)
-        with pytest.raises(PatientNotFoundAtConnector, match="MRN1"):
+        # Matched on the connector, not the MRN: the identifier is deliberately no
+        # longer in the message. See test_a_patient_miss_keeps_the_mrn_out_of_the
+        # _exception_text below, and _PatientResolutionRefused for why.
+        with pytest.raises(PatientNotFoundAtConnector, match="example-med"):
             resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
 
 
@@ -332,3 +335,84 @@ def test_a_next_link_with_an_unknown_scheme_refuses_as_pagination(certs, tmp_pat
         registry = _registry(base, key_path, ca)
         with pytest.raises(PaginationRefused, match="scheme|allowlist"):
             find_candidate_documents(registry, registry.get("example-med"), mrn="MRN1", since=_SINCE)
+
+
+# ------------------------------- the MRN, and the rule this module wrote for it
+
+def test_a_patient_miss_keeps_the_mrn_out_of_the_exception_text(certs, tmp_path):
+    """`FhirRequestFailed`'s docstring states the rule for this whole module: an
+    MRN must not travel in a diagnostic string, because "there is no logging
+    scrubber in this codebase to catch that downstream".
+
+    The two refusals immediately below it broke it. `str(exc)` on a
+    `ReferralLoopError` is exactly what every caller in this package logs --
+    `registry.py`, `store.py` and `MessageHandler._process` all do -- so an MRN
+    in the message is an MRN in a log file the moment anything wires this up.
+    Nothing wires it up yet, which is why this is a landmine rather than a leak.
+    """
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    behaviour = ServerBehaviour(
+        bundles={"/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": bundle()}
+    )
+    with fhir_server(certfile, keyfile, behaviour) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PatientNotFoundAtConnector) as caught:
+            resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
+
+    assert "MRN1" not in str(caught.value)
+    assert "example-med" in str(caught.value), "the message must still name the connector"
+
+
+def test_an_ambiguous_patient_keeps_the_mrn_out_of_the_exception_text(certs, tmp_path):
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    behaviour = ServerBehaviour(
+        bundles={
+            "/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": bundle(patient("p1"), patient("p2"))
+        }
+    )
+    with fhir_server(certfile, keyfile, behaviour) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PatientAmbiguousAtConnector) as caught:
+            resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
+
+    assert "MRN1" not in str(caught.value)
+    assert "2" in str(caught.value), "the candidate count is the actionable part"
+
+
+def test_the_mrn_is_still_reachable_on_the_refusal_just_not_in_its_message(certs, tmp_path):
+    """Dropped from the message, not from the object. A caller that genuinely
+    needs to know which identifier missed can ask for it and decide where it
+    goes; the difference is that reaching for it is now a deliberate act rather
+    than the default consequence of logging the exception."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    behaviour = ServerBehaviour(
+        bundles={"/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": bundle()}
+    )
+    with fhir_server(certfile, keyfile, behaviour) as (base, _b):
+        registry = _registry(base, key_path, ca)
+        with pytest.raises(PatientNotFoundAtConnector) as caught:
+            resolve_patient(registry, registry.get("example-med"), mrn="MRN1")
+
+    assert caught.value.mrn == "MRN1"
+    assert caught.value.connector_id == "example-med"
+
+
+def test_query_urls_are_documented_as_phi_bearing(certs, tmp_path):
+    """`query_urls[0]` embeds the MRN and always has -- `patient_search_url`
+    percent-encodes it into the hop-1 URL, and the search deliberately records
+    the real URL rather than a reconstruction because "provenance that is
+    approximated is not provenance".
+
+    So this is not redacted; it is labelled. A field that carries PHI and does
+    not say so is the one that ends up in a log line or a support ticket, and
+    the label is what a reviewer wiring this into the worklist has to read past.
+    """
+    from referral_loop.connect.resources import DocumentSearch
+
+    doc = DocumentSearch.__doc__ or ""
+    assert "PHI" in doc and "query_urls" in doc, (
+        "query_urls carries an MRN and the dataclass does not say so"
+    )

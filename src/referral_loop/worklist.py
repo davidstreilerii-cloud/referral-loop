@@ -881,12 +881,14 @@ def make_worklist_server(
     registry: Registry,
     pack: RulePack,
     host: str = "127.0.0.1",
-    # 5057 here, but cli.py defaults --worklist-port to 5055 and passes it
-    # through, so a container or a command line reaches this function with 5055
-    # and this default only applies to an in-process caller that omits the
-    # argument. The disagreement is as old as both files. Recorded rather than
-    # reconciled: picking one is a code change. See the matching note in cli.py.
-    port: int = 5057,
+    # 5055, matching cli.py's --worklist-port and the Dockerfile's EXPOSE. This
+    # signature defaulted to 5057 for as long as both files existed, which meant
+    # a library caller that omitted the argument bound a different port than
+    # every documented way of starting the service. The extraction that found the
+    # disagreement recorded it rather than reconciling it, on the grounds that
+    # picking one is a code change; publication is the reason to pick one, since
+    # two defaults that disagree read as an accident whatever the comment says.
+    port: int = 5055,
 ):
     """A bound WSGI server for the worklist. Loopback by default and by refusal.
 

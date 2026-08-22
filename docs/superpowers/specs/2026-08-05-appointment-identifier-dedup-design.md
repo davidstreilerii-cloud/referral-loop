@@ -1,7 +1,14 @@
 # The appointment identifier, and the rebooking the content key eats
 
 **Date:** 2026-08-05
-**Status:** approved, not yet implemented
+**Status:** implemented. `content_key` hashes `_CONCEPT_APPOINTMENT_ID` alongside the placer and
+filler order numbers, `pack.json` carries `appointment_id: ["SCH-1", "SCH-2"]`,
+`_CONTENT_KEY_VERSION` is `rl-content-v2` with `_legacy_content_key` retained for the dual read,
+`scripts/sign_pack.py` points at `src/referral_loop/rules`, and the pinning test named below is
+inverted — it is now
+`tests/test_listener.py::test_a_rebooking_that_keeps_the_order_numbers_is_not_content_deduped`.
+The design text stays in the future tense it was written in; the record is the reasoning, not the
+tense.
 **Follows:** the `SIU^S15` un-schedule fix (`b702547`), which made this defect visible for the first time.
 
 ## The defect

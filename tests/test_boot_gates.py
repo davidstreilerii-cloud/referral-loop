@@ -32,7 +32,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from referral_loop import audit as referral_audit
-from referral_loop import cli
+from referral_loop import cli, encryption_check
 from referral_loop.cli import PUBKEY_ENV, boot, main
 from referral_loop.errors import (
     PackVerificationError,
@@ -173,7 +173,7 @@ def test_refuses_to_boot_when_encryption_at_rest_is_unverified(tmp_path, monkeyp
     monkeypatch.setenv("PHI_MODE", "full")
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
     monkeypatch.setattr(
-        "referral_loop.encryption_check._detect_os_encryption", lambda: None
+        "referral_loop.encryption_check._detect_os_encryption", lambda _volume: None
     )
     with pytest.raises(RuntimeError, match="encryption at rest"):
         boot(db_path=tmp_path / "loops.db", pack_dir=tmp_path, public_key_hex="00" * 32)
@@ -203,7 +203,7 @@ def test_the_control_case_boots(booted):
 def test_encryption_gate_fires_alone(tmp_path, good_env, monkeypatch):
     """Pack valid, thresholds accepted, encryption unattested."""
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda _volume: None)
     with pytest.raises(RuntimeError, match="encryption at rest"):
         boot(db_path=tmp_path / "loops.db", pack_dir=SHIPPED_PACK_DIR,
              public_key_hex=SHIPPED_PUBKEY)
@@ -251,7 +251,7 @@ def test_no_database_file_is_created_when_a_gate_refuses(tmp_path, good_env, mon
     """
     db = tmp_path / "nested" / "loops.db"
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda _volume: None)
     with pytest.raises(RuntimeError):
         boot(db_path=db, pack_dir=SHIPPED_PACK_DIR, public_key_hex=SHIPPED_PUBKEY)
     assert not db.exists()
@@ -335,7 +335,7 @@ def test_a_missing_pack_names_the_directory_it_looked_in(tmp_path, good_env, cap
 def test_encryption_refusal_names_the_attestation_variable(tmp_path, good_env,
                                                            monkeypatch, capsys):
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda _volume: None)
     code = main(["listen", "--allow-plaintext", "--db", str(tmp_path / "loops.db"),
                  "--pack-dir", str(SHIPPED_PACK_DIR)])
     err = capsys.readouterr().err
@@ -382,7 +382,7 @@ def test_purge_refuses_an_unattested_volume_even_with_a_stated_policy(
     monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
     monkeypatch.setenv("PHI_MODE", "full")
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda _volume: None)
 
     code = main(["purge", "--db", str(tmp_path / "loops.db")])
 
@@ -459,7 +459,7 @@ def test_stats_refuses_an_unattested_volume(tmp_path, monkeypatch, capsys):
     LoopStore(tmp_path / "loops.db")
     monkeypatch.setenv("PHI_MODE", "full")
     monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
-    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda: None)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda _volume: None)
 
     code = main(["stats", "--db", str(tmp_path / "loops.db")])
 
@@ -1040,3 +1040,257 @@ def test_store_unavailable_is_a_referral_loop_error():
     """The boot path catches ReferralLoopError; StoreUnavailableError must be one
     or a broken database would escape as a traceback."""
     assert issubclass(StoreUnavailableError, ReferralLoopError)
+
+
+# =========================== the encryption gate looks at the right volume
+
+# The gate is the one control the README says refuses the boot. It was checking
+# a drive it derived from `CHROMA_DB_PATH` -- a variable from the purged parent
+# repo, appearing exactly once in this tree -- and defaulting to "C:" when that
+# was unset, which it always is. So it answered a question nobody asked and
+# logged the answer as a confirmation.
+
+
+class _Recorder:
+    """Stands in for the OS probe and remembers what it was asked about."""
+
+    def __init__(self, answer=None):
+        self.answer = answer
+        self.asked: list[str] = []
+
+    def __call__(self, path):
+        self.asked.append(path)
+        return self.answer
+
+
+def test_the_gate_is_told_which_volume_holds_the_database(tmp_path, good_env, monkeypatch):
+    """The defect in one assertion.
+
+    `verify_encryption_at_rest(phi_mode)` took only the mode, so the Windows
+    branch inspected whatever drive it guessed at -- `C:` -- no matter where
+    `--db` pointed. PHI on an unencrypted `D:` with BitLocker on `C:` passed the
+    gate and wrote "Encryption at rest: detected via OS" into the log. A
+    manufactured pass on a control whose whole job is to refuse.
+    """
+    probe = _Recorder(answer="pretend BitLocker")
+    monkeypatch.setattr(encryption_check, "_detect_os_encryption", probe)
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+
+    db = tmp_path / "nested" / "loops.db"
+    boot(db_path=db, pack_dir=SHIPPED_PACK_DIR, public_key_hex=SHIPPED_PUBKEY)
+
+    assert probe.asked, "the gate never consulted the volume at all"
+    assert probe.asked[0] == os.path.abspath(str(db))
+
+
+@pytest.mark.parametrize("mode", ["purge", "stats"])
+def test_every_cli_entry_point_tells_the_gate_where_the_database_is(
+    tmp_path, good_env, monkeypatch, mode
+):
+    """Three call sites, and a gate that is only right at one of them is not a
+    gate. `purge` and `stats` both open the PHI file, and both had the same
+    signature to call."""
+    LoopStore(tmp_path / "loops.db")
+    probe = _Recorder(answer="pretend BitLocker")
+    monkeypatch.setattr(encryption_check, "_detect_os_encryption", probe)
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+    monkeypatch.setenv(RAW_DAYS_ENV, "30")
+    monkeypatch.setenv(RESOLVED_DAYS_ENV, "365")
+
+    db = tmp_path / "loops.db"
+    argv = [mode, "--db", str(db)] + (["--dry-run"] if mode == "purge" else [])
+    assert main(argv) == 0
+
+    assert probe.asked == [os.path.abspath(str(db))]
+
+
+def test_the_gate_cannot_be_called_without_a_volume_to_check():
+    """A control that can be invoked without the thing it protects will be, and
+    the version of it that was is the one this fixes."""
+    with pytest.raises(TypeError):
+        encryption_check.verify_encryption_at_rest("full")
+
+
+def test_the_purged_parent_repos_vector_store_is_not_named_here():
+    """`CHROMA_DB_PATH` appeared exactly once in this tree -- in the boot gate --
+    and ChromaDB is the first entry in `tests/test_import_closure.FORBIDDEN`. In
+    a repository whose front page says "It contains no AI. No model calls, no ML
+    stack, no model client", a live read of a vector store's configuration
+    variable is not dead config; it is the line a hostile reader screenshots.
+    """
+    named = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in sorted((REPO_ROOT / "src" / "referral_loop").rglob("*.py"))
+        if "CHROMA" in path.read_text(encoding="utf-8").upper()
+    ]
+    assert named == [], f"the vector store this package was extracted from is named in {named}"
+
+
+# --------------------------------------------------------- the Windows probe
+
+
+def _fake_run(recorder, stdout="", returncode=0):
+    def run(argv, **kwargs):
+        recorder.append(list(argv))
+        return subprocess.CompletedProcess(argv, returncode, stdout, "")
+    return run
+
+
+def test_bitlocker_is_asked_about_the_drive_the_database_is_on(monkeypatch):
+    """Not `C:`, and not a guess. The drive comes out of the path the caller
+    passed in, which is the whole point of threading it through."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(encryption_check.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(encryption_check.subprocess, "run",
+                        _fake_run(calls, stdout="Protection Status: Protection On"))
+
+    detected = encryption_check._detect_os_encryption(r"D:\phi\loops.db")
+
+    assert detected and "D:" in detected
+    assert calls and calls[0][1:] == ["-status", "D:"], calls
+
+
+def test_manage_bde_is_invoked_by_absolute_path(monkeypatch):
+    """Windows `CreateProcess` searches the application directory and the
+    current directory *before* PATH. `["manage-bde", ...]` therefore resolves to
+    a `manage-bde.exe` sitting next to the app or in whatever directory the
+    service happened to start in, and a planted one printing "Protection On"
+    satisfies `PHI_MODE=full` -- the strongest gate in the system defeated by
+    dropping a file beside it.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(encryption_check.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(encryption_check.subprocess, "run",
+                        _fake_run(calls, stdout="Protection On"))
+
+    encryption_check._detect_os_encryption(r"D:\phi\loops.db")
+
+    assert calls
+    program = calls[0][0]
+    assert os.path.isabs(program), f"{program!r} is resolved by search order, not by path"
+    assert program.lower() == os.path.join(r"C:\Windows", "System32", "manage-bde.exe").lower()
+
+
+def test_a_windows_volume_that_cannot_be_named_fails_closed(monkeypatch):
+    """A UNC path has no drive letter, and a file server's disks are not ours to
+    attest to. No drive, no detection -- and no detection under PHI_MODE=full is
+    a refused boot, which is the direction to fail in."""
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(encryption_check.subprocess, "run", _fake_run(calls, stdout="Protection On"))
+
+    assert encryption_check._detect_os_encryption(r"\\fileserver\phi\loops.db") is None
+    assert calls == [], "manage-bde was asked about a path with no local volume"
+
+
+def test_bitlocker_reporting_protection_off_is_not_a_pass(monkeypatch):
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(encryption_check.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(encryption_check.subprocess, "run",
+                        _fake_run([], stdout="Protection Status: Protection Off"))
+    assert encryption_check._detect_os_encryption(r"D:\phi\loops.db") is None
+
+
+# ----------------------------------------------------------- the Linux probe
+
+
+def _fake_linux(monkeypatch, answers: dict):
+    """subprocess.run keyed on the program name, so each probe can be scripted."""
+    def run(argv, **kwargs):
+        key = os.path.basename(argv[0])
+        stdout = answers.get(key)
+        if stdout is None:
+            raise FileNotFoundError(argv[0])
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(encryption_check.subprocess, "run", run)
+
+
+def test_a_crypt_device_backing_the_database_is_detected(monkeypatch):
+    _fake_linux(monkeypatch, {
+        "findmnt": "/dev/mapper/phi-crypt\n",
+        "lsblk": "crypt\n",
+    })
+    detected = encryption_check._detect_os_encryption("/srv/phi/loops.db")
+    assert detected and "/dev/mapper/phi-crypt" in detected
+
+
+def test_an_encrypted_swap_somewhere_else_on_the_host_is_not_a_pass(monkeypatch):
+    """The old check was `"crypt" in lsblk_output` over `lsblk -o NAME,TYPE` for
+    the *whole host*. One encrypted swap device anywhere -- a laptop default --
+    satisfied it for a plaintext PHI volume. The device backing the database is
+    the only device this can be about."""
+    _fake_linux(monkeypatch, {
+        "findmnt": "/dev/sdb1\n",
+        # The device the database is actually on. That an encrypted swap exists
+        # elsewhere on this host says nothing about it.
+        "lsblk": "part\n",
+    })
+    assert encryption_check._detect_os_encryption("/srv/phi/loops.db") is None
+
+
+def test_a_device_merely_named_cryptic_is_not_a_pass(monkeypatch):
+    """Substring matching on a device name is not a type check. `cryptic`,
+    `encrypted-backup`, a mount point with `crypt` in it: all matched."""
+    _fake_linux(monkeypatch, {
+        "findmnt": "/dev/mapper/cryptic\n",
+        "lsblk": "lvm\n",
+    })
+    assert encryption_check._detect_os_encryption("/srv/phi/loops.db") is None
+
+
+def test_a_btrfs_subvolume_source_is_read_as_its_device(monkeypatch):
+    """findmnt reports a btrfs subvolume as `/dev/mapper/x[/subvol]`, and that
+    string is not a device lsblk will answer for."""
+    seen: list[list[str]] = []
+
+    def run(argv, **kwargs):
+        seen.append(list(argv))
+        if os.path.basename(argv[0]) == "findmnt":
+            return subprocess.CompletedProcess(argv, 0, "/dev/mapper/phi-crypt[/loops]\n", "")
+        return subprocess.CompletedProcess(argv, 0, "crypt\n", "")
+
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(encryption_check.subprocess, "run", run)
+
+    assert encryption_check._detect_os_encryption("/srv/phi/loops.db") is not None
+    assert seen[-1][-1] == "/dev/mapper/phi-crypt"
+
+
+def test_an_unidentifiable_linux_volume_fails_closed(monkeypatch):
+    """findmnt absent, or answering nothing. A volume we could not identify is
+    not a volume we may call encrypted."""
+    _fake_linux(monkeypatch, {"lsblk": "crypt\n"})  # no findmnt on this host
+    assert encryption_check._detect_os_encryption("/srv/phi/loops.db") is None
+
+
+def test_failing_to_identify_the_volume_refuses_the_boot_under_phi_mode_full(
+    tmp_path, monkeypatch
+):
+    """The end of the chain, asserted rather than argued: `None` from the probe
+    plus `PHI_MODE=full` and no attestation is a refused boot. `docs/security-
+    model.md` says "the process refuses to start unless disk encryption is
+    verified"."""
+    monkeypatch.setenv("PHI_MODE", "full")
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+    monkeypatch.setattr(encryption_check, "_detect_os_encryption", _Recorder(answer=None))
+    with pytest.raises(RuntimeError, match="encryption at rest"):
+        encryption_check.verify_encryption_at_rest("full", str(tmp_path / "loops.db"))
+
+
+def test_an_os_probe_that_raises_is_not_a_pass(monkeypatch, tmp_path):
+    """The bare `except ... : pass` this module shipped with swallowed the
+    failure and fell through to `return None`, which is the right answer -- but
+    it was right by accident rather than by statement."""
+    def boom(*_args, **_kwargs):
+        raise OSError("no such tool")
+
+    monkeypatch.setattr(encryption_check.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(encryption_check.subprocess, "run", boom)
+    assert encryption_check._detect_os_encryption(str(tmp_path)) is None

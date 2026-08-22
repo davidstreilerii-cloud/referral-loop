@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -969,8 +970,101 @@ def test_spec_11_can_fail(system, monkeypatch):
 # =========================== 12 & 13. no egress, no model calls -- the WHOLE suite
 
 
+# The floor that applies when the outer invocation is *not* the whole suite -- running this
+# file alone, or `-k spec_12`, leaves `session.items` too small for the derived check below
+# to say anything. The suite collected 1845 non-docker tests the day this was written, of
+# which the guarded child accounted for 1844 -- every one but this test, which it deselects
+# -- with five environment skips among them. 1800 is a floor and not a target: it has to be
+# revised upward as the suite grows, and a build that legitimately removes tests has to
+# lower it deliberately rather than watch a stale, generous constant absorb the loss. The
+# value it replaced was 700, against a suite of 1815 -- the child could have lost 1100 tests
+# and still reported this proof green.
+_MINIMUM_TESTS_UNDER_THE_GUARDS = 1800
+
+
+def _summary_count(stdout: str, outcome: str) -> int:
+    """`1834 passed, 5 skipped in 512s` -> the count for one outcome, 0 if absent.
+
+    Last match, not first: the word also occurs in this file's own source, which a
+    traceback would echo back into the captured output.
+    """
+    matches = re.findall(rf"(\d+) {outcome}\b", stdout)
+    return int(matches[-1]) if matches else 0
+
+
+def _vacuity_problems(stdout: str, outer_selected: int) -> list[str]:
+    """Everything wrong with the *size* of a guarded run, given the outer run's own
+    non-docker selection. Split out from the test so it can itself be tested -- an
+    anti-vacuity check that has never been shown to fire is the thing it warns about.
+
+    Two independent floors, because each covers where the other is blind:
+
+    - The derived one. The guarded run is the same suite as the outer run minus this
+      test, so `passed + skipped` in the child must reach `outer_selected - 1`. That is
+      exact, needs no maintenance, and tightens automatically as the suite grows. It says
+      nothing when the outer invocation was a subset (`-k`, a single file), which is
+      precisely when the constant below carries the weight.
+    - The constant. Blunt, needs updating, and is the only thing standing between a
+      single-file invocation of this proof and a green report over an empty child run.
+
+    Skips count toward the floor but are capped: a suite that "runs" by skipping is the
+    other way this proof goes hollow, and it would satisfy a pure count.
+    """
+    passed = _summary_count(stdout, "passed")
+    skipped = _summary_count(stdout, "skipped")
+    # xfail/xpass are counted only toward "did the child run this test at all". There are
+    # none today; they are here so that adding one does not turn the derived floor red for
+    # a reason that has nothing to do with egress.
+    ran = passed + skipped + _summary_count(stdout, "xfailed") + _summary_count(stdout, "xpassed")
+    problems = []
+    if passed < _MINIMUM_TESTS_UNDER_THE_GUARDS:
+        problems.append(
+            f"only {passed} tests passed under the guards; expected at least "
+            f"{_MINIMUM_TESTS_UNDER_THE_GUARDS}"
+        )
+    if outer_selected > 1 and ran < outer_selected - 1:
+        problems.append(
+            f"the guarded run accounted for {ran} tests ({passed} passed, {skipped} "
+            f"skipped), but this run selected {outer_selected} non-docker tests, all but "
+            f"this one of which the child should have run"
+        )
+    if skipped > passed // 20:
+        problems.append(
+            f"{skipped} of {passed + skipped} tests skipped under the guards; a suite that "
+            f"passes by skipping proves nothing about egress"
+        )
+    return problems
+
+
+@pytest.mark.parametrize(
+    "stdout,outer,expected_problem",
+    [
+        # The old floor's blind spot, stated as a case: two thirds of the suite gone.
+        ("701 passed in 12.00s", 1840, "only 701 tests passed"),
+        # Collection broke in the child and it ran a fraction of what the parent selected.
+        (f"{_MINIMUM_TESTS_UNDER_THE_GUARDS + 5} passed in 12.00s", 2600, "selected 2600"),
+        # A run that "passed" by skipping.
+        ("1800 passed, 400 skipped in 12.00s", 1840, "400 of 2200 tests skipped"),
+        # No summary line at all -- a child that collected nothing.
+        ("", 1840, "only 0 tests passed"),
+    ],
+)
+def test_the_anti_vacuity_floor_can_actually_fail(stdout, outer, expected_problem):
+    """The guarded run takes minutes, so its floor is the one assertion in this file with
+    no cheap way to watch it go red -- which is how it sat at 39% of the suite unnoticed.
+    These are the runs it must reject."""
+    problems = _vacuity_problems(stdout, outer)
+    assert any(expected_problem in problem for problem in problems), problems
+
+
+def test_the_anti_vacuity_floor_accepts_a_real_guarded_run():
+    """The shape the child actually emits, so the check above cannot be satisfied by
+    rejecting everything."""
+    assert _vacuity_problems("1834 passed, 5 skipped, 11 deselected in 500.00s", 1840) == []
+
+
 @pytest.mark.timeout(3600)
-def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
+def test_spec_12_and_13_the_whole_suite_runs_under_both_guards(request):
     """Spec tests 12 and 13 as written: block non-loopback `socket.connect`,
     monkeypatch `anthropic` and `claude_cli` to raise, and the **full suite**
     passes.
@@ -1026,10 +1120,16 @@ def test_spec_12_and_13_the_whole_suite_runs_under_both_guards():
     )
     tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-25:])
     assert proc.returncode == 0, f"the guarded suite did not pass:\n{tail}"
-    # Anti-vacuity: a run that collected nothing also reports no failures.
-    assert " passed" in proc.stdout, tail
-    passed = int(proc.stdout.split(" passed")[0].split()[-1])
-    assert passed > 700, f"only {passed} tests ran under the guards:\n{tail}"
+    # Anti-vacuity: a run that collected nothing also reports no failures. The size of the
+    # child run is checked against this run's own non-docker selection, so the floor is the
+    # real suite rather than a constant somebody has to remember to raise. Docker items are
+    # excluded here because the child excludes them by marker; counting them would make this
+    # fail on exactly the invocation the README calls normal.
+    outer_selected = sum(
+        1 for item in request.session.items if not item.get_closest_marker("docker")
+    )
+    problems = _vacuity_problems(proc.stdout, outer_selected)
+    assert not problems, "\n".join(problems) + f"\n{tail}"
 
 
 def test_spec_12_the_egress_guard_can_actually_fail():

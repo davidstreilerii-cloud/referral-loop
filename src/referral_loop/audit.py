@@ -515,6 +515,17 @@ def _emit(
             )
         )
         return True
+    except (KeyboardInterrupt, SystemExit):
+        # Not an audit failure, so not fail-open. The catch below is deliberately
+        # as wide as `BaseException` because *any* way this write can go wrong
+        # must not block a coordinator -- but Ctrl-C and a shutdown are not ways
+        # this write went wrong, they are the operator ending the process, and
+        # absorbing them would log "audit write dropped" and carry on. Re-raised
+        # ahead of the wide catch rather than narrowed into it, so the fail-open
+        # decision below keeps covering the errors it was written for --
+        # including the ones that do not inherit from `Exception`.
+        # `store.py`'s transition writer and `audited` below both do this.
+        raise
     except BaseException as exc:  # noqa: BLE001 - deliberate, see module docstring
         _note_failure(action, outcome, exc)
         return False

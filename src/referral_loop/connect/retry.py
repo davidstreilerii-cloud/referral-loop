@@ -11,6 +11,7 @@ intervals can only be observed by waiting for them is a policy nobody tests prec
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from time import sleep as _real_sleep
 
@@ -46,12 +47,28 @@ def _wait_for(response: Response, attempt: int) -> float:
             # as "retry immediately" -- so fall through to our own backoff.
             logger.debug("unparseable Retry-After %r; using backoff instead", raw)
         else:
-            capped = min(asked, float(MAX_RETRY_AFTER_SECONDS))
-            if capped < asked:
-                logger.warning(
-                    "server asked us to wait %ss; waiting %ss instead", asked, capped
-                )
-            return capped
+            if not (math.isfinite(asked) and asked > 0):
+                # Parsing is not validating. `float()` accepts far more than a
+                # delay -- "-1", "nan" and "inf" all succeed -- and `min()` hands
+                # the first two straight to the sleep, where `time.sleep(-5.0)`
+                # and `time.sleep(nan)` both raise ValueError. That escapes every
+                # handler in `fetch_retrying`, `acquire_token` and `preflight`,
+                # which are written for transport failures, so any endpoint
+                # answering 429 with `Retry-After: -1` ends the fetch in an
+                # unhandled traceback. Zero is refused alongside them: "wait no
+                # time at all" is precisely the reading the branch above already
+                # says a server does not get to impose.
+                #
+                # Same answer as an unparseable value, and deliberately the same:
+                # a header we will not act on is a header we do not have.
+                logger.debug("out-of-range Retry-After %r; using backoff instead", raw)
+            else:
+                capped = min(asked, float(MAX_RETRY_AFTER_SECONDS))
+                if capped < asked:
+                    logger.warning(
+                        "server asked us to wait %ss; waiting %ss instead", asked, capped
+                    )
+                return capped
     return BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
 
 

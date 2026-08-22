@@ -136,7 +136,10 @@ def boot(db_path: Path | str, pack_dir: Path | str, public_key_hex: str) -> Boot
     riding on another's failure. Encryption goes first because it is the one
     that must hold before anything touches disk.
     """
-    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"))
+    # The resolved path, not the mode alone. The gate derives the volume it
+    # inspects from this argument; without it the Windows branch guessed at a
+    # drive and passed on the wrong one. See encryption_check.
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"), db_path)
     pack = load_pack(Path(pack_dir), _public_key(public_key_hex))
     require_thresholds_accepted()
 
@@ -352,7 +355,7 @@ def _run_purge(args) -> int:
     compliance record attached to it.
     """
     policy = RetentionPolicy.from_env()
-    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"))
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"), args.db)
 
     db_path = Path(args.db)
     if not db_path.is_file():
@@ -413,7 +416,7 @@ def _run_stats(args) -> int:
     command produces is exactly the kind of number that gets pasted into a
     ticket without anyone checking the path first.
     """
-    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"))
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"), args.db)
 
     db_path = Path(args.db)
     if not db_path.is_file():
@@ -592,13 +595,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worklist-host", default="127.0.0.1",
                         help="worklist mode: bind address. Non-loopback is refused -- the "
                              "page has no authentication (default: %(default)s)")
-    # 5055 here, but `make_worklist_server`'s own signature defaults to 5057 and
-    # the worklist tests use 5057 throughout. The two have disagreed since both
-    # were written, and this path wins in practice: _run_worklist passes
-    # args.worklist_port through, so the library default is only ever reached by
-    # an in-process caller that omits the argument. Recorded rather than
-    # reconciled -- picking one is a code change, and the extraction that found
-    # this makes none. See the matching note in worklist.py.
+    # 5055, and `make_worklist_server` now agrees. It defaulted to 5057 until
+    # publication, so an in-process caller that omitted the argument bound a port
+    # nothing else in the project used. One number now. Some worklist tests still
+    # spell 5057 in URLs -- those exercise Host and Origin handling, where the
+    # port is incidental and any value works.
     parser.add_argument("--worklist-port", type=int, default=5055,
                         help="worklist mode: port (default: %(default)s)")
     parser.add_argument("--baseline-pack-dir", default="",
