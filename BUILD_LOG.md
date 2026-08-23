@@ -30,9 +30,11 @@ Ten false or stale claims, found by four independent reviewers, corrected at the
   not compiled in, and the index-inclusive floor is nearer 209 B/row), and the six growth
   projections built on it under-projected by 1.3–1.8×. Structural point and the pointer to
   `referral-loop stats` kept; invented precision removed.
-- **`Example Radiology`** in `README-technical.md`'s `peers.json` example — real practices trade
-  under that name, the same class of problem already fixed once for the connector example. Now
-  `example-radiology` / `Example Radiology Group`.
+- **A plausibly-real radiology practice name** in `README-technical.md`'s `peers.json` example —
+  real practices trade under names of that shape, the same class of problem already fixed once for
+  the connector example. Now `example-ris` / `Example Radiology`. The old value is deliberately not
+  quoted here: the history rewrite substitutes it wherever it appears, including inside a sentence
+  recording that it was replaced, which would leave this entry saying the new name is the risky one.
 - **§11.6a's commit SHAs.** 17 of ~19 do not resolve; `git filter-repo` rewrote every pre-extraction
   hash. One sentence added saying so. Not remapped individually — a hand-remapped table is one
   nobody can check against the audit it came from. `729ffb6` postdates the extraction and resolves.
