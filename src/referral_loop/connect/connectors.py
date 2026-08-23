@@ -53,7 +53,13 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectorConfigError(ReferralLoopError):
-    """The connector file is wrong. Refuse the boot; a default would be us deciding."""
+    """The connector file is wrong. Refuse the boot; a default would be us deciding.
+
+    Not retryable: a refused boot has accepted no message, and the fix is an edit
+    to a file rather than a second attempt.
+    """
+
+    retryable = False
 
 
 def _refuse(message: str) -> ConnectorConfigError:

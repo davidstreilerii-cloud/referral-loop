@@ -353,13 +353,28 @@ class MLLPServer(socketserver.ThreadingTCPServer):
     tls_context: ssl.SSLContext | None
     tls_handshake_timeout: float
 
+    # request object -> the source address whose slot it is holding. Written on
+    # the accept thread by `verify_request` and read on the connection thread by
+    # `shutdown_request`, so it is guarded; a dict mutated from two threads is
+    # the same unsound thing `_PeerLedger` refuses to do with a bare `+= 1`.
+    #
+    # Keyed on the request rather than on the address, because the address is
+    # not a key: `MAX_CONNECTIONS_PER_PEER` is greater than one, so a peer holds
+    # several slots at once and a close has to return exactly the one its own
+    # accept took. The entry lives only between the accept and the close, so the
+    # dict holds what is currently connected and nothing else. Annotated rather
+    # than assigned, like every attribute above, so no dict is shared across
+    # servers.
+    _admitted: dict[object, str]
+    _admitted_lock: threading.Lock
+
     def verify_request(self, request, client_address) -> bool:
         """Refuse a connection before it costs a thread, a slot or a handshake.
 
         socketserver spawns the connection thread in `process_request`, which
         runs only if this returns True, so this is the one place a connection
         can be refused without first paying for the resource it was opened to
-        consume. The slot taken here is returned in `MLLPRequestHandler.handle`.
+        consume. The slot taken here is returned in `shutdown_request`.
 
         **The TLS handshake deliberately happens after this**, on the connection
         thread, and that ordering is the whole point rather than an
@@ -394,6 +409,8 @@ class MLLPServer(socketserver.ThreadingTCPServer):
             )
             return False
         if self.peers.admit(peer):
+            with self._admitted_lock:
+                self._admitted[request] = peer
             return True
         logger.warning(
             "Refusing a connection from %s: it is at its connection cap, or the listener "
@@ -401,6 +418,56 @@ class MLLPServer(socketserver.ThreadingTCPServer):
             "interface engine.", peer,
         )
         return False
+
+    def shutdown_request(self, request) -> None:
+        """Return the slot this connection took, then close it as usual.
+
+        **Here rather than in `MLLPRequestHandler.handle`, because `handle` is
+        not the only path off an accept.** socketserver runs `verify_request`,
+        then `process_request`, which for `ThreadingMixIn` is a bare `t.start()`;
+        `handle` runs on that thread. Thread creation fails -- under memory
+        pressure, and under a process-wide thread limit -- and anything raised
+        inside `process_request` means the handler is never constructed. The slot
+        and the `_open[peer]` entry were then never returned, so `MAX_CONNECTIONS`
+        shrank by one for the life of the process and the listener went deaf with
+        no counter, no ACK and no ERROR line. The old comment on `handle`'s
+        `finally` said `verify_request` "is the only path that reaches here",
+        which is true and is the wrong direction: every path here came from an
+        accept, but not every accept arrives here.
+
+        **Called exactly once per accepted connection, on every path**, which is
+        what makes it safe to release from -- checked against this interpreter's
+        `socketserver`, not assumed. `_handle_request_noblock` calls it in the
+        `else` when `verify_request` refused, and in both `except` clauses when
+        `process_request` raised; `ThreadingMixIn.process_request_thread` calls
+        it in a `finally` when the thread did start. Those are alternatives, not
+        additions: the thread only exists if `process_request` returned, and the
+        `except` clauses only run if it did not.
+
+        **Keyed on the admission, not on the close, and that is the load-bearing
+        part.** The refusal path reaches this method too -- and it took no slot.
+        Releasing unconditionally would return one that was never acquired, and
+        `_slots` is a `BoundedSemaphore` specifically so that raises `ValueError`
+        rather than quietly inflating the cap. It would raise on the accept
+        thread inside a call socketserver does not guard, killing `serve_forever`
+        -- a listener that accepts nothing at all, which is a worse outage than
+        the leak. So the release happens only for a request `verify_request`
+        recorded, and `pop` makes a second call a no-op rather than a second
+        release.
+
+        The release is after the close, deliberately: the descriptor is back
+        before the slot that permits another one is.
+        """
+        with self._admitted_lock:
+            peer = self._admitted.pop(request, None)
+        try:
+            super().shutdown_request(request)
+        finally:
+            # In a `finally`, because a socket that could not be shut down is
+            # still a connection that has ended. Keeping the slot over a failed
+            # `close` would be the leak again, arriving through its own fix.
+            if peer is not None:
+                self.peers.release(peer)
 
 
 class MLLPRequestHandler(socketserver.BaseRequestHandler):
@@ -416,12 +483,12 @@ class MLLPRequestHandler(socketserver.BaseRequestHandler):
                 return
             self._serve(server, peer)
         finally:
+            # The connection slot is *not* returned here. It is returned in
+            # `MLLPServer.shutdown_request`, which socketserver calls on the
+            # paths that never reach this method as well as on the one that
+            # does; see the argument there. This `finally` keeps only the socket
+            # the handshake left us holding, which is ours and nobody else's.
             self._close_secured()
-            # Pairs with the slot taken in verify_request, which is the only
-            # path that reaches here. A cap whose slots are not returned shrinks
-            # to zero over an afternoon of ordinary traffic -- an outage
-            # arriving by way of the fix for one.
-            server.peers.release(self.client_address[0])
 
     def _secure(self, server: MLLPServer) -> bool:
         """Complete the TLS handshake, on this connection's own thread.
@@ -863,6 +930,11 @@ def make_mllp_server(
         logging.INFO if peers.requires_tls else logging.WARNING, "%s", peers.describe()
     )
     server = MLLPServer((host, port), MLLPRequestHandler)
+    # Before the bind's first accept can reach verify_request. Per instance, so
+    # two servers in one process (which the tests routinely run) do not share a
+    # ledger of who is connected.
+    server._admitted = {}
+    server._admitted_lock = threading.Lock()
     server.peer_registry = peers
     server.tls_context = tls_context
     server.tls_handshake_timeout = tls_handshake_timeout

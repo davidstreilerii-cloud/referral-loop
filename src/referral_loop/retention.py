@@ -71,7 +71,7 @@ before assuming either table needs the bound this module refuses to add.
 
 The audit trail
     Never touched, and this module never opens that database to delete from it.
-    ``guardrails/immutable_audit.py`` blocks deletion at its own authorizer, and
+    ``immutable_audit.py`` blocks deletion at its own SQLite authorizer, and
     audit retention is governed by a different and usually longer policy than
     clinical data. It is written *to*: a delete path over PHI that leaves no
     record of having run is the first thing an auditor asks about, and after it
@@ -94,6 +94,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from .audit import SYSTEM_ACTOR, SYSTEM_ROLE, AuditAction, AuditScope, audited
+from .clock import as_utc
 from .errors import ReferralLoopError
 from .events import LoopState
 from .store import LoopStore
@@ -245,7 +246,7 @@ def purge(
     412` has to be able to conclude that 412 loops are gone. `nullcontext` keeps
     the two paths structurally identical so the real one cannot be edited around.
     """
-    now = datetime.now(timezone.utc) if now is None else store._as_utc(now)
+    now = datetime.now(timezone.utc) if now is None else as_utc(now)
 
     recorder = (
         nullcontext(AuditScope()) if dry_run

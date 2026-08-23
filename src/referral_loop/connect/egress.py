@@ -45,9 +45,20 @@ class EgressRefused(ReferralLoopError):
     acceptable on a second attempt.
     """
 
+    retryable = False
+
 
 class ConnectorUnreachable(ReferralLoopError):
-    """Network or TLS failure reaching a configured endpoint."""
+    """Network or TLS failure reaching a configured endpoint.
+
+    `retryable = False` even though a network partition heals, and the
+    distinction is the one the attribute is named for. Re-attempting *this
+    request* is `connect/retry.py`'s call; `retryable` asks whether an interface
+    engine should redeliver an inbound HL7 message, and no inbound message is
+    waiting on an outbound fetch.
+    """
+
+    retryable = False
 
 
 @dataclass(frozen=True)

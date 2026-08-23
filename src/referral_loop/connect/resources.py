@@ -24,7 +24,13 @@ class ResourceMalformed(ReferralLoopError):
     Not fatal to a search -- documents.py skips and counts these, the same posture
     UnparseableSegmentError already takes for a bad HL7 segment. One malformed resource must not
     hide the nine good ones.
+
+    Not retryable, and the same reason UnparseableSegmentError is not: the bytes
+    parse the same way next time, and nothing was refused that a redelivery
+    could re-offer.
     """
+
+    retryable = False
 
 
 @dataclass(frozen=True)

@@ -142,3 +142,44 @@ capacity figure claimed index-inclusive measurement this codebase cannot produce
 **No fabricated data.** The audit that hunted it found two data artifacts totalling 807 bytes,
 both synthetic or cryptographic, and `data/` correctly gitignored. 30+ external citations
 verified against source.
+
+## 2026-08-23 — due-diligence pass
+
+```
+1908 passed, 5 skipped, 11 deselected in 936.42s (0:15:36)
+Required test coverage of 90.0% reached. Total coverage: 95.92%
+ruff: All checks passed   mypy: no issues in 40 source files
+```
+
+**Retryability is a type property, not prose.** `ReferralLoopError.retryable` defaults False;
+all 25 subclasses declare it in their own class body and a test fails the build if one inherits
+the default silently. The listener dispatches on the attribute rather than a class ladder, so a
+new error class can no longer join the fail-open side by being forgotten. The bare
+`except Exception` stays fail-open on purpose: AE on a message that will fault identically on
+every redelivery takes the whole feed off the air rather than costing one message.
+
+**A fourth boot gate: a writable audit trail.** Gated on the resolved path, not on the variable,
+so a source checkout still boots and an installed deployment is told at boot instead of finding
+an empty trail later. It runs before the pack gate because `load_pack` is itself audited —
+ordered last, the gate dirtied the counter it exists to protect on its way to refusing.
+
+**The counters are reachable.** New `health` mode reports every handler counter plus the audit
+trail's path and write-failure count; a listener logs the same on shutdown. `counters()` derives
+from `vars(self)`, so one added later cannot be left out of the report.
+
+**`eval` no longer writes site PHI to the OS temp directory**, and `replay` refuses a
+site-derived corpus given no scratch location — enforced where the property lives rather than by
+its one caller.
+
+**Connection slots return on every path.** Release moved to `shutdown_request`, keyed on the
+admission rather than the address, verified against this interpreter's socketserver for the
+double-release case a BoundedSemaphore would raise on.
+
+**`rebuild` is a CLI mode.** It recovers a worklist that a restore left empty. Encryption gate
+yes, pack gate no: the moment a site needs it is after a disaster, which is not the moment to
+discover where the signing key was.
+
+Also: `clock.as_utc` replaces six identical private copies (and the layering claim in clock.py's
+docstring now has a test, which it did not before); every dangling reference to the extracted-from
+codebase is gone from `src/`; the HL7 v2.7 fifth encoding character is named as considered and
+refused rather than implied not to exist; every organization in examples is now Example-prefixed.

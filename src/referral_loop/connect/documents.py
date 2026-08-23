@@ -40,7 +40,12 @@ class ConnectorCannotResolvePatients(ReferralLoopError):
 
     Raised rather than returning an empty result, because empty would say "the specialist filed
     nothing" when the truth is "we never asked".
+
+    Not retryable. Nothing about a second attempt gives the connector an
+    identifier system it was not configured with.
     """
+
+    retryable = False
 
 
 class _PatientResolutionRefused(ReferralLoopError):
@@ -59,7 +64,15 @@ class _PatientResolutionRefused(ReferralLoopError):
     may need to know *which* identifier missed. The point of the move is that reaching for
     it is now a deliberate act at a call site that can decide where it goes, instead of the
     default consequence of logging the exception.
+
+    Neither answer is retryable, and both subclasses restate it rather than lean
+    on this one: a `retryable` inherited from a *private* base is exactly the
+    silent inheritance the guard on this attribute exists to catch, and a reader
+    of `PatientAmbiguousAtConnector` should not have to find `_PatientResolutionRefused`
+    to learn what the listener would do with it.
     """
+
+    retryable = False
 
     def __init__(self, message: str, *, connector_id: str = "", mrn: str = ""):
         super().__init__(message)
@@ -70,7 +83,12 @@ class _PatientResolutionRefused(ReferralLoopError):
 
 
 class PatientNotFoundAtConnector(_PatientResolutionRefused):
-    """The identifier matched nobody here. Not the same as having no documents."""
+    """The identifier matched nobody here. Not the same as having no documents.
+
+    Not retryable: the same identifier matches nobody on the second query too.
+    """
+
+    retryable = False
 
 
 class PatientAmbiguousAtConnector(_PatientResolutionRefused):
@@ -78,7 +96,14 @@ class PatientAmbiguousAtConnector(_PatientResolutionRefused):
 
     Picking one is how another patient's consult note gets attached to this referral. Choosing
     between candidates is the identity-resolution slice's problem, not this one's.
+
+    Not retryable, and deliberately so even though the ambiguity may genuinely
+    clear once somebody merges the duplicate charts. That is a registration fix
+    on a timescale no interface engine's outbound queue survives, and the same
+    posture `CircularMergeError` takes: decline, tell a human, do not spin.
     """
+
+    retryable = False
 
 
 class FhirRequestFailed(ReferralLoopError):
@@ -87,7 +112,13 @@ class FhirRequestFailed(ReferralLoopError):
     Carries the OperationOutcome's severity and code, which are enumerated FHIR values, and
     never its diagnostics -- servers routinely echo the failing request there and ours contains
     an MRN. There is no logging scrubber in this codebase to catch that downstream.
+
+    `retryable = False` and the first line of this docstring say the same thing
+    from two directions: `connect/retry.py` has already exhausted the statuses
+    worth re-attempting by the time this is raised.
     """
+
+    retryable = False
 
 
 def _outcome_summary(response: Response) -> str:
@@ -231,7 +262,13 @@ MAX_RESOURCES = 500
 
 
 class PaginationRefused(ReferralLoopError):
-    """A next link led somewhere it should not, or the walk ran past its budget."""
+    """A next link led somewhere it should not, or the walk ran past its budget.
+
+    Not retryable: a link outside the allowlist is outside it on the next walk
+    too, and a budget re-spent from the start reaches the same bound.
+    """
+
+    retryable = False
 
 
 def _next_url(bundle: Mapping[str, object]) -> str | None:

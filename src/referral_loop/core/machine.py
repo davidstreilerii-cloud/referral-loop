@@ -119,7 +119,18 @@ class TransitionRejected(ReferralLoopError):
     The message names the referral and the attempted move and nothing else. It must never
     carry a patient identifier: a confirmed finding in this codebase is that MRNs reach
     application logs through exception messages, and every caller of this logs the string.
+
+    Not retryable, and this is the class where that declaration earns its keep.
+    It is documented above as landing in the listener's `ReferralLoopError`
+    clause, which is precisely the clause that used to answer `AA` by default --
+    so before the attribute existed, this one's fate on the wire was decided by
+    where it happened to fall in an `except` ladder rather than by anything the
+    state machine said. `False` is right: the machine refuses the same move from
+    the same state every time it is asked, so `AE` would queue a message that can
+    only ever be re-refused.
     """
+
+    retryable = False
 
     def __init__(
         self,

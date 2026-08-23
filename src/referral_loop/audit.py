@@ -1,16 +1,30 @@
 """Referral audit: a typed, allowlisted wrapper over `immutable_audit.py`.
 
-Spec section 3 routes referral audit through `guardrails/immutable_audit.py` and
-nothing else. It owns its own append-only database and blocks UPDATE and DELETE
-at the SQLite authorizer -- the property section 6 requires of `loop_events`
-anyway. `db.py` and `audit_trail.py` are excluded, and the reason matters here:
-`audit_trail.AuditEvent` carries a free-text `query_summary`, the same channel
-shape that leaked through an unbounded free-text field in an earlier system.
+Spec section 3 routes referral audit through the immutable audit store -- here
+`referral_loop/immutable_audit.py`, vendored as an ordinary sibling; see below
+for what it was before the extraction -- and through nothing else. It owns its
+own append-only database and blocks UPDATE and DELETE at the SQLite authorizer,
+the property section 6 requires of `loop_events` anyway.
 
-`GuardrailAuditEvent` has that shape too. Its `detail` is documented as "JSON
-string with additional context" and its `resource_id` is a bare string, so
-importing the module and calling it directly would reintroduce exactly the
-channel that motivated excluding `audit_trail`. **This module is the control.**
+The spec reached that instruction by *excluding* the other two audit facilities
+the original system offered, and the reason it excluded them is the reason this
+module exists, so it is worth restating rather than citing. Neither of those
+modules is in this repository and neither is named here, because a pointer a
+reader cannot follow is worth nothing; what matters is their shape. One of them
+recorded each event with a free-text summary field, filled from whatever a human
+had typed. A free-text field in an audit store is an unbounded channel into it:
+nothing about the field constrains what arrives, so the store's PHI footprint
+stops being a property of the schema and becomes a property of every caller. It
+had already carried more than intended once, elsewhere in that system, which is
+what put the exclusion in the spec.
+
+The store that *was* chosen has that shape too, which is the part the spec did
+not settle. `GuardrailAuditEvent.detail` is documented as "JSON string with
+additional context" and its `resource_id` is a bare string, so importing
+`immutable_audit` and calling it directly would reintroduce exactly the channel
+the exclusion was about -- an append-only database is immune to tampering, not to
+being told something it should never have been told. **This module is the
+control.** It is the reason the choice of store is not the whole of the answer.
 
 The invariant, written so it can be tested rather than reviewed
 ---------------------------------------------------------------
@@ -71,18 +85,22 @@ that the audit database holds no message-derived value at all.
 
 Why the audit store used to be loaded by file path, and is not any more
 ------------------------------------------------------------------------
-In the monorepo this module reached the audit store with
+Before the extraction this module reached the audit store with
 `importlib.util.spec_from_file_location`, not an import, and the reason was the
-package around it: `from healthcare_rag.guardrails.immutable_audit import ...`
-executes `healthcare_rag/guardrails/__init__.py`, which re-exports the whole
-stack -- including `tenant_isolation`, which spec section 3 says is deliberately
-**not** imported, because "importing an unexercised isolation control would
-suggest a guarantee the build does not test". A package's convenience re-exports
-would otherwise have settled an architectural question the spec settled the
-other way, and `test_import_closure.py` lists that module as forbidden.
+package that used to sit around it. The audit store lived inside a guardrails
+package whose `__init__.py` re-exported the whole stack, so importing the one
+module executed the package and bound all of them -- including the tenant
+isolation control, which spec section 3 says is deliberately **not** imported,
+because "importing an unexercised isolation control would suggest a guarantee
+the build does not test". Convenience re-exports would have settled an
+architectural question the spec settled the other way, and a file-path load was
+the only way to take one module without its siblings.
 
-That package is not in this repo. `immutable_audit.py` is vendored here as an
-ordinary sibling, so `from . import immutable_audit` pulls in the audit store
+That package is not in this repo, and `test_import_closure.py` forbids the whole
+namespace it belonged to, so a stray reference to it fails the build rather than
+resolving against some copy of it that happens to be installed.
+`immutable_audit.py` is vendored here as an ordinary
+sibling, so `from . import immutable_audit` pulls in the audit store
 and nothing else, and the file-path load -- along with the `sys.modules`
 registration that kept it and a normal package import bound to one module object
 and therefore one `_db_lock` -- is gone. `_module()` remains as a function
@@ -130,9 +148,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# v1 is a single-site install and `guardrails/tenant_isolation.py` is
-# deliberately not imported (spec sections 3 and 11): shipping an unexercised
-# isolation control would suggest a guarantee the build does not test.
+# v1 is a single-site install, and the tenant isolation control the original
+# system offered is deliberately not carried over (spec sections 3 and 11):
+# shipping an unexercised isolation control would suggest a guarantee the build
+# does not test. There is therefore no such module in this repository to point
+# at, and its absence is the decision rather than an omission.
 # GuardrailAuditEvent nonetheless requires a tenant_id, so it gets a constant.
 #
 # The constant is a literal and is deliberately not derived from the hostname,
@@ -297,8 +317,8 @@ _write_failures = 0
 def _module():
     """The append-only audit store.
 
-    This was loaded by file path in the monorepo, to import one module out of a package
-    whose ``__init__`` pulled in the whole guardrails stack. Vendored here, it is an
+    This was loaded by file path before the extraction, to import one module out of a
+    package whose ``__init__`` pulled in the rest of its stack. Vendored here, it is an
     ordinary sibling and the indirection is gone -- but ``_module()`` is kept as the seam
     because the tests patch ``_module().AUDIT_DB`` to redirect the database.
     """
@@ -328,9 +348,79 @@ def set_audit_db(path: str | Path) -> None:
         _initialised_for = None
 
 
+def verify_audit_db_writable() -> str:
+    """Boot gate: create the audit database now, or refuse the boot. Returns its path.
+
+    The fourth gate, and it exists because the other three cannot see this
+    failure. Every write here is best-effort by design -- see the failure-policy
+    note above -- so an audit database that cannot be written produces ERROR
+    lines and nothing else. That is the correct behaviour *once a site is
+    running*, and it is the wrong behaviour at boot, because at boot nobody has
+    yet decided anything an audit row would evidence and the whole thing is still
+    recoverable by setting one environment variable.
+
+    The specific way it goes wrong is documented one module over and had no
+    guard: `immutable_audit.AUDIT_DB` defaults to a path derived by walking up
+    out of the package directory, which lands on a source checkout's `data/` and,
+    from an installed package, beside site-packages -- "neither writable nor
+    anywhere a deployment wants PHI-adjacent state". So a `pip install` that
+    forgets `REFERRAL_AUDIT_DB` runs perfectly, serves coordinators, records
+    acknowledgements in `loop_events`, and has a permanently empty compliance
+    trail whose only symptom is a log line nobody greps for.
+
+    **The gate is on the resolved path, not on the variable.** Refusing when
+    `REFERRAL_AUDIT_DB` is unset would refuse every source checkout, where the
+    default is exactly right and is what the test suite and the Dockerfile's
+    `/app/data` are both calibrated against. The question is whether *this*
+    process can write to *that* file, and the only answer that is not a guess is
+    to go and do it.
+
+    Which is why this initialises rather than probing. `os.access` answers a
+    question about POSIX mode bits that neither Windows ACLs nor a read-only
+    bind mount respect, and a probe that opens its own temporary file proves
+    something about a different file. `init_audit_db` creates the directory
+    owner-only, creates the file owner-only, and runs the schema -- the same
+    work the first audited action would do -- so a success here is the real
+    thing and a failure here is the real failure, arriving before any clinical
+    state has moved.
+
+    Idempotent, and it leaves the module's initialisation cache warm, so the
+    first coordinator action does not pay for it again.
+    """
+    module = _module()
+    try:
+        _ensure_initialised(module)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001 - a gate fails closed on anything
+        from .errors import ReferralLoopError
+
+        # The exception type, not str(exc): a sqlite3 message carries the
+        # database path, and this string reaches an operator's terminal *and*
+        # whatever ticket they paste it into. The path is named once, below,
+        # deliberately and by us -- boot stderr is the diagnostic surface, and
+        # "cannot write <where I looked>" is the entire content of the
+        # diagnosis (see cli.py's note on why paths are allowed here and not in
+        # an audit row).
+        raise ReferralLoopError(
+            f"The referral audit trail at {module.AUDIT_DB} cannot be written "
+            f"({type(exc).__name__}). Set REFERRAL_AUDIT_DB to a writable directory on "
+            "the same encrypted volume as --db. This is refused rather than warned "
+            "about: audit writes fail open by design, so a site would otherwise run "
+            "normally with a permanently empty compliance trail and nothing but ERROR "
+            "records to say so."
+        ) from exc
+    return str(module.AUDIT_DB)
+
+
 def write_failures() -> int:
     """Audit writes dropped this process. Non-zero means the audit database is
-    behind the event log and someone has to look at the ERROR records."""
+    behind the event log and someone has to look at the ERROR records.
+
+    Reported by `referral-loop health` and by the snapshot every mode logs on the
+    way out. It had no consumer in `src/` at all until then, which made the
+    fail-open policy above rest on a loudness nothing implemented.
+    """
     return _write_failures
 
 
@@ -630,5 +720,6 @@ __all__ = [
     "record_peer_refusal",
     "referral_audit_entries",
     "set_audit_db",
+    "verify_audit_db_writable",
     "write_failures",
 ]

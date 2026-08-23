@@ -69,6 +69,7 @@ from .events import LabelOutcome, LoopState
 from .listener import MessageHandler
 from .pack import RulePack
 from .parse_hl7 import peek_control_id
+from .phi_files import create_private_directory
 from .registry import Registry
 from .store import LoopStore
 
@@ -83,7 +84,13 @@ class EvalError(ReferralLoopError):
     into a database somebody else owns. Producing a metric in any of those cases
     would be worse than producing none, because a metric gets pasted into a
     changelog and a refusal gets read.
+
+    Not retryable: an evaluation is an operator running a command, not a message
+    an engine is holding, and every refusal here needs a person to change
+    something before a second run says anything different.
     """
+
+    retryable = False
 
 
 # Event types that mean "this result was attributed to this loop". `reopened` is
@@ -219,7 +226,9 @@ def _outcome_for(store: LoopStore, control_id: str) -> _CaseOutcome:
     return _CaseOutcome(orphaned=orphaned)
 
 
-def _scratch_root(scratch_dir: Path | str | None, cleanup: list) -> Path:
+def _scratch_root(
+    scratch_dir: Path | str | None, cleanup: list, *, scratch_parent: Path | str | None = None
+) -> Path:
     """A directory nothing else owns, or a refusal.
 
     A caller who passes the site's data directory here gets an EvalError, not a
@@ -227,24 +236,57 @@ def _scratch_root(scratch_dir: Path | str | None, cleanup: list) -> Path:
     check is "empty or absent", not "not the production path", because there is
     no reliable way to recognise a production path and every wrong guess fails in
     the direction that writes.
+
+    **`scratch_parent` is where the volume decision is made.** With neither
+    argument this creates its throwaway directory under `tempfile.gettempdir()`,
+    which is the OS temp directory and is not necessarily on the volume the
+    encryption gate attested -- `store._reclaim` refuses to let SQLite put a
+    VACUUM copy there for exactly that reason, and a case database holds the same
+    verbatim HL7. `cli` therefore always passes the site database's own parent,
+    so the per-case files land inside the boundary the gate checked, beside the
+    file they were reconstructed from. `replay` refuses a site corpus outright
+    when neither is given, so the OS-temp branch cannot carry PHI at all.
+
+    The parent is not subjected to the empty-or-absent check, because it is the
+    *site's data directory* -- of course it is not empty, the database is in it.
+    A `scratch_dir` an operator named is checked, because naming a directory is a
+    claim to own it.
+
+    **Both arguments end at the same `TemporaryDirectory`, and the single code
+    path is deliberate.** It is unique per run, so the candidate replay and the
+    baseline replay of one `eval` invocation do not collide -- two calls into one
+    explicit `--scratch-dir` used to be the second one finding the first one's
+    case databases and refusing. It is 0700 at the instant it appears rather than
+    after a `chmod`. And it is removed in `replay`'s `finally`, which now covers
+    `--scratch-dir` as well: an operator who pointed the harness at a second disk
+    was previously left holding a directory of case databases full of verbatim
+    HL7, indefinitely, which is the same defect as the temp directory one wearing
+    different clothes.
     """
-    if scratch_dir is None:
-        tmp = tempfile.TemporaryDirectory(prefix="referral-eval-")
-        cleanup.append(tmp)
-        return Path(tmp.name)
-    path = Path(scratch_dir)
-    if path.exists():
-        if not path.is_dir():
-            raise EvalError(f"Scratch path {path} exists and is not a directory")
-        if any(path.iterdir()):
-            raise EvalError(
-                f"Refusing to replay into {path}: it already contains data. A pack "
-                "evaluation must never write into a database somebody else owns -- "
-                "point --scratch-dir at an empty or non-existent directory."
-            )
-    else:
-        path.mkdir(parents=True, exist_ok=True)
-    return path
+    parent: Path | None = None
+    if scratch_dir is not None:
+        parent = Path(scratch_dir)
+        if parent.exists():
+            if not parent.is_dir():
+                raise EvalError(f"Scratch path {parent} exists and is not a directory")
+            if any(parent.iterdir()):
+                raise EvalError(
+                    f"Refusing to replay into {parent}: it already contains data. A pack "
+                    "evaluation must never write into a database somebody else owns -- "
+                    "point --scratch-dir at an empty or non-existent directory."
+                )
+    elif scratch_parent is not None:
+        parent = Path(scratch_parent)
+    if parent is not None:
+        # 0700 at creation, and left exactly as it is when it already exists --
+        # see phi_files.create_private_directory for why this process
+        # re-permissions only what it made.
+        create_private_directory(parent)
+    tmp = tempfile.TemporaryDirectory(
+        prefix="referral-eval-", dir=None if parent is None else str(parent)
+    )
+    cleanup.append(tmp)
+    return Path(tmp.name)
 
 
 def _dismissal_rate(labels) -> float:
@@ -281,6 +323,7 @@ def replay(
     pack: RulePack,
     *,
     scratch_dir: Path | str | None = None,
+    scratch_parent: Path | str | None = None,
     labels=None,
 ) -> EvalResult:
     """Run a labeled corpus through the real pipeline and score the outcome.
@@ -289,6 +332,11 @@ def replay(
     A parameter called `db_path` invites an operator to pass the database they
     already have; this one takes a directory the harness fills with throwaway
     files and refuses one that is not empty.
+
+    `scratch_parent` is the other half, and it decides the *volume* rather than
+    the directory: the harness makes its own unique, auto-removed subdirectory
+    inside it. `cli` passes the site database's parent, so a replay's per-case
+    files sit on the disk the encryption gate attested. See `_scratch_root`.
 
     `labels` are the site's coordinator decisions (`LoopStore.labels()`), used
     only for the dismissal rate. They are deliberately *not* folded into the
@@ -309,9 +357,30 @@ def replay(
             "opposite things because nothing was measured."
         )
 
+    if scratch_dir is None and scratch_parent is None and any(
+        case.source == "site" for case in corpus
+    ):
+        # Belt and braces behind `cli` always naming a parent, and the reason it
+        # is here rather than there: this is the property, and a property
+        # enforced only by its one caller is one the next caller does not get.
+        # A site case's `messages` are verbatim HL7 out of the raw archive
+        # (`corpus_from_site`), and with neither argument the per-case databases
+        # would be written under `tempfile.gettempdir()` -- off the volume the
+        # encryption gate attested, which is the whole claim `--db` rests on.
+        # Refused rather than relocated by guesswork: this function has no
+        # database and therefore no volume it could be right about.
+        raise EvalError(
+            "Refusing to replay site-reconstructed cases without a scratch location. "
+            "Those cases hold verbatim HL7 from the raw archive, and the default "
+            "location is the OS temporary directory, which is not necessarily on the "
+            "encrypted volume this site attested. Pass scratch_parent (the site "
+            "database's own directory, which is what `referral-loop eval` does) or "
+            "scratch_dir."
+        )
+
     cleanup: list = []
     try:
-        root = _scratch_root(scratch_dir, cleanup)
+        root = _scratch_root(scratch_dir, cleanup, scratch_parent=scratch_parent)
 
         correct = 0
         false_matches = 0

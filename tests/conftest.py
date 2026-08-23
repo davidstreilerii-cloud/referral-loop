@@ -1,6 +1,6 @@
 """Keep the referral suite out of the installed audit database.
 
-`guardrails/immutable_audit.py` resolves `AUDIT_DB` from its own package
+`referral_loop/immutable_audit.py` resolves `AUDIT_DB` from its own package
 location, so without this every audited action in this suite -- every
 acknowledgement, every dismissal, every one of the several dozen `load_pack`
 calls in test_pack.py -- would append to the repository's real

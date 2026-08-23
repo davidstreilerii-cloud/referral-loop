@@ -80,6 +80,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .clock import as_utc
 from .core.states import ReferralState
 from .core.transitions import Evidence, Transition
 from .errors import (
@@ -1870,7 +1871,8 @@ class LoopStore:
         self.rebuild_alias_projection()
         # Neither identifier and, above all, not the reason. A log record is one
         # of the four artifacts spec test 14 greps, and the reason is free text a
-        # human typed about a patient -- the unbounded free-text channel. Both are already
+        # human typed about a patient: a field nothing constrains, so whatever it
+        # carries becomes part of this record's PHI footprint. Both are already
         # in mrn_alias_events, which is append-only and where the audit needs
         # them; this line exists so an operator sees a reversal happened.
         logger.warning(
@@ -2034,16 +2036,6 @@ class LoopStore:
 
     _PURGE_BUSY_TIMEOUT_MS = _PURGE_BUSY_TIMEOUT_MS
 
-    @staticmethod
-    def _as_utc(value: datetime) -> datetime:
-        """A naive timestamp is read as UTC, never compared against an aware one.
-
-        Comparing the two raises TypeError, and a TypeError inside a purge would
-        abort the whole run over one odd row -- most likely a row restored from
-        a system that wrote no offset.
-        """
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
     @classmethod
     def _older_than(cls, stamp: object, cutoff: datetime) -> bool | None:
         """True, False, or None when the timestamp cannot be read.
@@ -2055,7 +2047,7 @@ class LoopStore:
         if not isinstance(stamp, str):
             return None
         try:
-            return cls._as_utc(datetime.fromisoformat(stamp)) < cutoff
+            return as_utc(datetime.fromisoformat(stamp)) < cutoff
         except ValueError:
             return None
 

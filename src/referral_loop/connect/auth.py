@@ -64,7 +64,15 @@ class AuthFailure(ReferralLoopError):
 
     Distinguishes ours from theirs in the message: an invalid_client means our key or client id
     is wrong and no retry will help, a 5xx is the authorization server's problem.
+
+    `retryable = False` covers both, and the 5xx case is the one worth stating.
+    `retryable` names whether an interface engine should redeliver an inbound HL7
+    message; a token endpoint returning 503 is a *different* retry question,
+    owned by `connect/retry.py` and answered from the status code. No engine is
+    holding a message on this path, so there is nothing for AE to queue.
     """
+
+    retryable = False
 
 
 def _b64u(raw: bytes) -> str:

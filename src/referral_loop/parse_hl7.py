@@ -20,12 +20,33 @@ from .events import ParsedMessage
 
 ALLOWED_SEGMENTS = frozenset({"MSH", "PID", "MRG", "PV1", "ORC", "OBR", "OBX", "SCH", "RF1"})
 
-# MSH-2, the four encoding characters: component, repetition, escape,
-# subcomponent. They are not a field a sender may redefine as far as this
-# parser is concerned -- every component split downstream (message type, MRN,
-# universal service id) is a literal "^" split, so a message declaring any
-# other set would be read with confidently wrong clinical identifiers rather
-# than refused. structural_fault refuses it instead.
+# The only MSH-2 this parser accepts: component, repetition, escape,
+# subcomponent, in that order and exactly four characters long.
+#
+# This is a constraint this project imposes, not a property of HL7. The standard
+# lets a sender declare its own delimiters in MSH-2, and v2.7 went further and
+# added an optional *fifth* character (truncation, "#") -- so a conformant v2.7
+# message that uses it is refused here. Note where: its first four characters are
+# `^~\&`, so it clears the content check and is caught by the separator check at
+# offset 8 instead. That is a known and accepted cost, taken deliberately,
+# because the alternative is worse in two directions:
+#
+#   * Honouring a redeclared set means every split downstream would have to read
+#     its delimiter from the header. Every component split here (message type,
+#     MRN, universal service id) is a literal "^" split, so a parser that
+#     *accepted* a different set without threading it through would read the
+#     message with confidently wrong clinical identifiers rather than refuse it
+#     -- a false match manufactured by the reader, which is the failure this
+#     subsystem exists to prevent.
+#   * Accepting a variable-width MSH-2 makes the offset of every following field
+#     depend on sender-supplied content. That is a parser-differential surface:
+#     this parser and the interface engine upstream of it would disagree about
+#     where MSH-9 ends and MSH-10 begins for the same bytes, and the disagreement
+#     is chosen by whoever sent them. Fixed offsets are what make the disagreement
+#     impossible rather than merely unlikely.
+#
+# So the width is pinned as well as the content -- see the MSH-1/MSH-2/separator
+# triple in structural_fault, which is what makes the fixed offsets sound.
 ENCODING_CHARACTERS = "^~\\&"
 
 KNOWN_MESSAGE_TYPES = frozenset(
@@ -248,10 +269,11 @@ def structural_fault(text: str) -> str:
             # operator's log line, and repr escapes the CR that would otherwise
             # forge a second line there.
             return (
-                f"MSH-2 encoding characters are {raw[4:8]!r}, "
-                f"expected {ENCODING_CHARACTERS!r}"
+                f"MSH-2 at offsets 4-7 is {raw[4:8]!r}; this parser accepts only "
+                f"{ENCODING_CHARACTERS!r}"
             )
-        # The separator that closes MSH-2. Checking only the four characters
+        # The separator that closes MSH-2, and the offset that makes the width
+        # constraint real rather than nominal. Checking only the four characters
         # above is not enough: HL7 v2.7 defines a fifth encoding character
         # ("#", for truncation), whose first four are conformant, so a message
         # carrying it would pass the check above while the separator -- and

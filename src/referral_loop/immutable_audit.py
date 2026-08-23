@@ -187,9 +187,11 @@ _SCHEMA_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
 # measurably one (action 31, alongside READ and SELECT), and the
 # `inserted_at DEFAULT (datetime('now'))` column means a build that authorizes
 # DEFAULT expressions would issue it on every append. Leaving it out would make
-# a one-word query change refuse an audit write -- and on the guardrail path
-# that refusal is invisible, because `guardrails/middleware.py` ends its audit
-# write in `except Exception: pass` with no log at all. (The referral path is
+# a one-word query change refuse an audit write -- and on the path this module
+# was originally written for that refusal is invisible, because the middleware
+# calling it there ended its audit write in `except Exception: pass` with no log
+# at all. That caller is not in this repository, which is exactly why the risk is
+# recorded here instead of there: the module outlived it. (The referral path is
 # not the silent one and should not be cited as though it were:
 # `referral_loop/audit.py` logs ERROR with the exception type and increments
 # `write_failures()`, deliberately.)

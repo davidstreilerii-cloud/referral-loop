@@ -48,7 +48,20 @@ that poisons a monotonic `max()` and clamps a loop out of sight.
 
 This module imports nothing from the package, so it sits beneath the matcher,
 the registry, the listener and staleness alike and all four read the same number
-without any of them importing another.
+without any of them importing another. That is a load-bearing property rather
+than an observation, and `test_import_closure` asserts it: seven modules import
+this one now, which is exactly the fan-in at which a single convenience import
+back up the stack becomes an import cycle.
+
+`as_utc` lives here for the same reason, and arrived later than it should have.
+Six modules held a byte-identical copy of the naive-timestamp rule, and one of
+the six was this one -- which is the point. The clone the second paragraph above
+describes had been made again, inside the file written to end it, and spelled
+`_as_utc` so that nobody could reuse it even deliberately. Two of the six cited
+another module's copy as their justification, which is a citation a reader can
+follow and a compiler cannot. A rule that everything comparing two timestamps
+has to apply is time policy, so it belongs to the module that owns time policy,
+and it is public because a rule nobody can import is a rule everybody retypes.
 """
 from __future__ import annotations
 
@@ -68,12 +81,39 @@ MAX_CLOCK_SKEW = timedelta(hours=24)
 _READABLE_PAST = timedelta(days=36525)
 
 
-def _as_utc(value: datetime) -> datetime:
-    """Naive timestamps are read as UTC rather than compared against an aware
-    `now`, which raises TypeError. An `MSH-7` frequently carries no offset, and
-    a TypeError raised inside a guard would send every such message down an
-    error path instead of merely ranking one message wrong -- the same reasoning,
-    and the same fix, as `matcher._as_utc`."""
+def as_utc(value: datetime) -> datetime:
+    """A naive timestamp is read as UTC; an aware one is returned untouched.
+
+    The whole of the rule, and the reason it is one rule rather than a judgement
+    call per site: Python raises TypeError on any comparison or subtraction
+    mixing an aware datetime with a naive one, an HL7 `MSH-7` or `OBR-7`
+    frequently carries no offset, and every consumer of one of those stamps also
+    holds an aware `now`. So the choice at each site is between assuming UTC and
+    raising -- and raising is worse everywhere it can happen, in a different way
+    each time. The five that had this:
+
+      * **matcher** -- a TypeError inside matching is an unhandled result. The
+        listener archives the raw and moves on, so the result silently never
+        reaches a queue at all.
+      * **registry** -- a TypeError inside the ordering guard sends every
+        offsetless message down the AE path, permanently.
+      * **staleness** -- a TypeError there fails the *whole* worklist render
+        rather than ranking one loop wrong, which is much the larger outage.
+      * **worklist** -- the same, one frame further out.
+      * **store** -- a TypeError inside a retention purge aborts the entire run
+        over one odd row, most likely a row restored from a system that wrote no
+        offset.
+
+    None of those is a case for refusing the message, and none of them wants a
+    different answer from the others, which is why the answer is here.
+
+    Assuming UTC rather than site-local is consistent with how this subsystem
+    writes timestamps: `store.py` round-trips through
+    `datetime.isoformat`/`fromisoformat`, and nothing here writes a non-UTC naive
+    timestamp on purpose. It is still an assumption, and it is a ranking-accuracy
+    assumption rather than a safety one -- a stamp read in the wrong zone moves a
+    loop within a worklist; a TypeError removes it from one.
+    """
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
@@ -87,8 +127,8 @@ def is_future_dated(value: datetime, now: datetime | None = None) -> bool:
     fault, and refusing its traffic would strand the real clinical results this
     subsystem exists to keep.
     """
-    reference = datetime.now(timezone.utc) if now is None else _as_utc(now)
-    return _as_utc(value) > reference + MAX_CLOCK_SKEW
+    reference = datetime.now(timezone.utc) if now is None else as_utc(now)
+    return as_utc(value) > reference + MAX_CLOCK_SKEW
 
 
 def is_readable_clock(value: datetime, now: datetime | None = None) -> bool:
@@ -101,5 +141,5 @@ def is_readable_clock(value: datetime, now: datetime | None = None) -> bool:
     garbled field out of the arithmetic -- and it must never grow a future bound
     without moving `MAX_CLOCK_SKEW`'s behaviour with it.
     """
-    reference = datetime.now(timezone.utc) if now is None else _as_utc(now)
-    return _as_utc(value) >= reference - _READABLE_PAST
+    reference = datetime.now(timezone.utc) if now is None else as_utc(now)
+    return as_utc(value) >= reference - _READABLE_PAST

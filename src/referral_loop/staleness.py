@@ -20,8 +20,9 @@ about lateness, so it carries no clinical claim to guard.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
+from .clock import as_utc
 from .errors import ThresholdsNotAcceptedError
 from .events import Loop, LoopState
 from .pack import RulePack
@@ -66,20 +67,6 @@ def require_thresholds_accepted() -> None:
         )
 
 
-def _as_utc(value: datetime) -> datetime:
-    """Naive timestamps are treated as UTC so age arithmetic never raises.
-
-    Mixing an aware `now` with a naive stored `ordered_at` raises TypeError on
-    subtraction. A TypeError here means the whole worklist fails to render
-    instead of one loop being ranked wrong, which is a far worse failure --
-    same reasoning, and the same fix, as matcher._as_utc. Assuming UTC is
-    consistent with how the store and registry write timestamps (store.py
-    round-trips via datetime.isoformat/fromisoformat; nothing in this
-    subsystem writes a non-UTC naive timestamp on purpose).
-    """
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
-
 def age(loop: Loop, now: datetime) -> timedelta:
     """Age of the expectation. Future-dated orders clamp to zero, never negative.
 
@@ -98,7 +85,7 @@ def age(loop: Loop, now: datetime) -> timedelta:
     """
     if loop.ordered_at is None:
         return timedelta(0)
-    delta = _as_utc(now) - _as_utc(loop.ordered_at)
+    delta = as_utc(now) - as_utc(loop.ordered_at)
     return delta if delta > timedelta(0) else timedelta(0)
 
 

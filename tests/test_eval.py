@@ -32,6 +32,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from referral_loop import audit as referral_audit
+from referral_loop import eval as eval_module
 from referral_loop.cli import PUBKEY_ENV, main
 from referral_loop.errors import ReferralLoopError
 from referral_loop.eval import (
@@ -519,11 +520,134 @@ def test_replay_leaves_an_existing_production_store_untouched(
     assert sorted(p.name for p in (tmp_path / "site").iterdir()) == ["loops.db"]
 
 
-def test_replay_writes_nothing_outside_its_scratch_directory(shipped_pack, corpus, tmp_path):
+def test_replay_writes_nothing_outside_its_scratch_directory(
+    shipped_pack, corpus, tmp_path, monkeypatch
+):
+    """The case databases are named as they are built, not inferred afterwards.
+
+    They used to be countable in `scratch` when the replay returned, because an
+    explicit `--scratch-dir` was never cleaned up. It is now, so "everything in
+    there is a .db" would pass over an empty directory and prove nothing --
+    a vacuous `all()` is the quietest way for a test to stop testing. Recording
+    each path as `LoopStore` is constructed asserts the same property while the
+    files exist, and the emptiness afterwards becomes the *cleanup* assertion
+    instead of an accidental one.
+    """
     scratch = tmp_path / "scratch"
+    built: list[Path] = []
+    real_store = eval_module.LoopStore
+
+    def record(path, *args, **kwargs):
+        built.append(Path(path))
+        return real_store(path, *args, **kwargs)
+
+    monkeypatch.setattr(eval_module, "LoopStore", record)
     replay(corpus, shipped_pack, scratch_dir=scratch)
     assert {p.name for p in tmp_path.iterdir()} == {"scratch"}
-    assert all(p.suffix == ".db" for p in scratch.iterdir())
+    assert built and all(p.suffix == ".db" and scratch in p.parents for p in built)
+    assert list(scratch.iterdir()) == [], "the run's own subdirectory outlived the run"
+
+
+def test_replay_refuses_a_site_corpus_into_the_os_temporary_directory(
+    shipped_pack, corpus, tmp_path, monkeypatch
+):
+    """The one combination that put verbatim HL7 outside the attested volume.
+
+    `corpus_from_site` rebuilds cases out of the raw archive, so a site case's
+    `messages` are the messages -- MRNs, names, observation values. Replayed with
+    no scratch root, each one was written into a throwaway SQLite database under
+    `tempfile.gettempdir()`, which `store._reclaim` already argues is not
+    necessarily on the volume the encryption gate attested. `TemporaryDirectory`
+    is 0700 and each `.db` is 0600, so this was never world-readable; it was
+    outside the boundary the gate checks, which is the claim the product makes.
+
+    The refusal is on the *default*, not on `--scratch-dir`: an operator naming a
+    directory has made a decision about where it goes, and this is the case where
+    nobody did.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "os-temp"))
+    (tmp_path / "os-temp").mkdir()
+    from_site = [replace(case, source="site") for case in corpus]
+    with pytest.raises(EvalError) as exc:
+        replay(from_site, shipped_pack)
+    assert "scratch" in str(exc.value)
+    assert list((tmp_path / "os-temp").iterdir()) == [], (
+        "the refusal has to come before anything is written, not after"
+    )
+
+
+def test_eval_mode_keeps_its_case_databases_beside_the_site_database(
+    eval_env, tmp_path, monkeypatch, capsys
+):
+    """`cli` is the only production caller, and it never named a scratch root.
+
+    So every `eval` run at a site wrote its per-case databases -- reconstructed
+    from that site's own raw archive -- into the OS temporary directory. The
+    databases are named here rather than inferred from what survives on disk,
+    because cleanup is `finally`-only and a passing "nothing is left in /tmp"
+    would say nothing about where they were while they existed. That window is
+    the exposure: a SIGKILL or a power loss inside it leaves verbatim HL7 behind.
+    """
+    db = tmp_path / "site" / "loops.db"
+    pack_dir = tmp_path / "candidate"
+    _sign_into(pack_dir, eval_env)
+    os_temp = tmp_path / "os-temp"
+    os_temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(os_temp))
+
+    built: list[Path] = []
+    real_store = eval_module.LoopStore
+
+    def record(path, *args, **kwargs):
+        built.append(Path(path))
+        return real_store(path, *args, **kwargs)
+
+    monkeypatch.setattr(eval_module, "LoopStore", record)
+    assert main(["eval", "--db", str(db), "--pack-dir", str(pack_dir)]) == 0, \
+        capsys.readouterr().out
+
+    assert built, "the harness replayed nothing, so this proves nothing"
+    stray = [p for p in built if tmp_path / "site" not in p.parents]
+    assert not stray, f"case databases written off the --db volume: {stray}"
+    assert list(os_temp.iterdir()) == []
+
+
+def test_eval_mode_takes_a_scratch_directory_for_operators_who_want_elsewhere(
+    eval_env, tmp_path, monkeypatch, capsys
+):
+    """The escape hatch, and the refusal it keeps.
+
+    A site whose database volume is small, or who wants the replay on a separate
+    encrypted disk, needs somewhere to say so -- and there was no argument at
+    all. The "empty or absent" refusal still applies to it, because the reason
+    for that refusal has not changed: a directory that already holds data is one
+    somebody else owns.
+    """
+    db = tmp_path / "site" / "loops.db"
+    pack_dir = tmp_path / "candidate"
+    _sign_into(pack_dir, eval_env)
+    elsewhere = tmp_path / "elsewhere"
+
+    built: list[Path] = []
+    real_store = eval_module.LoopStore
+
+    def record(path, *args, **kwargs):
+        built.append(Path(path))
+        return real_store(path, *args, **kwargs)
+
+    monkeypatch.setattr(eval_module, "LoopStore", record)
+    assert main(["eval", "--db", str(db), "--pack-dir", str(pack_dir),
+                 "--scratch-dir", str(elsewhere)]) == 0, capsys.readouterr().out
+    assert built and all(elsewhere in p.parents for p in built)
+
+    # And the refusal survives the new argument.
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    (occupied / "someone-elses.db").write_bytes(b"")
+    code = main(["eval", "--db", str(db), "--pack-dir", str(pack_dir),
+                 "--scratch-dir", str(occupied)])
+    assert code == 2
+    assert "already contains data" in capsys.readouterr().err
 
 
 def test_the_default_scratch_directory_is_cleaned_up(shipped_pack, corpus, tmp_path, monkeypatch):
@@ -716,8 +840,11 @@ def test_an_attached_orphan_becomes_a_labeled_case(shipped_pack, corpus, tmp_pat
     assert cases[0].source == "site"
     assert cases[0].expected_loop_placer == target.placer_order_number
 
-    assert replay(cases, shipped_pack).recall == 0.0
-    assert replay(cases, _tier4_trusted(shipped_pack)).recall == 1.0
+    # `scratch_parent` because these cases are site-reconstructed, so they carry
+    # the archive's own messages and `replay` refuses to put them in the OS
+    # temporary directory. `tmp_path` stands in for the volume `--db` is on.
+    assert replay(cases, shipped_pack, scratch_parent=tmp_path).recall == 0.0
+    assert replay(cases, _tier4_trusted(shipped_pack), scratch_parent=tmp_path).recall == 1.0
 
 
 def test_an_undone_match_becomes_a_case_the_unchanged_pack_still_fails(
@@ -741,7 +868,9 @@ def test_an_undone_match_becomes_a_case_the_unchanged_pack_still_fails(
     assert len(cases) == 1
     assert cases[0].expected_loop_placer is None
 
-    result = replay(cases, shipped_pack)
+    # See the note in test_an_attached_orphan_becomes_a_labeled_case: a site
+    # corpus has to be told where it may be written.
+    result = replay(cases, shipped_pack, scratch_parent=tmp_path)
     assert result.false_match_rate == 1.0
     assert check_release_criteria(result, shipped_pack)[0] is False
 

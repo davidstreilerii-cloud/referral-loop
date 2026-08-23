@@ -208,5 +208,5 @@ Authorities are granted, never inferred. Exactly three exist — `merge` (`ADT^A
 end with a clinically open loop on nobody's queue.** Orders and schedules are strictly additive
 and carry no authority, so they need none.
 
-~17,000 lines of source, ~24,500 lines of tests, 1,889 passing, 90% coverage floor against a
+~17,000 lines of source, ~24,500 lines of tests, 1,908 passing, 90% coverage floor against a
 measured 96%. One runtime dependency.

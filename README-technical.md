@@ -39,7 +39,8 @@ is a different claim, and nothing in v1 observes it.
     export PHI_ENCRYPTION_VERIFIED=1   # or run on an OS-detected encrypted volume
     referral-loop listen --db data/referral_loops.db --peers peers.json
 
-Modes: `listen`, `filedrop`, `worklist`, `eval`, `purge`, `stats`, `connectors`.
+Modes: `listen`, `filedrop`, `worklist`, `eval`, `purge`, `stats`, `connectors`, `health`,
+`rebuild`.
 
 `listen` requires mutual TLS. `--peers` names a **JSON** file that carries both
 the TLS material and the peer map, because "which CA may sign a client
@@ -153,6 +154,15 @@ Each of these refuses the boot rather than assuming a value:
 | `REFERRAL_PACK_PUBKEY` | the rule pack is signed; a default key verifies nothing |
 | `REFERRAL_THRESHOLDS_ACCEPTED` | staleness thresholds are a clinical decision per specialty |
 | `PHI_ENCRYPTION_VERIFIED` | at-rest encryption is attested by the deployment, not detected |
+| `REFERRAL_AUDIT_DB` | see below — required in practice for an installed deployment |
+
+The fourth gate is on writability rather than on the variable, because the package-relative
+default is correct in a source checkout and wrong once installed: from `site-packages` it
+resolves beside `site-packages`, which is read-only in the container and is nowhere
+PHI-adjacent state belongs. Boot resolves the path and refuses if it cannot be written, so a
+checkout keeps working and an installed deployment that forgets the variable is told at boot
+instead of discovering an empty audit trail later. Audit writes fail open by design once the
+process is running — that trade is only defensible if the trail was writable to begin with.
 
 `purge` mode additionally requires both of these, which likewise have no defaults
 — retention of PHI is a site policy, not a vendor default:
@@ -206,7 +216,41 @@ both — false-match rate zero *and* auto-match rate at or above the pack's
 `min_auto_match_rate`. A floor without the coverage half is passed perfectly by a
 matcher that attaches nothing.
 
+## Known architectural state
+
+A model migration is **half landed**, and this is the honest summary of it. The detail lives
+1,400 lines into `store.py` and in `migration.py`'s own docstring; a reader should not have to
+find it by accident.
+
+**Two state vocabularies coexist.** `events.LoopState` has nine members and drives replay and
+everything that reads state. `core.states.ReferralState` has eleven and is what the state
+machine adjudicates. `migration.py` bridges them, and its second line says *"Temporary. Plan 2b
+deletes this module."*
+
+**Two event logs are dual-written.** `loop_events` drives replay; `transition_events` is the
+provenance log. One write in two places inside one transaction, so they cannot diverge on the
+paths that write both — but `reverse_acknowledgement` and `undo_match` move the projection while
+passing no `transition=`, so on those paths the chain folds to whatever the last recorded
+transition said. `store.py` documents this as a gap in the write path rather than a vocabulary
+cost, which is correct: it closes when something writes those transitions, not when the
+vocabularies merge.
+
+**What this costs, precisely.** `core/machine.py` is a real state machine — pure, table-driven,
+one `apply()`, three ordered guards, and invalid transitions are structurally impossible *within
+its own inputs*. But it is not the system's source of truth. `registry.py` asks it for a verdict
+on a `Referral` reconstructed by translating the legacy projection, and six canonical states have
+no legacy source, so that round-trip is lossy by construction. After an `unschedule` the
+transition chain holds `ACCEPTED` while the projection holds `OPEN`, which reads back as `SENT` —
+and `SENT` admits an edge that `ACCEPTED` does not. So "invalid transitions are structurally
+impossible" is true of `machine.apply()` and is **not** yet true of the product.
+
+**Why it is shipping this way.** Finishing the migration is weeks of work, and doing it badly
+under publication pressure would be worse than the current state, which is understood, tested,
+and bounded. The `CLOSED`-unreachability property that matters most clinically is held
+independently of any of this, by `test_no_event_type_maps_to_closed` and a depth-3 sweep over
+every public mutating call.
+
 ## Provenance
 
-Extracted from the healthcare-rag monorepo with `git filter-repo`, history
-preserved. Design: `docs/superpowers/specs/2026-07-31-referral-kernel-design.md`.
+Extracted from a monorepo with `git filter-repo`, history preserved. Design:
+`docs/superpowers/specs/2026-07-31-referral-kernel-design.md`.

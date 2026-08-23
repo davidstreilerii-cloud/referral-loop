@@ -283,3 +283,44 @@ def test_the_suite_is_exercising_this_checkout_and_not_an_installed_copy():
     assert Path(referral_loop.__file__).resolve().parent == here, (
         f"referral_loop resolved to {referral_loop.__file__}, not {here}"
     )
+
+
+def test_clock_imports_nothing_from_the_package():
+    """`clock.py` is the layer everything else's time handling sits on, and that is
+    only true while it depends on nothing above it.
+
+    Its docstring makes the claim in so many words -- "this module imports nothing
+    from the package, so it sits beneath the matcher, the registry, the listener and
+    staleness alike" -- and the claim has since been leaned on twice: once for
+    `MAX_CLOCK_SKEW`, and again for `as_utc`, which this module, the matcher, the
+    registry, staleness, the store and the worklist had each written out for
+    themselves -- six byte-identical copies -- before one of them moved here. Seven
+    modules import `clock` as a result, and that is exactly the fan-in at which a
+    single convenience import back up the stack becomes an import cycle. A cycle
+    would surface as an ImportError at whichever module happened to be imported
+    first, which is a failure that looks like a bug in the importer rather than in
+    the module that caused it.
+
+    Asserted on the source and not by probing `sys.modules`, for the same reason the
+    egress check reads source: an import probe answers "what got loaded", and what
+    got loaded is a property of import order. This is a claim about what is written
+    in one file.
+
+    `node.level > 0` is the whole check on the relative side -- `from .errors import`
+    is the spelling anything in this package would actually use -- with the absolute
+    spelling covered too, because `import referral_loop.errors` binds the same module
+    and would otherwise walk straight past.
+    """
+    tree = ast.parse((_SRC / "clock.py").read_text(encoding="utf-8"), filename="clock.py")
+    reached = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level > 0:
+            reached.add("." * node.level + (node.module or ""))
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("referral_loop"):
+            reached.add(node.module or "")
+        elif isinstance(node, ast.Import):
+            reached.update(a.name for a in node.names if a.name.startswith("referral_loop"))
+    assert not reached, (
+        "clock.py must import nothing from referral_loop -- everything else's time "
+        f"policy is layered on top of it; found {sorted(reached)}"
+    )

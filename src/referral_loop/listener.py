@@ -612,6 +612,33 @@ class MessageHandler:
         # it without passing through here.
         self.future_dated_order_count = 0
 
+    def counters(self) -> dict[str, int]:
+        """Every operational counter this handler is holding, by name.
+
+        **Discovered rather than listed, and that is the whole point.** The
+        nineteen counters above were declared, incremented, argued about in
+        comments -- and exported nowhere, so the only way to read one was a
+        debugger attached to a running listener. `_apply_unschedule` says so
+        outright where it explains why `unbooked_cancel_count` gets its own log
+        line: "no MessageHandler counter is exported anywhere, so the number
+        below, and only the number below, is what an operator will ever see."
+
+        A hand-maintained list of names would have closed that for today's
+        counters and reopened it for tomorrow's: the next one added would be
+        declared, incremented, and quietly absent from the report, which is
+        exactly the state this method exists to end. `vars(self)` with a suffix
+        convention cannot be forgotten, because forgetting it means not naming
+        the attribute `*_count`, and every one of them already is.
+
+        Sorted, so two snapshots of the same process diff cleanly rather than
+        by dict insertion order.
+        """
+        return {
+            name: value
+            for name, value in sorted(vars(self).items())
+            if name.endswith("_count") and isinstance(value, int)
+        }
+
     # --------------------------------------------------------------- entry point
 
     def handle(self, text: str, *, peer: PeerIdentity = LOCAL_PEER,
@@ -828,7 +855,7 @@ class MessageHandler:
                 "Refusing to open a loop for %r on an identifier retired since ingest (%s); "
                 "answering AE so the engine redelivers", control_id, exc,
             )
-            return build_ack(control_id, "AE")
+            return self._refusal_ack(control_id, exc)
         except StaleMessageError as exc:
             # Refused, not dropped: the raw is archived and this is routed for
             # human review. Not marked applied, so a redelivery re-evaluates
@@ -836,16 +863,38 @@ class MessageHandler:
             # a log line and swallowing it could cost a result.
             self.stale_message_count += 1
             logger.warning("Refused a clinically older message %r: %s", control_id, exc)
-            return build_ack(control_id, "AA")
+            return self._refusal_ack(control_id, exc)
         except CircularMergeError as exc:
             self.circular_merge_count += 1
             logger.error("Refused ADT^A40 %r: %s", control_id, exc)
-            return build_ack(control_id, "AA")
+            return self._refusal_ack(control_id, exc)
         except ReferralLoopError as exc:
+            # Everything this module has not been told about by name. The counter
+            # and the log line are generic because there is nothing specific to
+            # say; the *ACK* is not, because `exc.retryable` is the one thing
+            # every subclass is required to have decided (see
+            # errors.ReferralLoopError). This clause used to answer AA outright,
+            # which meant a new error class anywhere in the package -- a registry
+            # fault, an identity service that had not answered yet -- was
+            # positively acknowledged, dropped from the engine's outbound queue,
+            # and left a referral that had moved nowhere and appeared on no
+            # worklist.
             self.apply_failure_count += 1
             logger.error("Could not apply %r: %s. Raw archived and flagged.", control_id, exc)
-            return build_ack(control_id, "AA")
+            return self._refusal_ack(control_id, exc)
         except Exception:
+            # **Deliberately fail-open, and deliberately not routed through
+            # `_refusal_ack`.** A KeyError out of a registry bug, an AttributeError
+            # from a half-initialised pack: these carry no `retryable` because
+            # they are not part of the taxonomy at all, and there is no honest
+            # way to guess. AA is the answer that cannot make things worse. AE
+            # would ask the engine to redeliver a message that hit a code path
+            # which will fault identically on every redelivery, at the head of
+            # its outbound queue -- so a single unhandled bug would take the
+            # entire clinical feed off the air rather than costing one message.
+            # The raw is already archived and replayable, which is what makes AA
+            # recoverable here: the evidence survives, and the ERROR line below
+            # is the thing an operator acts on.
             self.apply_failure_count += 1
             logger.exception("Unexpected failure applying %r; raw archived for replay", control_id)
             return build_ack(control_id, "AA")
@@ -853,6 +902,21 @@ class MessageHandler:
         self.store.record_applied(control_id, key, message.message_type,
                                   peer_id=peer.peer_id)
         return build_ack(control_id, "AA")
+
+    @staticmethod
+    def _refusal_ack(control_id: str, exc: ReferralLoopError) -> str:
+        """The ACK a refused apply gets, taken from the exception's own declaration.
+
+        The `except` ladder in `_process` chooses a *counter* and a log line,
+        which is a question about which operator should look at this. Whether the
+        sending engine keeps the message is a different question, and it is
+        answered here for every clause at once so that no clause can hardcode a
+        code that contradicts what its own class says. A clause answering "AE"
+        beside a class declaring `retryable = False` would pass its own test
+        forever while the declaration -- the thing every future subclass is told
+        to trust -- was a lie.
+        """
+        return build_ack(control_id, "AE" if exc.retryable else "AA")
 
     # ------------------------------------------------------------ peer authority
 
@@ -1522,6 +1586,63 @@ class MessageHandler:
             message_at=self._message_at(message),
         )
         logger.info("ADT^A40 %r: carried %d loop(s)", message.control_id, len(moved))
+
+
+def operational_report(handler: MessageHandler) -> str:
+    """Everything this process knows about how ingest is going, as text.
+
+    The one surface between "a number exists in memory" and "an operator can see
+    it". Three groups, and they are separate because they have different
+    lifetimes and an operator has to know which is which:
+
+      * **The handler's counters**, which are this process's. A listener that
+        was restarted an hour ago has an hour's numbers, and the header says so
+        rather than leaving somebody to conclude that a quiet feed is a healthy
+        one.
+      * **The registry's**, which are the same in kind. `future_dated_message_count`
+        lives there because dropping a poisoned `MSH-7` is a state-machine
+        decision and the CLI reaches the registry without passing through a
+        handler; it belongs in the same report regardless of which object holds
+        it, because an operator is asking one question.
+      * **The audit trail**, which is the one thing here that is not about
+        ingest. `audit.py` argues at length that an audit write must fail open
+        rather than wedge a coordinator's queue, and rests that argument on the
+        failure being loud -- "between 'a compliance artifact is missing a row,
+        loudly' and 'a safety worklist is wedged'". `write_failures()` is the
+        counter carrying that loudness, and until this report existed it had no
+        consumer outside the test suite: not in `store.stats()`, not on a
+        worklist route, never logged periodically. The argument for failing open
+        was sound and the loudness it depended on was not implemented.
+
+    The path is printed beside the count because the two failures an operator is
+    triaging are "writes are failing" and "writes are landing somewhere I am not
+    looking" -- `REFERRAL_AUDIT_DB` defaults to a package-relative directory, and
+    a deployment that forgets it is the second failure wearing the first one's
+    silence. The boot gate in `cli.boot` now refuses that case outright; the path
+    is here so an operator can confirm which file they are being told about.
+
+    Nothing in here can carry an identifier: every value is an `int`, and the
+    only string is a filesystem path this process was configured with. Same
+    property `EvalResult` has, and for the same reason -- this text gets pasted
+    into tickets.
+    """
+    lines = [
+        "ingest counters (this process only; nothing here survives a restart):",
+    ]
+    counters = dict(handler.counters())
+    counters["future_dated_message_count"] = handler.registry.future_dated_message_count
+    for name in sorted(counters):
+        lines.append(f"  {name:<32} {counters[name]:>12,}")
+    lines.append("audit trail:")
+    lines.append(f"  {'database':<32} {audit.audit_db_path()}")
+    lines.append(f"  {'write_failures':<32} {audit.write_failures():>12,}")
+    if audit.write_failures():
+        lines.append(
+            "  Non-zero: the audit database is behind the event log. The actions "
+            "themselves succeeded and are in loop_events; the ERROR records name what "
+            "was dropped and why."
+        )
+    return "\n".join(lines)
 
 
 class FileDropSource:

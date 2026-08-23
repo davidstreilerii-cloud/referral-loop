@@ -1,9 +1,9 @@
 """`referral-loop` -- the entry point that actually constructs the system.
 
 Every module below this one has been exercised only from tests. This is where
-they are wired together for a real site, so it is also the only place the three
-boot gates can be enforced. All three fail closed, and each one is independent:
-breaking any single gate refuses the boot even when the other two are satisfied.
+they are wired together for a real site, so it is also the only place the four
+boot gates can be enforced. All four fail closed, and each one is independent:
+breaking any single gate refuses the boot even when the others are satisfied.
 
 1. **Encryption at rest.** `PHI_MODE=full` is the operating mode (spec section
    3), and `verify_encryption_at_rest` raises unless BitLocker/LUKS/KMS is
@@ -24,6 +24,20 @@ breaking any single gate refuses the boot even when the other two are satisfied.
    the site saying the numbers are theirs. Gated here as well as inside
    `staleness` so a site cannot run a listener for a week and discover at first
    worklist load that the queue it has been filling cannot be sorted.
+
+4. **A writable audit trail.** `audit.py` writes best-effort on purpose: an
+   unwritable audit database must not stop a coordinator acknowledging a result,
+   because a wedged safety worklist is worse than a missing compliance row. That
+   trade is only defensible while the missing row is *loud*, and the loudest
+   thing a running process can do about it is an ERROR line. `REFERRAL_AUDIT_DB`
+   defaults to a path derived from the package's own location, which is right in
+   a source checkout and wrong -- unwritable, or somewhere nobody looks -- from
+   an installed one, so a `pip install` that forgets the variable produces a
+   permanently empty compliance trail and runs otherwise perfectly. Gated on
+   whether the resolved path can actually be written, never on whether the
+   variable is set: a checkout must keep working, and the variable is not the
+   question. `audit.verify_audit_db_writable` answers it by creating the
+   database, which is the only answer that is not a guess.
 
 The gates run **before** `LoopStore` is constructed. Creating the database file
 first would mean a site that fails the encryption gate still has a PHI-shaped
@@ -54,6 +68,7 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+from . import audit
 from . import eval as eval_harness
 from .encryption_check import verify_encryption_at_rest
 from .errors import (
@@ -62,7 +77,7 @@ from .errors import (
     ReferralLoopError,
     StoreUnavailableError,
 )
-from .listener import FileDropSource, MessageHandler
+from .listener import FileDropSource, MessageHandler, operational_report
 from .mllp_server import make_mllp_server
 from .pack import RulePack, load_pack
 from .peers import PeerRegistry, load_peer_registry
@@ -86,7 +101,8 @@ PUBKEY_ENV = "REFERRAL_PACK_PUBKEY"
 # an operator as a traceback.
 _ED25519_PUBLIC_KEY_BYTES = 32
 
-MODES = ("listen", "filedrop", "worklist", "eval", "purge", "stats", "connectors")
+MODES = ("listen", "filedrop", "worklist", "eval", "purge", "stats", "connectors",
+         "health", "rebuild")
 
 # `eval` exit codes. Distinct from _refuse's 2, because "this pack must not ship"
 # and "this process could not start" send an operator to different places.
@@ -129,17 +145,31 @@ def _public_key(public_key_hex: str) -> bytes:
 
 
 def boot(db_path: Path | str, pack_dir: Path | str, public_key_hex: str) -> BootedStack:
-    """Run all three boot gates, then build the stack. Raises rather than degrading.
+    """Run all four boot gates, then build the stack. Raises rather than degrading.
 
     Gate order is deliberate but not load-bearing for independence -- each gate
-    is checked against a state where the other two pass, so none of them is
-    riding on another's failure. Encryption goes first because it is the one
-    that must hold before anything touches disk.
+    is checked against a state where the others pass, so none of them is riding
+    on another's failure. Encryption goes first because it is the one that must
+    hold before anything touches disk.
+
+    The audit gate's position *is* load-bearing, in both directions, and it is
+    the only one of the four that is pinned on both sides. It goes **after**
+    encryption at rest, because unlike the other three it creates a file, and the
+    audit database is PHI-adjacent -- it names loops, actors, roles and times --
+    so writing one onto an unattested volume is a smaller version of what gate 1
+    refuses. It goes **before** the pack gate, because `load_pack` is itself an
+    audited action: run last, it produced a `PACK_LOADED` row that failed, an
+    ERROR line about a dropped audit write, and a `write_failures` of 1, all on
+    the way to a boot that was going to be refused anyway. A gate that dirties
+    the counter it exists to protect is answering after the question was asked.
+    It still runs before `LoopStore`, so a refused boot has produced no clinical
+    file.
     """
     # The resolved path, not the mode alone. The gate derives the volume it
     # inspects from this argument; without it the Windows branch guessed at a
     # drive and passed on the wrong one. See encryption_check.
     verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"), db_path)
+    logger.info("Referral audit trail: %s", audit.verify_audit_db_writable())
     pack = load_pack(Path(pack_dir), _public_key(public_key_hex))
     require_thresholds_accepted()
 
@@ -223,6 +253,13 @@ def _run_listen(stack: BootedStack, args, host: str, port: int) -> int:
     except KeyboardInterrupt:
         logger.info("Interrupted; shutting the listener down")
     finally:
+        # The counters die with the process, so they are said out loud before it
+        # ends. Not a substitute for `health` -- which is how an operator asks
+        # while the thing is still running -- but the one moment at which nobody
+        # is going to ask and the numbers are about to be gone. A listener that
+        # spent a week answering AE to every third message should not take that
+        # fact to the grave with it.
+        logger.info("Listener stopping. %s", operational_report(stack.handler))
         server.server_close()
     return 0
 
@@ -251,6 +288,12 @@ def _run_filedrop(stack: BootedStack, drop_dir: Path | str) -> int:
         "Drained %s: %d accepted, %d deferred (left for the next drain), %d rejected",
         directory, accepted, source.deferred_count, source.rejected_count,
     )
+    # A drain is a whole process's lifetime, so this is that process's entire
+    # operational history and there is no later moment to ask for it. The three
+    # numbers above are about files; the report below is about what the messages
+    # inside them did, which is a different question and the one that says
+    # whether a replay actually landed.
+    logger.info("Drain complete. %s", operational_report(stack.handler))
     return 0
 
 
@@ -274,6 +317,25 @@ def _run_eval(stack: BootedStack, args, public_key_hex: str) -> int:
     `format_report`, which reads only floats and ints off `EvalResult`, or from a
     gate reason built from the same. The corpus itself holds PHI when it was
     reconstructed from the site archive, and never leaves this process.
+
+    **Nor does it leave the volume.** The harness writes one throwaway SQLite
+    database per case, and those cases are reconstructed from the raw archive, so
+    they hold verbatim HL7. Left to itself the harness puts them under
+    `tempfile.gettempdir()`; this passes the site database's own directory
+    instead, which the encryption gate has already attested and which
+    `_prepared_db_path` has already made 0700. `store._reclaim` makes the same
+    move for the same reason -- "a copy of the PHI file landing in /tmp would
+    undo the gate".
+
+    `--scratch-dir` overrides it for a site that wants the replay somewhere else
+    -- a bigger disk, a second encrypted volume -- and carries the harness's
+    "empty or absent" refusal with it. **One code path, and `--synthetic-only`
+    does not get its own.** A synthetic corpus carries no PHI and genuinely does
+    not need the attested volume, so the argument for branching is real; the
+    argument against is that the branch would make the safe location conditional
+    on a flag, and the flag would then be one edit away from selecting it for a
+    site corpus too. A single location that is always correct cannot be made
+    wrong by a later change to when it applies.
     """
     cases = eval_harness.synthetic_corpus()
     if not args.synthetic_only:
@@ -283,7 +345,11 @@ def _run_eval(stack: BootedStack, args, public_key_hex: str) -> int:
     print(f"{PROG}: corpus of {len(cases)} labeled case(s); "
           f"{sum(1 for c in cases if c.source == 'site')} reconstructed from site labels")
 
-    candidate = eval_harness.replay(cases, stack.pack, labels=labels)
+    scratch = dict(
+        scratch_dir=Path(args.scratch_dir) if args.scratch_dir else None,
+        scratch_parent=None if args.scratch_dir else Path(args.db).parent,
+    )
+    candidate = eval_harness.replay(cases, stack.pack, labels=labels, **scratch)
     print(eval_harness.format_report(candidate, title="candidate"))
 
     meets, why = eval_harness.check_release_criteria(candidate, stack.pack)
@@ -313,7 +379,7 @@ def _run_eval(stack: BootedStack, args, public_key_hex: str) -> int:
             f"Either re-sign that baseline with {concepts} added to its field_map, or gate "
             f"against a later baseline that already carries it."
         ) from exc
-    baseline = eval_harness.replay(cases, baseline_pack, labels=labels)
+    baseline = eval_harness.replay(cases, baseline_pack, labels=labels, **scratch)
     print(eval_harness.format_report(baseline, title="baseline"))
 
     allowed, reason = eval_harness.gate_pack_release(baseline, candidate, pack=stack.pack)
@@ -444,6 +510,104 @@ def _run_stats(args) -> int:
     return 0
 
 
+def _run_health(stack: BootedStack) -> int:
+    """Print the operational counters and the audit trail's state. Changes nothing.
+
+    The mode exists because nineteen counters were being maintained for nobody.
+    `MessageHandler` declares one per distinct operational fact -- unknown
+    message types, duplicate control ids, refused merges, deferred archive
+    writes -- each with a comment arguing why it deserves to be told apart from
+    its neighbours, and not one of them reached a surface an operator could
+    read. `audit.write_failures()` was worse: the whole fail-open argument in
+    `audit.py` rests on a dropped compliance row being loud, and the counter
+    carrying that loudness had no consumer outside the test suite.
+
+    **A separate process reports its own numbers, and the report says so.** These
+    counters are in-memory and per-process, so running `health` in one terminal
+    does not read the listener running in another; that would need a metrics
+    exporter, which is a deployment decision this subsystem does not get to make
+    on a site's behalf. What it is honestly good for is three things: the audit
+    trail's path and dropped-write count, which are process-independent facts
+    about a file; a `filedrop` or in-process run whose numbers *are* this
+    process's; and telling an operator that a counter by that name exists at all,
+    which is the difference between a number they can ask about and one they
+    cannot. The listener says the same thing into its log on the way down.
+
+    All four gates ran to get here, which is deliberate: a health report from a
+    process that could not verify its own pack would be reporting on a system
+    nobody should be running, and the refusal is the more useful answer.
+    """
+    print(f"{PROG}: {operational_report(stack.handler)}")
+    print(f"{PROG}: pack {stack.pack.version} verified; all four boot gates passed.")
+    print(f"{PROG}: counters above are this process's. Disk growth is `{PROG} stats`.")
+    return 0
+
+
+def _run_rebuild(args) -> int:
+    """Rebuild the loops projection from the event log. The repair tool, reachable.
+
+    `LoopStore.rebuild_projection` has existed since the projection did, with a
+    docstring naming a real disaster: a restore that replays `loop_events` into a
+    fresh file leaves `loops` empty, so `open_loops()` returns nothing while the
+    events sit right there and every referral in the site vanishes from the
+    worklist silently. That is the exact failure this product exists to prevent.
+    It had no caller in `src/` -- tests only -- which made it either dead code or
+    a capability an operator was assumed to have and could not reach. Both
+    readings are worse than not having it, so it gets a command.
+
+    **Same two gates as purge and stats, and for the same reasons.** The
+    encryption gate runs because this reads an event log full of MRNs and result
+    text and writes rows derived from it. The pack gate does not apply: a rebuild
+    matches nothing, and putting a site's recovery from a restore behind a
+    signing key would be the gate theatre `_run_purge` already refuses -- with a
+    sharper edge, because the moment a site needs this is the moment after a
+    disaster, which is not the moment to discover the pack key is on the machine
+    that burned down. The threshold gate does not apply: it computes no
+    staleness.
+
+    **A database that does not exist is refused, not created**, exactly as purge
+    and stats refuse one. A typo'd `--db` would otherwise create an empty file,
+    rebuild the zero loops in it, and report "0 loop(s) rebuilt" -- which reads
+    as "there was nothing to repair" when it means "you repaired the wrong file",
+    and the operator running this has just been told their worklist is empty.
+
+    **No dry run, and no confirmation.** Every other destructive-looking command
+    here has one; this is not destructive. It reads `loop_events`, which is
+    append-only and which it does not write to, and recomputes each `loops` row
+    from it -- the same `_materialize` every ordinary transition already calls,
+    just for every loop at once. There is no input that makes it lose anything,
+    because the source of truth is untouched and the output is a pure function of
+    it. Running it when it was not needed rewrites every row with the value it
+    already had.
+
+    Running it against a *live* listener is a different question and the answer
+    is "it is safe, and it is still not what you want". Each loop is replayed and
+    written inside one transaction, so a loop that changes mid-rebuild ends up
+    with either the old row or the new one, and the next event for that loop
+    re-materializes it correctly either way. Nothing is corrupted; the only cost
+    is that a rebuild racing a busy feed proves less than one run against a quiet
+    system, which is the situation an operator is in after a restore anyway.
+    """
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"), args.db)
+
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        raise StoreUnavailableError(
+            f"No database at {db_path}, so there is no event log to rebuild from. Point "
+            "--db at the file the listener writes to. It is not created here: rebuilding "
+            "a database this command just made would report a repaired projection over a "
+            "file that has never held a message."
+        )
+    store = LoopStore(db_path)
+    rebuilt = store.rebuild_projection()
+    print(
+        f"{PROG}: rebuilt {rebuilt} loop projection row(s) from the event log in "
+        f"{db_path}. loop_events was read and not written; every row above is derived "
+        "from it, so this is repeatable and changes nothing when nothing was wrong."
+    )
+    return 0
+
+
 def _run_connectors(args: argparse.Namespace) -> int:
     """Preflight every configured connector.
 
@@ -551,7 +715,10 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Required environment: {PUBKEY_ENV} (pack signing public key, hex), "
             "PHI_ENCRYPTION_VERIFIED=1 or OS-detected encryption at rest, "
             "REFERRAL_THRESHOLDS_ACCEPTED=1 once the site has reviewed "
-            f"rules/pack.json staleness_hours. purge mode additionally requires "
+            "rules/pack.json staleness_hours, and a writable audit trail -- set "
+            "REFERRAL_AUDIT_DB on any installed deployment; the default is derived "
+            "from the package's own location and is only right in a source checkout. "
+            f"purge mode additionally requires "
             f"{RAW_DAYS_ENV} and {RESOLVED_DAYS_ENV}, which have no defaults."
         ),
     )
@@ -565,7 +732,11 @@ def _build_parser() -> argparse.ArgumentParser:
              "approximate on-disk size per table, including the tables retention "
              "deliberately never touches. "
              "connectors: check every configured FHIR endpoint -- reachability and "
-             "credentials are proven separately -- and exit nonzero if any failed.",
+             "credentials are proven separately -- and exit nonzero if any failed. "
+             "health: print this process's ingest counters and the audit trail's "
+             "path and dropped-write count. rebuild: reconstruct the loops "
+             "projection from the event log, for a restore that left the worklist "
+             "empty. It reads the log and does not write to it.",
     )
     parser.add_argument("--db", default="data/referral_loops.db",
                         help="SQLite file on an encrypted volume (default: %(default)s)")
@@ -606,6 +777,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="eval mode: the pack --pack-dir is measured against. Omitted, "
                              "the candidate is only checked against the absolute floor "
                              "(spec section 10.4 criterion 4) and no gate is applied")
+    parser.add_argument("--scratch-dir", default="",
+                        help="eval mode: directory the replay's throwaway per-case "
+                             "databases are created under. Must be empty or not exist -- "
+                             "it is never the site's database directory. Defaults to the "
+                             "parent of --db, which the encryption gate has already "
+                             "attested; those databases are rebuilt from the raw archive "
+                             "and hold real HL7, so the default keeps them on that volume "
+                             "rather than in the OS temporary directory. Either way they "
+                             "are removed when the run ends")
     parser.add_argument("--synthetic-only", action="store_true",
                         help="eval mode: skip the cases reconstructed from this site's own "
                              "coordinator labels. The site corpus is the valuable half -- it "
@@ -642,14 +822,16 @@ def main(argv: list[str] | None = None) -> int:
     # loads a pack, and an operator whose retention period is unset -- or who just wants to see
     # how big their database has gotten -- needs to hear that rather than a message about a
     # signing key. connectors joins them for the same reason and a stronger one: preflight
-    # touches no database, no pack and no PHI, so not one of the three boot gates is relevant
+    # touches no database, no pack and no PHI, so not one of the four boot gates is relevant
     # to what it does. See _run_purge, _run_stats and _run_connectors for which gates each runs.
-    if args.mode in ("purge", "stats", "connectors"):
+    if args.mode in ("purge", "stats", "connectors", "rebuild"):
         try:
             if args.mode == "purge":
                 return _run_purge(args)
             if args.mode == "stats":
                 return _run_stats(args)
+            if args.mode == "rebuild":
+                return _run_rebuild(args)
             return _run_connectors(args)
         except (ReferralLoopError, RuntimeError) as exc:
             return _refuse(str(exc))
@@ -679,6 +861,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_filedrop(stack, args.drop_dir)
         if args.mode == "eval":
             return _run_eval(stack, args, public_key_hex)
+        if args.mode == "health":
+            return _run_health(stack)
         return _run_worklist(stack, args.worklist_host, args.worklist_port)
     except ReferralLoopError as exc:
         return _refuse(str(exc))

@@ -54,10 +54,12 @@ still left off, because "useful" is how a field ends up on a screen that a
 screenshot then leaves the building on. Widening it is a decision for a pilot
 site, made once, with the test updated in the same commit.
 
-Free-text reasons are held to the same rule. A coordinator types them, so they
-are the unbounded free-text channel: they stay in the append-only event log where the
-audit needs them, and reach no artifact. That also means they have no XSS
-surface at all rather than an escaped one.
+Free-text reasons are held to the same rule, and for a stronger reason than the
+allowlist above. A coordinator types them, so nothing bounds what they contain --
+the field is a channel into every artifact it reaches, and no review of the code
+can say what has come through it. They therefore stay in the append-only event
+log where the audit needs them, and reach no artifact. That also means they have
+no XSS surface at all rather than an escaped one.
 
 Log records are an artifact too. Nothing here logs a `str(exc)` from a store or
 registry failure, because `MrnRetiredError` and the alias errors compose their
@@ -140,6 +142,7 @@ from urllib.parse import urlsplit
 import jinja2
 from flask import Blueprint, Flask, jsonify, request
 
+from .clock import as_utc
 from .errors import (
     LoopNotFoundError,
     ReferralLoopError,
@@ -197,10 +200,6 @@ PRELIMINARY_RULE = (
 )
 
 
-def _as_utc(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
-
 def _row(loop: Loop, now: datetime, pack: RulePack, *, arrived_at: datetime | None = None) -> dict:
     """The allowlist. Only these keys reach the template or the JSON view.
 
@@ -219,7 +218,7 @@ def _row(loop: Loop, now: datetime, pack: RulePack, *, arrived_at: datetime | No
         hours: float | None = age(loop, now).total_seconds() / 3600
         basis = "ordered"
     elif arrived_at is not None:
-        hours = max(0.0, (_as_utc(now) - _as_utc(arrived_at)).total_seconds() / 3600)
+        hours = max(0.0, (as_utc(now) - as_utc(arrived_at)).total_seconds() / 3600)
         basis = "arrived"
     else:
         hours = None

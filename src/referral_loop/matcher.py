@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-from .clock import is_readable_clock
+from .clock import as_utc, is_readable_clock
 from .errors import PackVerificationError
 from .events import Loop, LoopState, MatchResult, ParsedMessage
 from .pack import RulePack
@@ -195,18 +195,6 @@ def concept_value(message: ParsedMessage, pack: RulePack, concept: str) -> str:
 
 
 # ------------------------------------------------------------------ datetimes
-
-
-def _as_utc(value: datetime) -> datetime:
-    """Naive timestamps are treated as UTC so window arithmetic never raises.
-
-    Mixing an aware observation datetime with a naive stored `ordered_at` raises
-    TypeError on subtraction, and a TypeError inside matching is an unhandled
-    result -- the listener archives the raw and moves on, so the result silently
-    never reaches a queue at all. Assuming UTC is consistent with how the store
-    and registry write timestamps.
-    """
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def hl7_datetime(raw: str) -> datetime | None:
@@ -392,13 +380,13 @@ def _in_window(loop: Loop, key: ResultKey, pack: RulePack) -> bool:
     if loop.ordered_at is None or key.observed_at is None:
         return False
     window = timedelta(hours=pack.date_window_hours(loop.modality or key.modality))
-    return abs(_as_utc(key.observed_at) - _as_utc(loop.ordered_at)) <= window
+    return abs(as_utc(key.observed_at) - as_utc(loop.ordered_at)) <= window
 
 
 def _distance(loop: Loop, key: ResultKey) -> timedelta:
     if loop.ordered_at is None or key.observed_at is None:
         return timedelta.max
-    return abs(_as_utc(key.observed_at) - _as_utc(loop.ordered_at))
+    return abs(as_utc(key.observed_at) - as_utc(loop.ordered_at))
 
 
 def _tiebreak(candidates: list[Loop], key: ResultKey, pack: RulePack) -> list[Loop]:

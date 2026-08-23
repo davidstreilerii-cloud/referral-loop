@@ -594,7 +594,9 @@ def test_jinja_syntax_in_a_modality_is_not_evaluated(http, registry):
 @pytest.mark.parametrize("action, setup", [("dismiss", "orphan"), ("reverse_acknowledgement", "ack")])
 def test_a_free_text_reason_reaches_no_artifact_at_all(http, registry, caplog, action, setup):
     """Reasons are free text a coordinator types. Free text is the channel PHI
-    leaks through -- the same shape that leaked through an unbounded free-text field in an earlier system.
+    leaks through: nothing constrains the field, so no review of the code can say
+    what has come through it -- which is how it leaked once in the system this
+    was extracted from.
     It stays in the append-only log, where the audit needs it, and off the page,
     off the JSON, off the action's own response, and out of every log record.
 

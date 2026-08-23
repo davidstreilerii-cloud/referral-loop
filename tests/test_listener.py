@@ -39,7 +39,14 @@ from pathlib import Path
 import pytest
 
 from referral_loop import listener as listener_module
-from referral_loop.errors import StoreUnavailableError
+from referral_loop.errors import (
+    CircularMergeError,
+    MrnRetiredError,
+    NoAppointmentError,
+    ReferralLoopError,
+    StaleMessageError,
+    StoreUnavailableError,
+)
 from referral_loop.events import LoopState
 from referral_loop.listener import (
     _ARCHIVE_BYTES_PER_WINDOW,
@@ -59,6 +66,7 @@ from referral_loop.mllp_server import (
     DESYNC_GRACE_SECONDS,
     FIRST_FRAME_SECONDS,
     MAX_FRAME_BYTES,
+    MLLPServer,
 )
 from referral_loop.parse_hl7 import parse_hl7_text
 from referral_loop.peers import (
@@ -2485,6 +2493,96 @@ def test_a_slot_is_returned_when_the_connection_ends(handler):
     assert len(loops(handler)) == 3
 
 
+def test_a_slot_is_returned_when_the_handler_thread_never_starts(handler, monkeypatch):
+    """The slot was returned in `handle()`, which is not the only path off an accept.
+
+    socketserver's accept loop calls `verify_request` -- where the slot is taken
+    -- and then `process_request`, which for `ThreadingMixIn` is `t.start()`.
+    Thread creation fails under memory pressure and under a process-wide thread
+    limit, and anything raised in `process_request` means `handle()` is never
+    reached at all. `_slots` and `_open[peer]` were therefore decremented only on
+    the success path: every such accept shrank `MAX_CONNECTIONS` by one for the
+    life of the process, and the listener went deaf with no message, no counter
+    and no ERROR line -- exactly the outage the cap was added to prevent,
+    arriving through the cap.
+
+    `max_connections=1` so a single leaked slot is the whole listener, and the
+    proof is a real delivery afterwards rather than a semaphore's internals: an
+    ACK is what an interface engine would have got.
+    """
+    failing = {"on": True}
+    real_process_request = MLLPServer.process_request
+
+    def refuse_to_start(self, request, client_address):
+        if failing["on"]:
+            raise RuntimeError("can't start new thread")
+        return real_process_request(self, request, client_address)
+
+    # socketserver's own handler prints a full traceback to stderr for each of
+    # these. Silenced because three of them are deliberate here, and a suite that
+    # cries wolf on purpose teaches people to skim its output.
+    monkeypatch.setattr(MLLPServer, "handle_error", lambda self, request, address: None)
+    monkeypatch.setattr(MLLPServer, "process_request", refuse_to_start)
+
+    with running_server(handler, max_connections=1) as address:
+        for _ in range(3):
+            with socket.create_connection(address, timeout=10) as doomed:
+                assert peer_closed(doomed, timeout=10)
+
+        failing["on"] = False
+        with socket.create_connection(address, timeout=10) as sock:
+            # A refused connection is closed under the client on Windows, so the
+            # symptom of the leak is a reset rather than an empty read. Both are
+            # "no ACK", which is the assertion; catching the OSError here keeps
+            # the failure legible instead of a WinError in a socket helper.
+            try:
+                sock.sendall(frame(order()))
+                ack = read_ack(sock)
+            except OSError:
+                ack = ""
+            assert "|AA|" in ack, (
+                "the listener is at its connection cap with nothing connected: every "
+                "accept whose thread failed to start kept its slot"
+            )
+    assert len(loops(handler)) == 1
+
+
+def test_a_refused_connection_does_not_return_a_slot_it_never_took(handler):
+    """The other half of moving the release, and the half that can be worse.
+
+    `shutdown_request` is called on *every* accepted connection, including the
+    ones `verify_request` refused -- socketserver's `_handle_request_noblock`
+    ends `else: self.shutdown_request(request)`, outside the `try` that guards
+    the accepted path. So releasing there unconditionally would return a slot
+    that was never taken, and `_slots` is a `BoundedSemaphore` precisely so that
+    raises `ValueError` rather than quietly inflating the cap. It would raise on
+    the accept thread, inside a call socketserver does not guard, which kills
+    `serve_forever` -- a listener that stops accepting anything at all, which is
+    strictly worse than the leak being fixed.
+
+    So the release is keyed on the admission, not on the close. Three refusals
+    are churned through and then the cap is measured: one connection in, the
+    next refused. A cap inflated by the refusals would let both in, and a server
+    killed by a `ValueError` would refuse both.
+    """
+    with running_server(handler, max_connections=1, max_connections_per_peer=1) as address:
+        with socket.create_connection(address, timeout=10) as holder:
+            holder.sendall(frame(order()))
+            assert "|AA|" in read_ack(holder)
+            for _ in range(3):
+                with socket.create_connection(address, timeout=10) as refused:
+                    assert peer_closed(refused, timeout=10), "the cap should have refused this"
+
+        with socket.create_connection(address, timeout=10) as first:
+            first.sendall(frame(order("SECOND", placer="P2", filler="F2")))
+            assert "|AA|" in read_ack(first), "the accept loop did not survive the refusals"
+            with socket.create_connection(address, timeout=10) as second:
+                assert peer_closed(second, timeout=10), (
+                    "the cap admitted two connections where it allows one: the refusals "
+                    "returned slots they never took"
+                )
+
+
 def test_a_connection_is_closed_at_its_absolute_deadline(handler):
     """`RECV_TIMEOUT_SECONDS` is applied with `settimeout`, so it bounds each
     `recv` call and not the connection's lifetime. A connection that speaks
@@ -2688,3 +2786,125 @@ def test_stale_future_dated_observation_is_accepted_not_dropped(handler):
     future = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y%m%d%H%M%S")
     handler.handle(order(message_at=future))
     assert len(loops(handler)) == 1
+
+
+# ------------------------------------------------- retryability is a declaration
+
+
+def _every_referral_loop_error() -> list[type]:
+    """Every `ReferralLoopError` subclass in the package, however deeply nested.
+
+    Every module is imported first, and that is the load-bearing half.
+    `__subclasses__()` sees only classes the interpreter has actually executed,
+    so a walk over whatever this test module happened to import would quietly
+    exempt the classes nobody here uses -- which is exactly the population the
+    guard exists for. A new error class in `connect/` is the case that has to
+    fail, not the case that is skipped.
+    """
+    import importlib
+    import pkgutil
+
+    import referral_loop
+
+    for found in pkgutil.walk_packages(referral_loop.__path__, "referral_loop."):
+        importlib.import_module(found.name)
+
+    def descend(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from descend(sub)
+
+    return sorted(
+        set(descend(ReferralLoopError)), key=lambda c: (c.__module__, c.__qualname__)
+    )
+
+
+def test_every_referral_loop_error_declares_its_own_retryability():
+    """Inheriting `retryable` is the failure mode, so inheriting it is the failure.
+
+    `_process` answers `AE` or `AA` off this one attribute, and the base class
+    declares `False` so that a class which says nothing still fails in the
+    direction that cannot wedge an interface. That default is the safe answer to
+    "we do not know", and it is the wrong answer to "nobody thought about it":
+    the two are indistinguishable at the point the ACK is chosen, and the second
+    one silently decides that a clinical message may be forgotten by the sending
+    engine.
+
+    So the property under test is not the *value* -- it is that somebody wrote
+    one down. `cls.__dict__` rather than `getattr`, because `getattr` cannot tell
+    a deliberate `False` from an inherited one, which is the whole distinction.
+    """
+    undeclared = [
+        f"{cls.__module__}.{cls.__qualname__}"
+        for cls in _every_referral_loop_error()
+        if "retryable" not in cls.__dict__
+    ]
+    assert not undeclared, (
+        "these ReferralLoopError subclasses inherit `retryable` instead of declaring it: "
+        + ", ".join(undeclared)
+        + ". Decide, in the class body, whether a redelivery of the message that caused "
+        "this could ever succeed -- True answers AE and asks the engine to queue it, "
+        "False answers AA and archives it for review. Inheriting the default silently "
+        "puts a clinical message on the fail-open side."
+    )
+
+
+def test_an_unenumerated_retryable_failure_is_queued_rather_than_acknowledged(
+    handler, monkeypatch
+):
+    """The defect this attribute closes, in the direction that loses a referral.
+
+    `_process` used to enumerate `MrnRetiredError` by name and answer everything
+    else `AA`. A future error class that *is* transient -- a registry lock, an
+    identity service that has not answered yet -- would therefore be positively
+    acknowledged, the sending engine would drop it from its outbound queue, and
+    the referral would move nowhere and appear on no worklist. The class is
+    defined here rather than imported precisely because the point is that
+    `_process` has never heard of it.
+    """
+
+    class _TransientRegistryFault(ReferralLoopError):
+        retryable = True
+
+    def refuse(*_args, **_kwargs):
+        raise _TransientRegistryFault("the registry could not answer yet")
+
+    monkeypatch.setattr(handler, "_apply", refuse)
+    assert ack_code(handler.handle(order())) == "AE"
+    assert handler.apply_failure_count == 1
+    assert loops(handler) == []
+
+
+def test_an_unenumerated_permanent_failure_is_still_acknowledged(handler, monkeypatch):
+    """The other direction, which must not regress while the first is fixed.
+
+    `errors.ReservedStateError` and `errors.CircularMergeError` both argue that
+    `AE` on a permanently unacceptable message wedges the interface behind it
+    forever, so the fix for the case above must not become "queue everything".
+    A class that declares `retryable = False` is answered exactly as it was.
+    """
+
+    class _PermanentlyUnacceptable(ReferralLoopError):
+        retryable = False
+
+    def refuse(*_args, **_kwargs):
+        raise _PermanentlyUnacceptable("no redelivery makes this acceptable")
+
+    monkeypatch.setattr(handler, "_apply", refuse)
+    assert ack_code(handler.handle(order())) == "AA"
+    assert handler.apply_failure_count == 1
+
+
+def test_the_enumerated_failures_answer_what_they_declare(handler):
+    """The class ladder in `_process` picks a counter; the attribute picks the ACK.
+
+    Asserted together so the two cannot drift: a clause that hardcoded its own
+    ACK code would keep passing its own test while the declaration above it said
+    something else, and the declaration is what a reader -- and every future
+    subclass -- is told to trust.
+    """
+    assert StoreUnavailableError.retryable is True
+    assert MrnRetiredError.retryable is True
+    assert StaleMessageError.retryable is False
+    assert CircularMergeError.retryable is False
+    assert NoAppointmentError.retryable is False

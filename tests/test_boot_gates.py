@@ -20,6 +20,7 @@ import json
 import os
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -528,6 +529,240 @@ def test_a_dry_run_purge_reports_without_deleting(tmp_path, monkeypatch, capsys)
     assert code == 0, out
     assert "would delete" in out and "1 resolved loop(s)" in out
     assert len(store.all_loops()) == 1
+
+
+# ------------------------------------------------ the audit trail is a boot gate
+
+
+def test_boot_refuses_an_audit_trail_it_cannot_write(tmp_path, good_env, monkeypatch):
+    """Gate 4, broken while the other three are satisfied.
+
+    `REFERRAL_AUDIT_DB` defaults to a path walked out of the package directory --
+    right in a source checkout, and from an installed package "neither writable
+    nor anywhere a deployment wants PHI-adjacent state", which `immutable_audit`
+    says of its own default. Audit writes fail open by design, so before this
+    gate a deployment that forgot the variable booted, served coordinators,
+    recorded every acknowledgement in `loop_events`, and kept a permanently empty
+    compliance trail whose only symptom was an ERROR line.
+
+    Unwritability is arranged by putting a regular *file* where the audit
+    database's directory has to be. That is a real filesystem refusal on both
+    POSIX and Windows, unlike a mode bit, which Windows does not honour and which
+    root ignores -- so this fails for the same reason a read-only bind mount or a
+    container's immutable package directory would.
+    """
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_bytes(b"")
+    monkeypatch.setattr(referral_audit._module(), "AUDIT_DB", str(blocked / "audit_trail.db"))
+    monkeypatch.setattr(referral_audit, "_initialised_for", None)
+
+    with pytest.raises(ReferralLoopError, match="audit trail"):
+        boot(db_path=tmp_path / "loops.db", pack_dir=SHIPPED_PACK_DIR,
+             public_key_hex=SHIPPED_PUBKEY)
+
+    assert referral_audit.write_failures() == 0, (
+        "the gate has to refuse before the first audited action: run after the pack "
+        "gate it let load_pack's own PACK_LOADED row fail first, so the counter it "
+        "exists to protect was already at 1 by the time it spoke"
+    )
+
+
+def test_the_audit_gate_names_the_variable_and_exits_two(tmp_path, good_env, monkeypatch, capsys):
+    """What the operator actually sees. One line, naming what to set, exit 2 --
+    the same contract the other three gates hold themselves to."""
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_bytes(b"")
+    monkeypatch.setattr(referral_audit._module(), "AUDIT_DB", str(blocked / "audit_trail.db"))
+    monkeypatch.setattr(referral_audit, "_initialised_for", None)
+
+    code = main(["health", "--db", str(tmp_path / "loops.db"),
+                 "--pack-dir", str(SHIPPED_PACK_DIR)])
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "REFERRAL_AUDIT_DB" in err
+    assert "Traceback" not in err
+
+
+def test_the_audit_gate_passes_on_a_writable_default_without_the_variable(
+    tmp_path, good_env, monkeypatch
+):
+    """The control, and the half that would be easy to get wrong.
+
+    The gate is on "can this process write that file", not on "is
+    `REFERRAL_AUDIT_DB` set" -- a source checkout's package-relative default is
+    correct and must keep booting, which is what the whole test suite and the
+    repository layout depend on. `REFERRAL_AUDIT_DB` is not set here (the
+    autouse fixture in conftest redirects the module global directly, exactly as
+    a checkout's default would resolve), and the boot succeeds and leaves a real
+    database behind.
+    """
+    monkeypatch.delenv("REFERRAL_AUDIT_DB", raising=False)
+    audit_db = tmp_path / "audit" / "audit_trail.db"
+    monkeypatch.setattr(referral_audit._module(), "AUDIT_DB", str(audit_db))
+    monkeypatch.setattr(referral_audit, "_initialised_for", None)
+
+    stack = boot(db_path=tmp_path / "loops.db", pack_dir=SHIPPED_PACK_DIR,
+                 public_key_hex=SHIPPED_PUBKEY)
+
+    assert stack.pack.version
+    assert audit_db.is_file(), "the gate proves writability by writing, so a pass leaves a file"
+
+
+# ------------------------------------------------------- counters an operator sees
+
+
+def test_health_mode_reports_every_handler_counter_by_name(
+    tmp_path, good_env, monkeypatch, capsys
+):
+    """Nineteen counters were maintained for nobody.
+
+    Each one is a distinct operational fact with a comment arguing why it must be
+    told apart from its neighbours, and none of them reached a surface an
+    operator could read -- `_apply_unschedule` says so where it explains why it
+    logs its own number: "no MessageHandler counter is exported anywhere".
+
+    Every counter is asserted present rather than a sample of them, and the
+    expected set is taken from the handler itself, so a counter added later and
+    left out of the report fails here instead of going quietly missing.
+    """
+    stack = boot(db_path=tmp_path / "loops.db", pack_dir=SHIPPED_PACK_DIR,
+                 public_key_hex=SHIPPED_PUBKEY)
+
+    code = main(["health", "--db", str(tmp_path / "loops.db"),
+                 "--pack-dir", str(SHIPPED_PACK_DIR)])
+    out = capsys.readouterr().out
+
+    assert code == 0, out
+    missing = [name for name in stack.handler.counters() if name not in out]
+    assert not missing, f"counters absent from the health report: {missing}"
+    assert "future_dated_message_count" in out, "the registry's counter answers the same question"
+    assert referral_audit.audit_db_path() in out
+
+
+def test_health_mode_surfaces_a_dropped_audit_write(tmp_path, good_env, monkeypatch, capsys):
+    """The number the whole fail-open argument rests on, made visible.
+
+    `audit.py` argues that an audit write must never block a coordinator, and
+    justifies it with "between 'a compliance artifact is missing a row, loudly'
+    and 'a safety worklist is wedged'". `write_failures()` is the loudness, and
+    it had no consumer in `src/` at all -- not in `store.stats()`, not on a
+    worklist route, never logged. The argument was sound and the thing it
+    depended on was not implemented.
+
+    The failure is real rather than a poked counter: `log_guardrail_event` is
+    made to raise, the audited action still returns (which is the fail-open
+    policy holding), and the report then has to say so.
+    """
+    module = referral_audit._module()
+    real_log = module.log_guardrail_event
+    failing = {"on": True}
+
+    def unwritable(event):
+        if failing["on"]:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        return real_log(event)
+
+    # A toggle rather than `monkeypatch.undo()`, for the reason conftest gives:
+    # every fixture and the test body share one monkeypatch instance, so undo()
+    # would also take `good_env` off and the boot below would refuse for an
+    # entirely different reason.
+    monkeypatch.setattr(module, "log_guardrail_event", unwritable)
+    assert referral_audit.record_peer_refusal("engine-a", "no_merge_authority") is False
+    assert referral_audit.write_failures() == 1, "the failure has to be real to be reported"
+    failing["on"] = False
+
+    code = main(["health", "--db", str(tmp_path / "loops.db"),
+                 "--pack-dir", str(SHIPPED_PACK_DIR)])
+    out = capsys.readouterr().out
+
+    assert code == 0, out
+    failures_line = [line for line in out.splitlines() if "write_failures" in line]
+    assert failures_line and failures_line[0].strip().endswith("1"), out
+    assert "behind the event log" in out
+
+
+# ------------------------------------------------------ the repair tool has a door
+
+
+def test_rebuild_mode_restores_a_worklist_a_restore_left_empty(tmp_path, monkeypatch, capsys):
+    """The disaster `rebuild_projection` was written for, run the way an operator would.
+
+    `loops` is a projection of `loop_events`, so a restore that replays the event
+    log into a fresh file leaves it empty: `open_loops()` returns nothing while
+    the events are sitting right there, and every referral at the site is off the
+    worklist with no error anywhere. The repair for it existed and had no caller
+    in `src/`, which made it unreachable to the only person who would ever need
+    it.
+
+    The projection is emptied directly rather than by simulating a restore,
+    because the two produce the same state and the state is the premise. What is
+    under test is that a command puts it back.
+    """
+    db = tmp_path / "loops.db"
+    store = LoopStore(db)
+    now = datetime.now(timezone.utc)
+    store.append_event(LoopEvent("L-0000000000aa", "created", now, "C1",
+                                 {"mrn": "MRN1", "placer_order_number": "P1"}))
+    assert len(store.open_loops()) == 1
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM loops")
+    assert store.open_loops() == [], "the premise: the projection is gone, the log is not"
+
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+    for name in (PUBKEY_ENV, "REFERRAL_THRESHOLDS_ACCEPTED"):
+        monkeypatch.delenv(name, raising=False)
+
+    code = main(["rebuild", "--db", str(db)])
+    out = capsys.readouterr().out
+
+    assert code == 0, out
+    assert "rebuilt 1 loop projection row(s)" in out
+    assert len(store.open_loops()) == 1
+    assert store.open_loops()[0].loop_id == "L-0000000000aa"
+
+
+def test_rebuild_mode_refuses_a_database_that_does_not_exist(tmp_path, monkeypatch, capsys):
+    """A typo'd --db would otherwise create an empty file, rebuild the nothing in
+    it, and report success -- to an operator who has just been told their entire
+    worklist is empty. Same refusal purge and stats make, with a sharper edge."""
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+    missing = tmp_path / "typo" / "loops.db"
+
+    code = main(["rebuild", "--db", str(missing)])
+
+    assert code == 2
+    assert "no event log to rebuild from" in capsys.readouterr().err
+    assert not missing.exists()
+    assert not missing.parent.exists(), "a refused rebuild created the data directory"
+
+
+def test_rebuild_mode_refuses_an_unattested_volume(tmp_path, monkeypatch, capsys):
+    """It reads an event log of MRNs and result text and writes rows derived from
+    it, so encryption at rest holds first. The pack and threshold gates do not
+    apply and are proved not to by the test above, which runs with neither set."""
+    LoopStore(tmp_path / "loops.db")
+    monkeypatch.setenv("PHI_MODE", "full")
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption",
+                        lambda _volume: None)
+
+    code = main(["rebuild", "--db", str(tmp_path / "loops.db")])
+
+    assert code == 2
+    assert "PHI_ENCRYPTION_VERIFIED" in capsys.readouterr().err
+
+
+def test_health_and_rebuild_are_listed_in_help(capsys):
+    """A mode nobody can find is a mode that does not exist -- which is what
+    `rebuild_projection` was before it had one."""
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert exit_info.value.code == 0
+    assert "health" in out and "rebuild" in out
+    assert "REFERRAL_AUDIT_DB" in out, "the fourth gate has to be findable too"
 
 
 def test_help_works_with_no_pack_no_environment_and_no_database(tmp_path):

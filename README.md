@@ -63,7 +63,7 @@ reachable-but-we-agreed-not-to.
 | | |
 |---|---|
 | Source | ~17,000 lines, Python |
-| Tests | ~24,500 lines · **1,889 passing** |
+| Tests | ~24,500 lines · **1,908 passing** |
 | Coverage | 90% floor, 96% measured |
 | Runtime dependencies | one (`cryptography`) |
 | Standards | HL7 v2 · FHIR · SMART Backend Services · mutual TLS |

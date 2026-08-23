@@ -1,6 +1,6 @@
 """The immutable audit trail, and the one thing it must never contain.
 
-Spec section 3 routes referral audit through `guardrails/immutable_audit.py`,
+Spec section 3 routes referral audit through `referral_loop/immutable_audit.py`,
 and spec test 14 asserts PHI sentinels appear zero times in "worklist HTML,
 logs, exports, **and audit entries**". Until this task there were no audit
 entries, so that last clause passed while asserting nothing about anything.
@@ -127,8 +127,9 @@ def test_an_acknowledgement_appends_exactly_one_row(registry):
 
 
 def test_the_tenant_constant_identifies_no_site(registry):
-    """v1 is a single-site install and `tenant_isolation` is deliberately not
-    imported (spec sections 3 and 11), but GuardrailAuditEvent requires a
+    """v1 is a single-site install and the original system's tenant isolation
+    control is deliberately not carried over -- there is no such module in this
+    repository (spec sections 3 and 11) -- but GuardrailAuditEvent requires a
     tenant_id. Derived from the hostname or the install path it would be
     site-identifying, and it would read as a tenancy boundary this build does
     not test. It is a literal placeholder that says so."""
@@ -521,8 +522,8 @@ def test_no_sentinel_reaches_a_log_record_on_the_merge_and_reversal_paths(regist
     Spec test 14 names logs as one of its four artifacts, and the E2E proof in
     test_worklist greps `caplog` -- but it never reverses a merge, so four log
     lines on the identity paths were never covered. `store.reverse_alias` logged
-    both MRNs *and* the coordinator's free-text reason at WARNING, which is the
-    unbounded free-text channel arriving through a door nothing was watching.
+    both MRNs *and* the coordinator's free-text reason at WARNING -- an unbounded
+    free-text channel arriving through a door nothing was watching.
     """
     caplog.set_level(logging.DEBUG)
     reason = f"registration error, see {_E2E_SENTINELS['PID_NAME']}"

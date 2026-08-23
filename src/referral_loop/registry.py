@@ -136,7 +136,7 @@ from .audit import (
     RefusalCode,
     audited,
 )
-from .clock import MAX_CLOCK_SKEW, is_future_dated
+from .clock import MAX_CLOCK_SKEW, as_utc, is_future_dated
 from .core import machine
 from .core.machine import RejectionReason, TransitionRejected
 from .core.states import DocumentationStatus, ReferralState
@@ -257,14 +257,6 @@ _CLEARED_ACK = {"ack_by": "", "ack_role": "", "ack_at": ""}
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _as_utc(value: datetime) -> datetime:
-    """Naive timestamps are treated as UTC rather than compared against aware
-    ones, which raises TypeError. An HL7 MSH-7 frequently carries no offset, and
-    a TypeError inside the ordering guard would send every such message down the
-    AE path permanently."""
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 class Registry:
@@ -1639,7 +1631,7 @@ class Registry:
                 control_id, MAX_CLOCK_SKEW, self.future_dated_message_count,
             )
             return detail
-        return {**detail, _MESSAGE_AT: _as_utc(message_at).isoformat()}
+        return {**detail, _MESSAGE_AT: as_utc(message_at).isoformat()}
 
     def _stamp_merge(self, detail: dict, message_at: datetime | None, control_id: str) -> dict:
         """Record an A40's MSH-7 without letting it govern clinical ordering.
@@ -1666,7 +1658,7 @@ class Registry:
                 "Either a sender's clock is wrong or a message is forged; both need a human.",
                 control_id, MAX_CLOCK_SKEW, self.future_dated_message_count,
             )
-        return {**detail, _MERGE_MESSAGE_AT: _as_utc(message_at).isoformat()}
+        return {**detail, _MERGE_MESSAGE_AT: as_utc(message_at).isoformat()}
 
     @staticmethod
     def _message_time(event: LoopEvent) -> datetime | None:
@@ -1674,7 +1666,7 @@ class Registry:
         if not raw:
             return None
         try:
-            return _as_utc(datetime.fromisoformat(raw))
+            return as_utc(datetime.fromisoformat(raw))
         except (TypeError, ValueError):
             # An unparseable stamp must not be read as "older than everything".
             return None
@@ -1749,7 +1741,7 @@ class Registry:
         mark = self._clinical_watermark(loop_id)
         if mark is None:
             return
-        incoming = _as_utc(message_at)
+        incoming = as_utc(message_at)
         if incoming < mark:
             raise StaleMessageError(
                 f"Refusing {what} for loop {loop_id}: message time {incoming.isoformat()} "
