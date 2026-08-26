@@ -29,11 +29,29 @@ append-only event log. A coordinator sees three queues:
 | **Orphans** | A result arrived that matched no order |
 
 Built alongside that, and scoped honestly: a FHIR read client aimed at a further question — *does a
-document exist on the other side that nobody sent us?* That is the only path that produces value
-with zero cooperation from the receiving side; everything else waits for someone to send a message.
+document exist on the other side that nobody sent us?* It is the only path here that produces value
+without waiting for someone to push a message. Not without cooperation, though: it reads only from
+endpoints that have already registered this client for SMART Backend Services and granted it scopes.
 The client and its connector preflight are built and tested against a test FHIR server, and
 `connectors` mode runs the preflight today. The reconciliation job that would consume the client is
 v2: `find_candidate_documents` has tests and no production caller yet.
+
+### The boundary this sits inside
+
+Both ends of a tracked loop have to be reachable from one hospital's interface engine. That is a
+real limit, not a deployment detail. The US closed-loop referral standard — IHE PCC 360X, and its
+US National Extension — specifies Direct Secure Messaging carrying an XDM package with C-CDA
+content as the way a referral crosses an organizational boundary. This system speaks none of that.
+It reads HL7 v2 from a local interface engine, which 360X does not list as a transport at any
+conformance level.
+
+Worth being precise about what that does and does not mean. 360X's payloads *are* HL7 v2.5.1
+messages — the gap is transport and packaging, not the data model. And the loops most likely to
+break are the ones inside a single organization, where the order and the result already share an
+interface engine and nobody is watching the gap between them. That is the population this tracks.
+
+Crossing organizations is a different system, and an honest reading of the standard says so.
+[`docs/STANDARDS_WATCH.md`](docs/STANDARDS_WATCH.md) records the specifics and what would change it.
 
 ## Why it's built this way
 
