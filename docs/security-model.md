@@ -208,5 +208,9 @@ Authorities are granted, never inferred. Exactly three exist — `merge` (`ADT^A
 end with a clinically open loop on nobody's queue.** Orders and schedules are strictly additive
 and carry no authority, so they need none.
 
-~17,000 lines of source, ~24,500 lines of tests, 1,908 passing, 90% coverage floor against a
-measured 96%. One runtime dependency.
+~17,000 lines of source, ~24,500 lines of tests, over 1,900 passing, a 90% coverage floor enforced
+in CI against a measured figure in the mid-90s. One runtime dependency.
+
+The exact counts live in `BUILD_LOG.md`, dated. They belong there rather than here because a precise
+figure in a document nobody re-measures is wrong the first time someone adds a test — and this one
+moved six times in a single week of pre-publication work.
