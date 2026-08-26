@@ -65,6 +65,7 @@ import binascii
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -102,12 +103,24 @@ PUBKEY_ENV = "REFERRAL_PACK_PUBKEY"
 _ED25519_PUBLIC_KEY_BYTES = 32
 
 MODES = ("listen", "filedrop", "worklist", "eval", "purge", "stats", "connectors",
-         "health", "rebuild")
+         "documents", "health", "rebuild")
 
 # `eval` exit codes. Distinct from _refuse's 2, because "this pack must not ship"
 # and "this process could not start" send an operator to different places.
 EVAL_ALLOWED = 0
 EVAL_BLOCKED = 1
+
+# `documents` exit codes, and the distinction is the one `connect/documents.py`
+# exists to make. **0 means the search completed**, including the case where it
+# completed and found nothing -- a resolved patient with nothing filed is a real
+# answer a coordinator may act on. **1 means the search did not complete**: the
+# connector does not know this patient, matched several, failed the request, or
+# handed back a `next` link the walk would not follow. Sharing an exit code
+# between those two would hand a script the one confusion this module is built to
+# prevent, which is "nobody documented anything" reported for "we never got an
+# answer". 2 stays what it is everywhere else here: the command could not start.
+DOCUMENTS_SEARCHED = 0
+DOCUMENTS_UNANSWERED = 1
 
 
 class BootedStack(NamedTuple):
@@ -648,6 +661,149 @@ def _run_connectors(args: argparse.Namespace) -> int:
     return 0 if all(r.ok for r in reports) else 1
 
 
+def _search_date(value: str, flag: str) -> datetime | None:
+    """An ISO 8601 date or timestamp, or a refusal naming the flag. Never a guess.
+
+    Every other reading of an unparseable window -- clamp it, default it, drop the bound --
+    searches a period the operator did not ask for and then reports the result as though they
+    had. That is the same false negative `connect/documents.py` refuses everywhere else: an
+    answer about a window nobody chose is indistinguishable from an answer about theirs.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ReferralLoopError(
+            f"{flag} is not an ISO 8601 date or timestamp ({exc}). Give a date such as "
+            "2026-01-01, or an instant such as 2026-01-01T14:00:00+00:00. It is not "
+            "defaulted or corrected here: a search window this command guessed at would "
+            "report on a period the operator never asked about."
+        ) from exc
+
+
+def _run_documents(args: argparse.Namespace) -> int:
+    """Ask one connector what it has filed for one patient. Reads; never writes.
+
+    This is `connect/documents.find_candidate_documents` reaching an operator. Until it
+    existed the function had tests and no caller in `src/` at all, which reads to a reviewer
+    as either dead code or an unfinished thought -- and the honest answer was neither. The
+    two-hop search and its four outcomes are the part of this system with the most FHIR
+    exposure and the least standards ambiguity, and a capability nobody can invoke is a
+    capability nobody can check. `_run_rebuild` above was written out of the same argument.
+
+    **Read-only, and structurally so.** No `Registry` is constructed here and no `LoopStore`
+    is opened, so there is no object in scope through which a loop could be created, moved or
+    acknowledged. That is deliberate and it is the mode's whole safety claim: a coordinator
+    running a search to see what a specialist has filed must not thereby change what the
+    worklist says. Attaching a found document to a loop is the next sub-project's decision --
+    it needs an authority check, provenance and a transition -- and a search command that
+    quietly did it would be making that decision on a site's behalf without one.
+
+    **One gate, not four, and it is the encryption gate.** This pulls consult notes and
+    diagnostic reports into the process, so it handles PHI even though it never writes any:
+    an operator redirects this output into a file, and the file lands on the volume `--db`
+    names. Gating on that path is the site attesting that this machine may hold PHI at rest
+    at all. The other three do not apply, on exactly the reasoning `_run_purge` sets out --
+    no pack is loaded and nothing is matched, so the signature gate would be gate theatre;
+    no staleness is computed, so the threshold gate has nothing to accept; and the audit gate
+    guards a trail this command does not write to.
+
+    **The MRN travels on argv and that is the sharp edge of this command.** It is visible to
+    `ps` and to Task Manager for the life of the process and it lands in shell history, which
+    is a weaker position than anything else in this subsystem gives an identifier. It is
+    accepted because the alternative -- a search command that cannot be told who to search
+    for -- is not a command, and because this is an interactive diagnostic run by an operator
+    on the site's own host rather than something a scheduler runs. What follows from it is
+    that nothing this mode *prints* puts the identifier anywhere new: not the MRN, not the
+    remote's Patient id, and not `DocumentSearch.query_urls`, which carries the MRN
+    percent-encoded into the hop-1 URL and says so in its own docstring. The provenance is
+    held and returned; stdout is not the surface it goes out on.
+    """
+    from .connect.connectors import load_connector_registry
+    from .connect.documents import find_candidate_documents
+
+    # Argument validation first, the same way `_run_purge` answers the retention policy before
+    # anything touches disk: these checks read only argv, create nothing and fetch nothing, and
+    # an operator who mistyped a date needs to hear that rather than a message about a volume.
+    mrn = args.mrn.strip()
+    if not mrn:
+        raise ReferralLoopError(
+            "documents mode needs --mrn: the patient identifier to resolve at the connector, "
+            "in that connector's declared identifier_systems.mrn. There is no default, and an "
+            "empty value is not a narrower search -- an identifier token with an empty value "
+            "is a Patient search some servers answer with everyone they have."
+        )
+    since = _search_date(args.since, "--since")
+    if since is None:
+        raise ReferralLoopError(
+            "documents mode needs --since: the start of the window to search, as a date "
+            "(2026-01-01). There is no default because a default would be this command "
+            "choosing how far back a referral stays interesting, which is the site's call."
+        )
+    until = _search_date(args.until, "--until")
+
+    # Before the connector file is read and long before a token is signed: nothing has been
+    # fetched yet, so a box that cannot attest encryption at rest has not yet been handed PHI.
+    verify_encryption_at_rest(os.environ.get("PHI_MODE", "full"), args.db)
+
+    registry = load_connector_registry(args.connectors)
+    # Raises ConnectorConfigError naming every configured id when this one is a typo, which is
+    # the answer an operator wants -- `connectors` mode prints the same list.
+    profile = registry.get(args.connector)
+    if not profile.is_queryable:
+        # `find_candidate_documents` raises ConnectorCannotResolvePatients for this too, and
+        # would raise it here. Checked first anyway, because that refusal arrives after the
+        # JWT has been built and the token exchanged: an operator's first evidence of a
+        # misconfiguration should not be a credential handshake with a site they were never
+        # able to query. `connectors` mode already prints which connectors are in this state.
+        raise ReferralLoopError(
+            f"{profile.connector_id} declares no identifier_systems.mrn, so it cannot be "
+            "asked about one of our patients at all. It is preflight-only: reachability and "
+            f"credentials can be proven with `{PROG} connectors`, and nothing more."
+        )
+
+    try:
+        search = find_candidate_documents(registry, profile, mrn=mrn, since=since, until=until)
+    except ReferralLoopError as exc:
+        # Printed and returned rather than raised, the same choice `_run_connectors` makes and
+        # for the same reason: this is an answer about a remote system, not a failed start, and
+        # `_refuse`'s "refusing to start" would be the wrong sentence in front of it. Every one
+        # of these messages is built by `connect/documents.py` to name the connector and never
+        # the identifier -- see `_PatientResolutionRefused` -- so printing it is safe here.
+        print(f"{PROG}: {exc}")
+        return DOCUMENTS_UNANSWERED
+
+    print(
+        f"{PROG}: {profile.connector_id} answered for the window given: "
+        f"{len(search.resources)} candidate(s) over {search.pages_walked} page(s), "
+        f"{search.skipped_malformed} malformed resource(s) skipped."
+    )
+    for found in search.resources:
+        # The remote's own resource id and the page it came from. Neither identifies a patient,
+        # and both are what an operator needs to go look the document up at the source.
+        print(f"{PROG}:   {found.resource_type} {found.resource.get('id', '?')} "
+              f"(page {found.page})")
+    if not search.resources:
+        print(
+            f"{PROG}: the patient resolved and nothing is filed in that window. This is the "
+            "one empty answer this command will give: a connector that does not know the "
+            "patient, matches several, or fails the search exits 1 instead."
+        )
+    print(
+        f"{PROG}: read-only. No loop was created, moved or acknowledged, and nothing was "
+        f"written to {args.db}. Attaching any of the above to a referral is a separate, "
+        "audited action that this command deliberately cannot take."
+    )
+    print(
+        f"{PROG}: the identifier searched for, the remote's patient id and the query URLs are "
+        "held on the result and deliberately not printed -- query_urls carries the identifier "
+        "percent-encoded, and stdout gets redirected into files and pasted into tickets."
+    )
+    return DOCUMENTS_SEARCHED
+
+
 def _run_worklist(stack: BootedStack, host: str, port: int) -> int:
     """Serve the coordinator worklist. Loopback by refusal, not by convention.
 
@@ -733,6 +889,11 @@ def _build_parser() -> argparse.ArgumentParser:
              "deliberately never touches. "
              "connectors: check every configured FHIR endpoint -- reachability and "
              "credentials are proven separately -- and exit nonzero if any failed. "
+             "documents: ask one connector (--connector) what it has filed for one "
+             "patient (--mrn) since a date (--since). Read-only: it opens no loop "
+             "database and can move nothing. Exit 0 means the search completed, "
+             "including completing with nothing found; exit 1 means it did not "
+             "complete, which is the opposite fact. "
              "health: print this process's ingest counters and the audit trail's "
              "path and dropped-write count. rebuild: reconstruct the loops "
              "projection from the event log, for a restore that left the worklist "
@@ -741,8 +902,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default="data/referral_loops.db",
                         help="SQLite file on an encrypted volume (default: %(default)s)")
     parser.add_argument("--connectors", default="connectors.json",
-                        help="connectors mode: JSON file of outbound FHIR endpoints "
-                             "(default: %(default)s)")
+                        help="connectors and documents modes: JSON file of outbound FHIR "
+                             "endpoints (default: %(default)s)")
+    parser.add_argument("--connector", default="",
+                        help="documents mode: which connector_id from --connectors to "
+                             "search. Required, and never inferred even when the file "
+                             "holds exactly one -- a search is addressed to a named site")
+    parser.add_argument("--mrn", default="",
+                        help="documents mode: the patient identifier to resolve at that "
+                             "connector, in its declared identifier_systems.mrn. Note that "
+                             "this puts an identifier on the process command line, where "
+                             "ps and shell history can see it; the mode is an interactive "
+                             "operator diagnostic for that reason, not something to "
+                             "schedule. Nothing it prints repeats the value")
+    parser.add_argument("--since", default="",
+                        help="documents mode: start of the window to search, as an ISO "
+                             "8601 date (2026-01-01) or instant. Required and never "
+                             "defaulted: how far back a referral stays interesting is a "
+                             "clinical judgement, not this command's. Note the search "
+                             "widens it to midnight of that day")
+    parser.add_argument("--until", default="",
+                        help="documents mode: optional end of the window, same format. "
+                             "Omitted, the search is open-ended forwards")
     parser.add_argument("--pack-dir", default=str(DEFAULT_PACK_DIR),
                         help="directory holding pack.json and pack.sig (default: the shipped pack)")
     parser.add_argument("--drop-dir", default="data/dropbox",
@@ -823,8 +1004,13 @@ def main(argv: list[str] | None = None) -> int:
     # how big their database has gotten -- needs to hear that rather than a message about a
     # signing key. connectors joins them for the same reason and a stronger one: preflight
     # touches no database, no pack and no PHI, so not one of the four boot gates is relevant
-    # to what it does. See _run_purge, _run_stats and _run_connectors for which gates each runs.
-    if args.mode in ("purge", "stats", "connectors", "rebuild"):
+    # to what it does. documents sits beside it: it does handle PHI and therefore takes the
+    # encryption gate itself, but it loads no pack, computes no staleness and writes no audit
+    # row, so the remaining three would be gate theatre in front of a read-only search -- and
+    # a pack key it does not use must not stand between a coordinator and the question "has
+    # the specialist filed anything". See _run_purge, _run_stats, _run_connectors and
+    # _run_documents for which gates each one runs and why.
+    if args.mode in ("purge", "stats", "connectors", "documents", "rebuild"):
         try:
             if args.mode == "purge":
                 return _run_purge(args)
@@ -832,6 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
                 return _run_stats(args)
             if args.mode == "rebuild":
                 return _run_rebuild(args)
+            if args.mode == "documents":
+                return _run_documents(args)
             return _run_connectors(args)
         except (ReferralLoopError, RuntimeError) as exc:
             return _refuse(str(exc))

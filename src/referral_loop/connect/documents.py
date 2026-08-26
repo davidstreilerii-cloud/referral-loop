@@ -16,6 +16,31 @@ raise, so that only the fourth can hand back an empty result:
 
 A caller handed an empty list cannot tell those apart, and they are opposite facts about a
 referral loop. Design spec section 1.3.
+
+Who calls this
+--------------
+`find_candidate_documents` had tests and no caller anywhere in `src/` -- the module was
+written against a next sub-project that has not landed. That is a bad thing to publish
+either way it reads: dead code, or an unfinished thought, and a reviewer cannot tell which
+from the outside. It is now wired to `cli._run_documents` (`referral-loop documents`), and
+the choice between wiring and deleting went to wiring for three reasons.
+
+The capability is real and the site needs it before the attach path exists -- "has the
+specialist filed anything for this patient" is the question the whole product is about, and
+a coordinator asking it by hand is a smaller thing than an automated attach, not a
+placeholder for one. The four outcomes above are a claim about behaviour that a reader can
+now run rather than take on trust; deleting the function would have deleted the claim with
+it. And `LoopStore.rebuild_projection` was in exactly this position -- tested, uncalled,
+genuinely needed after a restore -- and got `referral-loop rebuild` for the same argument,
+so a second answer here would have made the first one arbitrary.
+
+What the command deliberately does **not** do is attach anything. It constructs no
+`Registry` and opens no `LoopStore`, so no result of this search can move a loop; deciding
+that a fetched DocumentReference closes a referral needs an authority check, provenance and
+a transition, and that is the next sub-project's decision to make rather than a search
+command's to make quietly. `connectors.py`'s own docstring already drew that line: "the day
+an adapter lets a fetched DocumentReference close a loop, that has to be a line someone
+wrote".
 """
 from __future__ import annotations
 
@@ -56,9 +81,10 @@ class _PatientResolutionRefused(ReferralLoopError):
     here: `str(exc)` on a `ReferralLoopError` is what every caller in this package logs --
     `registry.py`, `store.py` and `MessageHandler._process` all do it with `%s` -- so an
     identifier interpolated into the message is an identifier in a log file the first time
-    anybody wires this module up. Nothing in `src/` calls it yet, which makes this a
-    landmine rather than a leak, and a landmine is the thing to remove before publication
-    rather than after the first caller.
+    anybody wires this module up. It was defused while nothing in `src/` called it --
+    a landmine rather than a leak, and the moment to lift one is before the first caller.
+    That caller exists now: `cli._run_documents` prints `str(exc)` for exactly these two
+    refusals, which is the sentence above happening for real one task after it was written.
 
     Carried on the object because a caller resolving identity across two sites genuinely
     may need to know *which* identifier missed. The point of the move is that reaching for

@@ -39,8 +39,8 @@ is a different claim, and nothing in v1 observes it.
     export PHI_ENCRYPTION_VERIFIED=1   # or run on an OS-detected encrypted volume
     referral-loop listen --db data/referral_loops.db --peers peers.json
 
-Modes: `listen`, `filedrop`, `worklist`, `eval`, `purge`, `stats`, `connectors`, `health`,
-`rebuild`.
+Modes: `listen`, `filedrop`, `worklist`, `eval`, `purge`, `stats`, `connectors`, `documents`,
+`health`, `rebuild`.
 
 `listen` requires mutual TLS. `--peers` names a **JSON** file that carries both
 the TLS material and the peer map, because "which CA may sign a client
@@ -144,6 +144,29 @@ A read-only connector grants none, but the field is not optional.
 Preflight makes **two** proofs and reports them apart, because `/metadata` is
 unauthenticated on Epic: fetching it proves reachability, TLS and version, and proves
 nothing at all about whether our credentials work.
+
+`documents` mode asks the other half of the question — whether the far side has filed
+anything for one patient that nobody sent us:
+
+    referral-loop documents --connectors connectors.json --connector example-med \
+                            --mrn MRN1 --since 2026-01-01
+
+Read-only, and structurally so: it constructs no registry and opens no loop database, so a
+search cannot move a loop. That is asserted by counting loop events either side of the call
+rather than by reading the mode's source, because a future caller that wrote would pass any
+test that only inspected code.
+
+Exit codes split three ways on purpose. **0** the search completed, including when it
+legitimately found nothing; **1** the connector answered but not usably — the patient is
+unknown there, or ambiguous, or the request failed; **2** the mode could not start, which
+covers an unknown connector, a preflight-only connector, an unparseable window, and a failed
+encryption gate. "Nothing filed" and "could not ask" are different answers to a coordinator
+and should not share an exit code.
+
+The report names the connector, the resource types, the remote resource ids and the page
+count. It does **not** print the MRN, the remote Patient id, or the query URLs — those carry
+the identifier percent-encoded. `--mrn` on the command line is the one exposure, and it is
+the operator's own argv.
 
 ## Required configuration
 

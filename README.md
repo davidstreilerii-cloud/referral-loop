@@ -32,9 +32,12 @@ Built alongside that, and scoped honestly: a FHIR read client aimed at a further
 document exist on the other side that nobody sent us?* It is the only path here that produces value
 without waiting for someone to push a message. Not without cooperation, though: it reads only from
 endpoints that have already registered this client for SMART Backend Services and granted it scopes.
-The client and its connector preflight are built and tested against a test FHIR server, and
-`connectors` mode runs the preflight today. The reconciliation job that would consume the client is
-v2: `find_candidate_documents` has tests and no production caller yet.
+The client and its connector preflight are built and tested against a test FHIR server. Two modes
+reach them today: `connectors` runs the preflight, and `documents` asks the question above for one
+patient and prints what it found. Both are read-only — `documents` constructs no registry and opens
+no loop database, so a search cannot move a loop, which is asserted by counting events either side
+of the call rather than by reading the code. The job that would consume the search *automatically*,
+attaching what it finds, is v2.
 
 ### The boundary this sits inside
 

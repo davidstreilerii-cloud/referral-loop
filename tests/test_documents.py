@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
 
+from referral_loop.cli import MODES, main
 from referral_loop.connect.connectors import ConnectorRegistry
 from referral_loop.connect.documents import (
     MAX_PAGES,
@@ -32,7 +34,14 @@ from ._fhirserver import (
 _SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def _registry(base_url, key_path, ca_file, *, mrn_system="urn:oid:1.2.3"):
+def _connector_mapping(base_url, key_path, ca_file, *, mrn_system="urn:oid:1.2.3"):
+    """The connector file's contents, as a mapping.
+
+    Split out of `_registry` so the CLI tests at the bottom of this file can write the *same*
+    connector to disk and let `load_connector_registry` read it back. A second literal would
+    drift from this one, and the mode under test is only interesting insofar as it reaches the
+    same profile these tests already exercise in-process.
+    """
     connector = {
         "connector_id": "example-med",
         "organization": "Example Medical Center",
@@ -53,7 +62,13 @@ def _registry(base_url, key_path, ca_file, *, mrn_system="urn:oid:1.2.3"):
     }
     if mrn_system is not None:
         connector["identifier_systems"] = {"mrn": mrn_system}
-    return ConnectorRegistry.from_mapping({"connectors": [connector]})
+    return {"connectors": [connector]}
+
+
+def _registry(base_url, key_path, ca_file, *, mrn_system="urn:oid:1.2.3"):
+    return ConnectorRegistry.from_mapping(
+        _connector_mapping(base_url, key_path, ca_file, mrn_system=mrn_system)
+    )
 
 
 @pytest.fixture
@@ -348,7 +363,11 @@ def test_a_patient_miss_keeps_the_mrn_out_of_the_exception_text(certs, tmp_path)
     `ReferralLoopError` is exactly what every caller in this package logs --
     `registry.py`, `store.py` and `MessageHandler._process` all do -- so an MRN
     in the message is an MRN in a log file the moment anything wires this up.
-    Nothing wires it up yet, which is why this is a landmine rather than a leak.
+
+    Something wires it up now. `cli._run_documents` prints `str(exc)` for this
+    refusal and the one below it, so the rule stopped being a precaution and
+    became the reason the `documents` mode's output is safe to redirect into a
+    file. This test is what holds it there.
     """
     certfile, keyfile, ca = certs
     key_path, _ = rsa_keypair(tmp_path)
@@ -416,3 +435,248 @@ def test_query_urls_are_documented_as_phi_bearing(certs, tmp_path):
     assert "PHI" in doc and "query_urls" in doc, (
         "query_urls carries an MRN and the dataclass does not say so"
     )
+
+
+# ------------------------------------- the `documents` mode: the caller this module lacked
+#
+# Everything above this line exercises `find_candidate_documents` in-process. Nothing in
+# `src/` did, which is the whole reason this section exists -- see the module docstring of
+# `connect/documents.py` for the argument. These tests go in through `cli.main`, because a
+# public entry point is only reachable if the argument parsing, the gate ordering and the
+# dispatch all agree with each other, and none of those three is exercised by calling the
+# function directly.
+
+
+def _store_with_one_event(tmp_path):
+    """A loop store holding exactly one event, so "unchanged" is a number and not a vacuum."""
+    from referral_loop.events import LoopEvent
+    from referral_loop.store import LoopStore
+
+    store = LoopStore(tmp_path / "loops.db")
+    store.append_event(LoopEvent("L-000000000001", "created", _SINCE, "C1", {"mrn": "MRN1"}))
+    return store
+
+
+def _loop_events(store) -> int:
+    return store.stats()["tables"]["loop_events"]["rows"]
+
+
+def _connector_file(tmp_path, base_url, key_path, ca_file, *, mrn_system="urn:oid:1.2.3"):
+    path = tmp_path / "connectors.json"
+    path.write_text(
+        json.dumps(_connector_mapping(base_url, key_path, ca_file, mrn_system=mrn_system)),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def attested(monkeypatch):
+    """The encryption gate satisfied by operator attestation, and no pack key anywhere.
+
+    Both halves are assertions in disguise. The attestation is set because this mode *does*
+    take the encryption gate -- a run on a box with it unset must refuse, which is its own
+    test below. The pack key is removed because this mode has to reach its work without one:
+    it loads no pack and matches nothing, exactly as `connectors` does not.
+    """
+    monkeypatch.setenv("PHI_MODE", "full")
+    monkeypatch.setenv("PHI_ENCRYPTION_VERIFIED", "1")
+    monkeypatch.delenv("REFERRAL_PACK_PUBKEY", raising=False)
+
+
+def test_the_documents_mode_finds_candidates_and_writes_no_loop_state(
+    certs, tmp_path, capsys, attested
+):
+    """The read-only claim is the whole point: a search must not be able to move a loop.
+
+    Asserted by counting events before and after rather than by reading the mode's source,
+    because a future caller that writes would pass any test that only inspects code. The
+    database counted is the one the mode was handed on `--db`, so a mode that opened it and
+    appended anything -- an attach, a "we looked" marker, an audit-shaped loop event -- fails
+    here rather than at a code review that might not happen.
+    """
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    store = _store_with_one_event(tmp_path)
+    before = _loop_events(store)
+
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        document_reference("d1")
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        diagnostic_report("r1")
+    )
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        path = _connector_file(tmp_path, base, key_path, ca)
+        code = main([
+            "documents", "--connectors", str(path), "--connector", "example-med",
+            "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+        ])
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "DocumentReference" in out and "d1" in out
+    assert "DiagnosticReport" in out and "r1" in out
+    assert _loop_events(store) == before, "a document search moved a loop"
+
+
+def test_the_mode_does_not_print_the_mrn_it_was_given(certs, tmp_path, capsys, attested):
+    """`DocumentSearch.query_urls` carries the MRN percent-encoded and says so in its own
+    docstring. stdout is the one surface an operator pipes into a file, pastes into a ticket
+    and leaves open in a terminal, so the provenance this mode holds is deliberately not the
+    provenance it prints."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle(
+        document_reference("d1")
+    )
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        path = _connector_file(tmp_path, base, key_path, ca)
+        code = main([
+            "documents", "--connectors", str(path), "--connector", "example-med",
+            "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+        ])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "MRN1" not in captured.out
+    assert "MRN1" not in captured.err
+
+
+def test_a_resolved_patient_with_nothing_filed_still_exits_zero(certs, tmp_path, capsys, attested):
+    """Empty is a real answer here and must not look like a failure. The three answers that are
+    *not* "nothing was filed" all raise inside the search, so exit 0 with a count of zero is the
+    one case where a coordinator may act on the absence."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    bundles = _patient_bundle()
+    bundles["/DocumentReference?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    bundles["/DiagnosticReport?patient=Patient%2Fp1&date=ge2026-01-01"] = bundle()
+    with fhir_server(certfile, keyfile, ServerBehaviour(bundles=bundles)) as (base, _b):
+        path = _connector_file(tmp_path, base, key_path, ca)
+        code = main([
+            "documents", "--connectors", str(path), "--connector", "example-med",
+            "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+        ])
+
+    assert code == 0
+    assert "0 candidate" in capsys.readouterr().out
+
+
+def test_a_patient_the_connector_does_not_know_exits_one_not_zero(certs, tmp_path, capsys, attested):
+    """The distinction the whole module is built on, carried out to an exit code. "We asked and
+    the answer is not usable" is not "we asked and there was nothing", so it cannot share an exit
+    code with it -- a script that treats both as 0 has learned the wrong fact."""
+    certfile, keyfile, ca = certs
+    key_path, _ = rsa_keypair(tmp_path)
+    behaviour = ServerBehaviour(
+        bundles={"/Patient?identifier=urn%3Aoid%3A1.2.3%7CMRN1": bundle()}
+    )
+    with fhir_server(certfile, keyfile, behaviour) as (base, _b):
+        path = _connector_file(tmp_path, base, key_path, ca)
+        code = main([
+            "documents", "--connectors", str(path), "--connector", "example-med",
+            "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+        ])
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "example-med" in out
+    assert "MRN1" not in out
+
+
+def test_a_preflight_only_connector_refuses_before_it_signs_anything(tmp_path, capsys, attested):
+    """No server is started, and that is the assertion. A connector with no declared identifier
+    system cannot be asked about a patient at all, so the refusal has to come before the JWT is
+    built and the token call made -- otherwise the operator's first evidence of a configuration
+    mistake is a credential exchange with a site they were never able to query."""
+    key_path, _ = rsa_keypair(tmp_path)
+    path = _connector_file(
+        tmp_path, "https://unreachable.invalid/api/FHIR/R4", key_path, None, mrn_system=None
+    )
+    code = main([
+        "documents", "--connectors", str(path), "--connector", "example-med",
+        "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "identifier_systems" in err
+    assert "MRN1" not in err
+
+
+def test_an_unknown_connector_refuses_and_names_the_configured_ones(tmp_path, capsys, attested):
+    key_path, _ = rsa_keypair(tmp_path)
+    path = _connector_file(tmp_path, "https://unreachable.invalid/api/FHIR/R4", key_path, None)
+    code = main([
+        "documents", "--connectors", str(path), "--connector", "typo-med",
+        "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "typo-med" in err and "example-med" in err
+
+
+def test_an_unparseable_since_refuses_rather_than_searching_from_nowhere(tmp_path, capsys, attested):
+    """A window this mode could not parse must not become a window it invented. Every other
+    reading of a bad `--since` -- clamp it, default it, drop it -- searches a period the operator
+    did not ask for and reports the result as though they had."""
+    key_path, _ = rsa_keypair(tmp_path)
+    path = _connector_file(tmp_path, "https://unreachable.invalid/api/FHIR/R4", key_path, None)
+    code = main([
+        "documents", "--connectors", str(path), "--connector", "example-med",
+        "--mrn", "MRN1", "--since", "last tuesday", "--db", str(tmp_path / "loops.db"),
+    ])
+    assert code == 2
+    assert "--since" in capsys.readouterr().err
+
+
+def test_it_refuses_without_an_mrn(tmp_path, capsys, attested):
+    """argparse would default `--mrn` to the empty string and the search would go out asking for
+    a patient identified by nothing, which some servers answer with every patient they have."""
+    key_path, _ = rsa_keypair(tmp_path)
+    path = _connector_file(tmp_path, "https://unreachable.invalid/api/FHIR/R4", key_path, None)
+    code = main([
+        "documents", "--connectors", str(path), "--connector", "example-med",
+        "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+    ])
+    assert code == 2
+    assert "--mrn" in capsys.readouterr().err
+
+
+def test_it_refuses_without_a_window(tmp_path, capsys, attested):
+    """Omitted is refused for the same reason unparseable is. A default `--since` would be
+    this command deciding how far back a referral stays interesting, which is a clinical
+    judgement the site makes -- the same argument `staleness` makes for its thresholds, and
+    the reason those are gated behind an acceptance variable rather than shipped as fact."""
+    key_path, _ = rsa_keypair(tmp_path)
+    path = _connector_file(tmp_path, "https://unreachable.invalid/api/FHIR/R4", key_path, None)
+    code = main([
+        "documents", "--connectors", str(path), "--connector", "example-med",
+        "--mrn", "MRN1", "--db", str(tmp_path / "loops.db"),
+    ])
+    assert code == 2
+    assert "--since" in capsys.readouterr().err
+
+
+def test_it_refuses_when_encryption_at_rest_is_not_attested(tmp_path, capsys, monkeypatch):
+    """The one gate this mode does take. It pulls consult notes and lab results into this
+    process and prints them, and an operator redirects that stdout onto the volume `--db`
+    names."""
+    monkeypatch.setenv("PHI_MODE", "full")
+    monkeypatch.delenv("PHI_ENCRYPTION_VERIFIED", raising=False)
+    monkeypatch.setattr("referral_loop.encryption_check._detect_os_encryption", lambda _p: None)
+    key_path, _ = rsa_keypair(tmp_path)
+    path = _connector_file(tmp_path, "https://unreachable.invalid/api/FHIR/R4", key_path, None)
+    code = main([
+        "documents", "--connectors", str(path), "--connector", "example-med",
+        "--mrn", "MRN1", "--since", "2026-01-01", "--db", str(tmp_path / "loops.db"),
+    ])
+    assert code == 2
+    assert "PHI_ENCRYPTION_VERIFIED" in capsys.readouterr().err
+
+
+def test_documents_is_a_mode():
+    assert "documents" in MODES
