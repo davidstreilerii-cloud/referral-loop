@@ -105,7 +105,11 @@ def test_the_module_records_when_it_is_deleted():
     """A temporary module with no expiry note becomes permanent. The note is the only
     thing standing between this bridge and a second permanent state vocabulary."""
     doc = migration.__doc__ or ""
-    assert "Plan 2b" in doc
+    # 2c, not 2b. 2b built this bridge and replays history through it; 2c is the plan
+    # that retires the legacy vocabulary and takes this module with it. Asserting 2b
+    # passed for a while by accident -- the string survives in a different sentence
+    # about replay -- which is a test agreeing with its own name and not with the code.
+    assert "Plan 2c" in doc
     assert "delete" in doc.lower()
 
 

@@ -1,16 +1,37 @@
 """The legacy nine-state vocabulary, mapped onto the canonical model.
 
-**Temporary. Plan 2b deletes this module** when `Loop` and `LoopState` go away and the
+**Temporary. Plan 2c deletes this module** when `Loop` and `LoopState` go away and the
 canonical model is the only vocabulary in the repo. A temporary module carrying no expiry
 note becomes permanent, and a second permanent state vocabulary is the thing this whole
 plan exists to avoid -- so the note is here, at the top, rather than in a plan document
 nobody reads while editing code.
 
-Until then it is the bridge two callers need. Plan 2b's replay walks the event log through
-`canonical_state`; an interoperability branch forking at `canonical-model-v1` uses
-`to_referral` and `to_artifact` to get a canonical view of live data without waiting for
-2b to land. Nothing in the running machine imports it, and `core/` must not: the import
-closure test names this module as forbidden from the domain layer.
+Until then it is a bridge, and the useful thing to write down is how wide. **Two modules
+under `src/` import it, and they are not the same kind of caller.** `registry.py` takes
+`canonical_state` and `to_referral` for the transition guard, which runs on every move a
+loop makes: that is the substantive coupling, the one whose removal is the actual work of
+the plan above. `worklist.py` takes `translate_to_legacy` for a single line in its refusal
+handler, and that one is display only -- no decision is made from the result, and deleting
+it changes what a coordinator reads and nothing else. Plan 2b's replay will walk the event
+log through `canonical_state` as well, and an interoperability branch forking at
+`canonical-model-v1` uses `to_artifact` for a canonical view of live data without waiting
+for 2b to land; neither of those is in this tree today. Everything else that reaches this
+module is a test.
+
+The count is here because "how much depends on this" is the first question anyone asks
+before deleting a module, and grep answers it badly: `store.py` and `listener.py` both name
+things from here in prose, and `to_artifact`, `UNRECORDED_PARTY` and
+`CLOSED_IS_UNREACHABLE` have no importer under `src/` at all. Two, not five.
+
+Nothing in `core/` imports this module and nothing in `core/` may: the import closure test
+names it as forbidden from the domain layer.
+
+On the plan numbers, because an earlier revision of this docstring had them backwards and a
+reader chasing them deserves better than a contradiction. **2b built this bridge; 2c removes
+it.** 2b is the zero-behaviour-change exercise that introduced `Transition` and routed moves
+through `machine.apply` -- it replays history *through* this module and could not have
+deleted it. 2c is the follow-on that retires the legacy vocabulary, and it is the one the
+header names. `translate_to_legacy` has said 2c all along and was the correct one.
 
 **What the map says.** Five legacy states carry over into `ReferralState`:
 

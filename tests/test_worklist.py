@@ -22,8 +22,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from referral_loop import worklist as worklist_module
+from referral_loop.core.machine import TransitionRejected
+from referral_loop.core.states import ReferralState
 from referral_loop.errors import StoreUnavailableError
 from referral_loop.events import LoopState
+from referral_loop.migration import (
+    WITHOUT_LEGACY_SOURCE,
+    canonical_state,
+    translate_to_legacy,
+)
 from referral_loop.registry import Registry
 from referral_loop.store import LoopStore
 from referral_loop.worklist import (
@@ -338,6 +345,13 @@ def test_acknowledging_a_preliminary_is_refused_with_a_renderable_4xx(http, regi
 
 
 def test_acknowledging_twice_is_refused(http, registry):
+    # The ACKNOWLEDGED assertion below also happens to pin the legacy-vocabulary
+    # translation at worklist._refused: the machine refuses this as RECONCILED ->
+    # RECONCILED, so without the translation the error says RECONCILED and this line
+    # fails. That is a side effect of the state this test happens to use rather than
+    # anything it set out to check -- see the vocabulary-boundary section below, which
+    # checks it on purpose. Do not weaken this to a status-code-only assertion on the
+    # grounds that the message is incidental; it is load-bearing twice over.
     loop_id = _acknowledged(registry)
     response = http.post(f"/worklist/{loop_id}/acknowledge",
                          json={"actor": "coordinator-b", "role": "referral_coordinator"})
@@ -359,6 +373,240 @@ def test_an_unknown_loop_is_404_not_500(http):
     response = http.post("/worklist/L-does-not-exist/acknowledge",
                          json={"actor": "a", "role": "referral_coordinator"})
     assert response.status_code == 404
+
+
+# ------------------------------------------------- the legacy vocabulary boundary
+
+# The canonical names that are not also legacy names -- derived rather than listed, so a
+# tenth LoopState or a fifteenth ReferralState is folded in by the next test run instead
+# of by somebody remembering to edit a literal here. SCHEDULED and CANCELLED fall out of
+# this set because both vocabularies spell them the same way, which is exactly why they
+# are uninteresting: no coordinator can tell which model produced them, so neither can a
+# test. Everything left is a word that appears on this surface only if the translation at
+# worklist._refused stopped happening.
+_CANONICAL_ONLY_STATE_NAMES = frozenset(
+    {state.name for state in ReferralState} - {state.name for state in LoopState}
+)
+
+
+def _mentions(name: str, text: str) -> bool:
+    """Whole-word, matching how translate_to_legacy rewrites -- see its docstring.
+
+    A substring test would be both too eager and too lax here: `SENT` sits inside no other
+    state name today, but a loop id is caller-influenced elsewhere on this surface and the
+    reason the translation is `\\b`-anchored in the first place is that a bare replace
+    corrupts longer tokens. A test that checks for leakage by a looser rule than the code
+    prevents it by is measuring something other than the code.
+    """
+    return re.search(rf"\b{name}\b", text) is not None
+
+
+def test_a_machine_refusal_reaches_the_coordinator_in_the_legacy_vocabulary(http, registry):
+    """The bridge in migration.py, exercised where it is actually load-bearing.
+
+    Plan 2b routed the worklist's refusals through `core.machine`, whose messages name
+    `ReferralState` members. Every other thing this surface shows a coordinator -- the
+    queue rows, the success bodies, the buttons on the page -- says ACKNOWLEDGED. So a
+    refusal that said RECONCILED would be an internal refactor changing what a person
+    reads, which is the one thing that routing was explicitly not entitled to do.
+
+    Written against the HTTP body rather than against `translate_to_legacy` directly, and
+    the distinction is the whole value of the test. A unit test of the substitution passes
+    happily on the day someone deletes the call in `worklist._refused` and the canonical
+    names start reaching coordinators; only a test that drives a real refusal through the
+    real route can fail on that. The raw exception is asserted on too, below, so the test
+    also cannot pass by accident on a refusal that never contained a canonical name --
+    without that half, a future refusal raised in registry.py before the machine is
+    reached would satisfy the negative assertions vacuously.
+    """
+    loop_id = registry.open_loop(mrn=MRN_SENTINEL, modality="CT", control_id="C-VOCAB-1")
+
+    response = http.post(f"/worklist/{loop_id}/acknowledge",
+                         json={"actor": "a", "role": "referral_coordinator"})
+    assert response.status_code == 409, response.data
+    error = response.get_json()["error"]
+
+    # Provenance. `not_a_legal_transition` is `RejectionReason.NOT_A_LEGAL_TRANSITION`'s
+    # value and core.machine is the only thing that writes it, so this pins that the
+    # refusal under test really did come from the state machine and not from one of
+    # registry.py's own pre-machine guards, which speak legacy already and would make the
+    # rest of this test prove nothing.
+    assert "not_a_legal_transition" in error, error
+
+    assert _mentions("OPEN", error), error
+    assert _mentions("ACKNOWLEDGED", error), error
+    assert not _mentions("SENT", error), error
+    assert not _mentions("RECONCILED", error), error
+
+    # And the same refusal, caught before the translation, to show there was something to
+    # translate. If this half ever stops holding -- because the machine's message changed
+    # shape, or because the guard moved back out of core -- the assertions above have
+    # quietly become tautologies and this is what says so.
+    with pytest.raises(TransitionRejected) as raised:
+        registry.acknowledge(loop_id, actor="a", role="referral_coordinator",
+                             control_id="C-VOCAB-2")
+    raw = str(raised.value)
+    assert _mentions("SENT", raw), raw
+    assert _mentions("RECONCILED", raw), raw
+
+
+def test_every_canonical_state_a_legacy_loop_can_be_in_has_a_legacy_spelling():
+    """Totality in the only direction this boundary needs it.
+
+    A refusal's `from_state` is `canonical_state(loop.state)` and nothing else, so the
+    states this surface can name are exactly the image of the forward map. The map being
+    partial the other way -- six canonical states with no legacy source at all -- is fine
+    and is the point of `WITHOUT_LEGACY_SOURCE`; the map being partial *this* way would
+    mean a refusal that a coordinator reads in two vocabularies at once.
+
+    Driven through `translate_to_legacy` rather than by reading the private inverse dict,
+    because the inverse dict being complete and the substitution actually firing are two
+    different claims and only the second one is what a coordinator experiences.
+    """
+    checked = 0
+    for legacy in LoopState:
+        if legacy is LoopState.CLOSED:
+            continue  # No canonical image at all; CLOSED_IS_UNREACHABLE says why.
+        canonical = canonical_state(legacy)
+        if not isinstance(canonical, ReferralState):
+            continue  # Section 6.5: an artifact's state, which no referral refusal names.
+        assert translate_to_legacy(f"-> {canonical.name} refused") == f"-> {legacy.name} refused"
+        checked += 1
+    assert checked == 5, "the five legacy states that carry over into ReferralState"
+
+
+def test_no_action_on_this_surface_can_refuse_in_a_canonical_state_name(http, registry):
+    """The leak-hunt, run mechanically rather than argued.
+
+    Six canonical states -- DRAFT, RECEIVED, ACCEPTED, DECLINED, SEEN, AGED_OUT -- have no
+    legacy spelling, so `translate_to_legacy` leaves them exactly as they are. That is
+    correct behaviour for a partial map and a real hazard for this surface: a refusal whose
+    `to_state` were one of those six would show a coordinator a word from a model the rest
+    of the page has never heard of, and the translation could not save it.
+
+    Nothing can reach that today, because the only worklist action routed through the
+    machine is `acknowledge` and the only move it asks for is RECONCILED. But "nothing can
+    reach that today" is a claim about a call graph, and call graphs change under people
+    who are not reading this comment. So it is checked by driving every action against a
+    loop in every reachable legacy state and reading what comes back, which keeps holding
+    when registry.py grows a sixth guard or the worklist grows a sixth button.
+    """
+    loops = _one_loop_in_every_legacy_state(registry)
+    attach_target = registry.open_loop(mrn=MRN_SENTINEL, modality="NM",
+                                       control_id="C-SWEEP-TARGET")
+    attribution = {"actor": "a", "role": "referral_coordinator", "reason": "sweep"}
+    actions = {
+        "acknowledge": attribution,
+        "reverse_acknowledgement": attribution,
+        "dismiss": attribution,
+        "undo_match": attribution,
+        "attach": {**attribution, "target_loop_id": attach_target},
+    }
+
+    # Actions that are *not* refused move the loop they were aimed at, so the later cells
+    # of a row run against whatever the earlier ones left behind -- acknowledging the
+    # RESULTED loop succeeds, and everything after it in that row is really an attempt on
+    # an ACKNOWLEDGED one. Left alone rather than reset between cells: it widens what gets
+    # tried rather than narrowing it, and a coordinator clicking two buttons in a row
+    # produces exactly this. It does mean the key this grid was built under stops being
+    # the loop's state partway through, so the failure message reads the live state back
+    # rather than naming the one the row was seeded with.
+    refusals = 0
+    for loop_id in loops.values():
+        for action, body in actions.items():
+            response = http.post(f"/worklist/{loop_id}/{action}", json=body)
+            if response.status_code != 409:
+                continue
+            refusals += 1
+            payload = response.get_json()
+            # Both fields, not just "error". `detail` is written by _refused too, and a
+            # leak in the field nobody thought to check is the leak that ships.
+            shown = f"{payload.get('error', '')} {payload.get('detail', '')}"
+            leaked = sorted(n for n in _CANONICAL_ONLY_STATE_NAMES if _mentions(n, shown))
+            at = registry.get(loop_id).state.value
+            assert not leaked, f"{action} on a {at} loop showed {leaked}: {shown}"
+
+    # Non-vacuity. Every assertion above is inside two loops and a `continue`, so a change
+    # that made this surface stop refusing anything at all -- a broken fixture, an action
+    # renamed out from under the sweep -- would leave a green test that checked nothing.
+    # The grid is 8 states by 5 actions and 34 of the 40 cells refuse today; the floor is
+    # set well under that on purpose, because tightening a legal transition is a legitimate
+    # change that moves this number and should not have to edit a test about vocabulary.
+    assert refusals >= 15, f"the sweep only provoked {refusals} refusals; it has gone blind"
+
+
+def _one_loop_in_every_legacy_state(registry) -> dict[LoopState, str]:
+    """One loop per reachable legacy state, for tests that sweep rather than sample.
+
+    CLOSED is absent because it is unreachable by construction: `store.append_event`
+    refuses every event that would arrive there, so there is no sequence of registry calls
+    that would build one. The assertion at the end is what keeps that an active claim --
+    if a tenth LoopState is added, or CLOSED is made reachable, this fails here rather
+    than silently narrowing every sweep built on it.
+    """
+    open_id = registry.open_loop(mrn=MRN_SENTINEL, modality="CT", control_id="C-SWEEP-OPEN")
+
+    scheduled = registry.open_loop(mrn=MRN_SENTINEL, modality="US", control_id="C-SWEEP-SCH-1")
+    registry.schedule(scheduled, control_id="C-SWEEP-SCH-2")
+
+    resulted = registry.open_loop(mrn=MRN_SENTINEL, modality="MR", control_id="C-SWEEP-RES-1")
+    registry.record_result(resulted, obx11="F", control_id="C-SWEEP-RES-2")
+
+    acknowledged = registry.open_loop(mrn=MRN_SENTINEL, modality="XR", control_id="C-SWEEP-ACK-1")
+    registry.record_result(acknowledged, obx11="F", control_id="C-SWEEP-ACK-2")
+    registry.acknowledge(acknowledged, actor="coordinator-a", role="referral_coordinator",
+                         control_id="C-SWEEP-ACK-3")
+
+    cancelled = registry.open_loop(mrn=MRN_SENTINEL, modality="MG", control_id="C-SWEEP-CAN-1")
+    registry.cancel(cancelled, control_id="C-SWEEP-CAN-2")
+
+    orphan = registry.orphan(control_id="C-SWEEP-ORPH", mrn=MRN_SENTINEL,
+                             detail={"modality": "CT"})
+
+    dismissed = registry.orphan(control_id="C-SWEEP-DIS", mrn=MRN_SENTINEL,
+                                detail={"modality": "CT"})
+    registry.dismiss_orphan(dismissed, actor="a", role="referral_coordinator",
+                            reason="another facility")
+
+    # `obx11` is not decoration here: attach_orphan refuses an orphan whose OBX-11 nobody
+    # could read, so an orphan built without one never reaches ATTACHED at all.
+    attached = registry.orphan(control_id="C-SWEEP-ATT", mrn=MRN_SENTINEL,
+                               detail={"modality": "PT", "obx11": "F"})
+    attach_host = registry.open_loop(mrn=MRN_SENTINEL, modality="PT",
+                                     control_id="C-SWEEP-ATT-HOST")
+    registry.attach_orphan(attached, attach_host, actor="a", role="referral_coordinator",
+                           control_id="C-SWEEP-ATT-2")
+
+    loops = {
+        LoopState.OPEN: open_id,
+        LoopState.SCHEDULED: scheduled,
+        LoopState.RESULTED: resulted,
+        LoopState.ACKNOWLEDGED: acknowledged,
+        LoopState.CANCELLED: cancelled,
+        LoopState.ORPHAN: orphan,
+        LoopState.DISMISSED: dismissed,
+        LoopState.ATTACHED: attached,
+    }
+    for state, loop_id in loops.items():
+        assert registry.get(loop_id).state is state, loop_id
+    assert set(loops) == set(LoopState) - {LoopState.CLOSED}
+    return loops
+
+
+def test_the_six_states_with_no_legacy_source_would_pass_through_untranslated():
+    """The hazard the sweep above exists to guard, stated so it cannot be forgotten.
+
+    This is not a bug in `translate_to_legacy` and it must not be `fixed` by inventing
+    legacy names for these six. They have no legacy source because the legacy machine
+    genuinely cannot represent them -- migration.py's docstring spends a paragraph on why
+    -- and a synthesised spelling would be this module asserting that the old model knew
+    something it never knew. The correct guarantee is the one above: no refusal reaching
+    this surface names one. This test records what the consequence would be if that ever
+    stopped being true, so the next reader finds the reasoning rather than a surprise.
+    """
+    for state in WITHOUT_LEGACY_SOURCE:
+        assert translate_to_legacy(f"-> {state.name} refused") == f"-> {state.name} refused"
+    assert {s.name for s in WITHOUT_LEGACY_SOURCE} <= _CANONICAL_ONLY_STATE_NAMES
 
 
 # ---------------------------------------------------------------- reversal
