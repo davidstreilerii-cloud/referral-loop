@@ -152,7 +152,7 @@ from .errors import (
 from .events import Loop, LoopState
 from .migration import translate_to_legacy
 from .pack import RulePack
-from .registry import Registry
+from .registry import CoordinatorActions
 from .staleness import age, is_stale, require_thresholds_accepted, staleness_ratio
 from .store import LoopStore
 
@@ -546,7 +546,19 @@ def _refuse_a_request_this_page_did_not_originate():
     }), 403
 
 
-def create_blueprint(store: LoopStore, registry: Registry, pack: RulePack) -> Blueprint:
+def create_blueprint(
+    store: LoopStore, registry: CoordinatorActions, pack: RulePack
+) -> Blueprint:
+    # `CoordinatorActions`, not `Registry`. A deployment still hands this the one
+    # real registry; the narrowing is about what this module may ask of it, and
+    # it cuts in the direction that matters here. Every route below is a person
+    # at a browser, and the surface admits nothing else: `open_loop`, `schedule`
+    # and `record_result` are not names this file can resolve, so the page cannot
+    # manufacture a clinical event even by accident. A worklist that could open a
+    # loop could put a study in the record no ordering provider ever signed, and
+    # a worklist that could call an ingest method could advance the clinical
+    # watermark on a click -- which is the failure `Registry.acknowledge`
+    # describes and which nothing until now prevented.
     bp = Blueprint("worklist", __name__, url_prefix="/worklist")
     base = "/worklist"
 
@@ -807,7 +819,7 @@ def create_blueprint(store: LoopStore, registry: Registry, pack: RulePack) -> Bl
     return bp
 
 
-def _refused(registry: Registry, loop_id: str, exc: ReferralLoopError, *,
+def _refused(registry: CoordinatorActions, loop_id: str, exc: ReferralLoopError, *,
              explain_preliminary: bool = False):
     """A refused action is a 409 the UI can render, never a 500.
 
@@ -866,7 +878,9 @@ def _recent_merges(store: LoopStore) -> list[dict]:
     ]
 
 
-def create_app(store: LoopStore, registry: Registry, pack: RulePack) -> Flask:
+def create_app(
+    store: LoopStore, registry: CoordinatorActions, pack: RulePack
+) -> Flask:
     app = Flask(__name__)
     # Before the blueprint's own copy, and covering what that one cannot: routing
     # failures, and the /static route Flask registers here rather than there.
@@ -877,7 +891,7 @@ def create_app(store: LoopStore, registry: Registry, pack: RulePack) -> Flask:
 
 def make_worklist_server(
     store: LoopStore,
-    registry: Registry,
+    registry: CoordinatorActions,
     pack: RulePack,
     host: str = "127.0.0.1",
     # 5055, matching cli.py's --worklist-port and the Dockerfile's EXPOSE. This

@@ -128,6 +128,7 @@ import threading
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
+from typing import Protocol
 
 from .audit import (
     ENGINE_ACTOR,
@@ -257,6 +258,209 @@ _CLEARED_ACK = {"ack_by": "", "ack_role": "", "ack_at": ""}
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ------------------------------------------------------------------- surfaces
+#
+# Two protocols over one class, because this class has two callers and they do
+# not share a contract.
+#
+# The seam is not a matter of taste and was not drawn by one. Every public method
+# below falls on one side of a signature test: it either names an `actor` or it
+# does not. The seven that do not are driven by the listener, from an MLLP
+# socket, and each carries a `control_id` because the thing that caused the call
+# was a message -- which is what the duplicate index is keyed on and what the
+# clinical watermark is derived from. The six that do are driven by the worklist,
+# from a browser, and each carries an `actor` and a `role` because the thing that
+# caused the call was a person clicking a button. The split lands the same way
+# whether you sort by caller or by signature, which is the evidence that it is a
+# real seam in the code rather than a grouping imposed on it.
+#
+# `acknowledge` has carried the argument for these protocols in its docstring
+# since it was written: no `message_at`, because a human action is not a message
+# and must not advance the clinical watermark. The reasoning is worth restating
+# because it is the whole point of the file. The watermark is a `max()` over an
+# append-only log and it exists to answer one question -- when did this site last
+# hear from the system that sends these messages. A coordinator clicking
+# acknowledge is not evidence that the RIS is alive; it is evidence that a person
+# is at a desk. Let a human action advance it and the number now answers a
+# question nobody asked, and answers the real one wrongly: a correction arriving
+# tomorrow with an MSH-7 from this morning reads as stale, `StaleMessageError`
+# swallows it, and safety rule 2 stops firing with no test noticing, because
+# nothing that ran was wrong -- the input to it was.
+#
+# That docstring has been true and unenforced for the life of the module. A
+# property in a README is documentation; a property with a failing build is a
+# control, and this package applies that standard to interoperability claims it
+# makes to other people. Applying it inward is the same move: `IngestActions`
+# does not declare `acknowledge`, so a listener holding one cannot reach it, and
+# the type checker says so before the socket does.
+#
+# **Structural, deliberately.** `Registry` inherits neither of these. Inheriting
+# would bind the contract to the class, and the class travels everywhere -- an
+# object that *is* both surfaces by its MRO is an object from which either
+# surface is reachable wherever it lands, which is the situation these protocols
+# exist to end. Binding structurally instead means the contract attaches at the
+# annotation, at the call site, which is the only place it can actually refuse
+# anything. Nothing here changes behaviour: no body moves, no signature changes,
+# no method is removed. The only new thing in the process is what mypy will
+# reject.
+
+
+class IngestActions(Protocol):
+    """What the listener may do to the registry: everything a message can cause.
+
+    Driven by `mllp_server` handing `listener.Handler` a parsed message, so there
+    is no session behind any of it and nobody to name. That absence is the reason
+    none of these takes an `actor` and the reason none may be given one. An
+    `actor` on this surface could only be filled with a constant or with the
+    sending peer's id, and either one writes a name into the audit trail for an
+    action no person took -- which is strictly worse than an anonymous record,
+    because an anonymous record is silent where a fabricated one is confident and
+    wrong.
+
+    The positive half of the contract is `message_at`. These calls do advance the
+    clinical watermark, and should: a message arriving is exactly the evidence
+    that the sending system is alive and current. It is the pairing that matters
+    -- ingest advances the watermark and has no actor, coordination has an actor
+    and does not touch the watermark -- and publishing them as two types is what
+    stops the pair from being separated by an ordinary refactor.
+
+    `future_dated_message_count` is on the surface because `listener.counters`
+    reads it when it prints the ingest counters, and that reporting path is part
+    of what the listener is for. It is an `int` and nothing else; the counters
+    block is pasted into tickets and nothing in it may carry an identifier.
+    """
+
+    future_dated_message_count: int
+
+    def open_loop(
+        self,
+        mrn: str,
+        control_id: str,
+        modality: str = "",
+        placer_order_number: str = "",
+        filler_order_number: str = "",
+        service_code: str = "",
+        ordering_provider: str = "",
+        ordered_at: datetime | None = None,
+        loop_id: str | None = None,
+        message_at: datetime | None = None,
+        submitted_mrn: str = "",
+    ) -> str: ...
+
+    def orphan(
+        self,
+        control_id: str,
+        mrn: str,
+        detail: dict,
+        message_at: datetime | None = None,
+        submitted_mrn: str = "",
+    ) -> str: ...
+
+    def merge_patient(
+        self,
+        prior_mrn: str,
+        surviving_mrn: str,
+        control_id: str,
+        message_at: datetime | None = None,
+    ) -> list[str]: ...
+
+    def schedule(
+        self, loop_id: str, control_id: str, message_at: datetime | None = None
+    ) -> None: ...
+
+    def unschedule(
+        self, loop_id: str, control_id: str, message_at: datetime | None = None
+    ) -> None: ...
+
+    def cancel(
+        self, loop_id: str, control_id: str, message_at: datetime | None = None
+    ) -> None: ...
+
+    def record_result(
+        self,
+        loop_id: str,
+        obx11: str,
+        control_id: str,
+        message_at: datetime | None = None,
+        match_tier: int | None = None,
+        attached_from: str = "",
+    ) -> None: ...
+
+
+class CoordinatorActions(Protocol):
+    """What the worklist may do to the registry: everything a person can cause.
+
+    Every method here is a deliberate act by a named coordinator, and every one
+    either resolves a loop or reverses a resolution -- which is to say, every one
+    of them is precisely the kind of event an audit trail exists to answer for.
+    So each takes an `actor` and a `role`, and the requirement is not a
+    convention: `acknowledge` refuses at runtime when either is empty, on the
+    grounds that a resolution attributed to nobody cannot say who vouched for the
+    match or on what authority. `role` is separate from `actor` because "a
+    coordinator did this" and "a radiologist did this" are different claims about
+    the same act, and only one of them is answerable later if it was never
+    recorded.
+
+    What this surface conspicuously does not offer is `message_at`, and the
+    omission is load-bearing rather than an oversight -- see the module comment
+    above. It also does not offer `open_loop`, `schedule` or `record_result`:
+    the worklist does not invent clinical events. It records what a human
+    concluded about events the feed already delivered, and a page that could
+    manufacture an order would be a page that could put a study in the record
+    that no ordering provider ever signed.
+
+    `get` is here and is the only read in the class. It is exempt from the actor
+    rule because it appends nothing -- there is no record for a name to be
+    missing from -- and it is on this surface rather than shared because the
+    worklist is what renders state after an action. The listener does not read
+    loops back; if it ever needs to, that is a design argument to have out loud,
+    not an import to add quietly.
+    """
+
+    def get(self, loop_id: str) -> Loop: ...
+
+    def acknowledge(
+        self, loop_id: str, actor: str, role: str, control_id: str
+    ) -> None: ...
+
+    def reverse_acknowledgement(
+        self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> None: ...
+
+    def dismiss_orphan(
+        self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> None: ...
+
+    def attach_orphan(
+        self,
+        orphan_id: str,
+        target_loop_id: str,
+        actor: str,
+        role: str,
+        control_id: str = "",
+    ) -> None: ...
+
+    def undo_match(
+        self, loop_id: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> str: ...
+
+    # Published with no caller, deliberately, and the honesty is the point.
+    # `reverse_merge` names an actor, a role and a reason, so by the signature
+    # test that draws this seam it is a coordinator action and nothing else could
+    # be argued from its shape. No route reaches it today -- the worklist exposes
+    # no merge-reversal endpoint -- and the same is true of `cancel` on the ingest
+    # surface, which no listener branch calls. Declaring them on the surface their
+    # signature puts them on is what makes that reachable-from-here-in-principle
+    # rather than unclassified, and it means the day a route is added the contract
+    # is already the right one instead of being chosen under deadline. The
+    # alternative -- a third bucket for "no caller yet" -- would be a place for
+    # methods to sit unexamined, which is how a class gets to fourteen public
+    # methods and two contracts in the first place.
+    def reverse_merge(
+        self, retired_mrn: str, actor: str, role: str, reason: str, control_id: str = ""
+    ) -> list[str]: ...
 
 
 class Registry:

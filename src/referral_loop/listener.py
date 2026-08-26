@@ -151,7 +151,7 @@ from .peers import (
     TRANSPORT_IN_PROCESS,
     PeerIdentity,
 )
-from .registry import CORRECTED, FINAL, PRELIMINARY, Registry
+from .registry import CORRECTED, FINAL, PRELIMINARY, IngestActions
 from .store import Attribution, LoopStore, attributed
 
 logger = logging.getLogger(__name__)
@@ -534,9 +534,29 @@ class MessageHandler:
     express.
     """
 
-    def __init__(self, store: LoopStore, registry: Registry, pack: RulePack):
+    def __init__(self, store: LoopStore, registry: IngestActions, pack: RulePack):
         self.store = store
-        self.registry = registry
+        # `IngestActions`, not `Registry`, and the narrowing is the point rather
+        # than a stylistic preference. A deployment still passes the one real
+        # `Registry` -- it satisfies both surfaces structurally and nothing about
+        # the object changes here. What changes is what this module is able to
+        # ask of it: `acknowledge`, `dismiss_orphan`, `undo_match` and the rest of
+        # the coordinator surface are no longer names this file can resolve, and
+        # a call to one fails the type check rather than the ward.
+        #
+        # The rule being enforced is the one `Registry.acknowledge` has stated in
+        # prose since it was written: a human action must not advance the
+        # clinical watermark, because a coordinator clicking acknowledge is not
+        # evidence that the sending system is alive. Every method reachable
+        # through this annotation takes a `message_at` and is supposed to move
+        # that watermark; every method it hides is a human act that must not. A
+        # handler that could reach both would be one refactor away from stamping
+        # an ack with the arrival time of the message that happened to be in
+        # scope, and the resulting watermark would say the RIS was heard from at
+        # a moment when it was not -- after which a correction arriving with an
+        # earlier MSH-7 reads as stale, gets refused, and safety rule 2 stops
+        # firing without a single test going red.
+        self.registry: IngestActions = registry
         self.pack = pack
         self._lock = threading.RLock()
         # Attributes rather than the constants alone, so a deployment on a small
