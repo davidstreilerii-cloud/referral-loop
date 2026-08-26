@@ -185,3 +185,43 @@ Also: `clock.as_utc` replaces six identical private copies (and the layering cla
 docstring now has a test, which it did not before); every dangling reference to the extracted-from
 codebase is gone from `src/`; the HL7 v2.7 fifth encoding character is named as considered and
 refused rather than implied not to exist; every organization in examples is now Example-prefixed.
+
+## 2026-08-26 — consolidation pass
+
+```
+1930 passed, 5 skipped, 11 deselected in 975.58s (0:16:15)
+Required test coverage of 90.0% reached. Total coverage: 95.87%
+ruff: All checks passed   mypy: no issues in 40 source files
+```
+
+**The transport boundary is now stated.** IHE PCC 360X — the US closed-loop referral standard
+— requires XDM over Direct with C-CDA for a referral that crosses an organizational boundary,
+and names no MLLP transport at any conformance level. Both ends of a loop tracked here have to
+be reachable from one interface engine. That was true before this entry and written down
+nowhere. `docs/STANDARDS_WATCH.md` carries the specifics, including one open question: 360X
+may assign a durable cross-organization referral identifier, which would mean a conformant
+implementation closes loops by carrying an id rather than by matching results to orders. That
+is unconfirmed and recorded as a watch item, not a finding.
+
+Precision that matters and is easy to get backwards: 360X's payloads *are* HL7 v2.5.1. The
+gap is the envelope.
+
+**The ingest/coordinator seam is a type.** `Registry` served two callers with two contracts
+and said so in a comment — a human action must not advance the message watermark. Two
+structural protocols now say it to mypy instead. No existing violation was found, so the
+control was proven by injecting one per side and confirming both are refused.
+
+**The FHIR read client has a caller.** `documents` mode asks whether the far side has filed
+anything nobody sent us, for one patient, read-only by construction. A search cannot move a
+loop, asserted by counting events either side of the call rather than by reading the source.
+
+**The legacy vocabulary boundary is pinned.** It was live, load-bearing, and untested. Six
+canonical states deliberately have no legacy spelling; the guarantee is that no refusal
+reaching the coordinator names one, swept at runtime rather than asserted in a comment.
+
+**Two tests had stopped meaning what their names said**, and both were found by changing
+something nearby rather than by reading them: one pinned the vocabulary translation by
+accident, and one pinned a plan number that survived a correction in an unrelated sentence.
+
+**Published figures no longer carry an exact test count.** It moved six times in a week. The
+dated measurements live here, where being a point-in-time reading is the point.
