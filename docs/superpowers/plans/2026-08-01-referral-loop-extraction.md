@@ -1286,7 +1286,7 @@ gh repo create referral-loop --private --source=. --remote=origin --push
 gh repo view --json name,visibility,defaultBranchRef
 ```
 
-Expected: `{"name":"referral-loop","visibility":"PRIVATE",...}`. **Confirm `PRIVATE`** before doing anything else — this repo contains the eval harness and rule-pack design that §3.1 of the spec identifies as the parts most worth getting right.
+Expected: `{"name":"referral-loop","visibility":"PRIVATE",...}`. **Confirm `PRIVATE`** before doing anything else. At the time this plan ran the repository was not intended to be public, and a visibility mistake is not one you can take back.
 
 - [ ] **Step 8: Confirm CI is green on the pushed branch**
 

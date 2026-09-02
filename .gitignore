@@ -11,3 +11,11 @@ dist/
 # committable by accident.
 data/
 .venv/
+
+# Nothing of these kinds has ever been committed. Belt and braces, because the
+# cost of the first mistake is not recoverable once the repo is public.
+*.db
+*.sqlite3
+*.key
+*.pem
+.env
