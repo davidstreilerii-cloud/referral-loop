@@ -16,7 +16,7 @@
 # holding PHI should change when someone decides it changes. `.github/dependabot.yml`
 # opens a PR when the digest moves, so the decision is prompted rather than
 # forgotten.
-FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
 WORKDIR /app
 
