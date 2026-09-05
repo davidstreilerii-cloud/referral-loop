@@ -70,6 +70,7 @@ and it may never raise the confidence in one it is not.
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import platform
 import subprocess
@@ -162,7 +163,17 @@ def _bitlocker_protecting(db_path: str) -> str | None:
     The drive comes from the path the caller passed in. That sentence is the
     entire fix for the defect this module is named for.
     """
-    drive = os.path.splitdrive(db_path)[0]
+    # `ntpath`, not `os.path`. They are the same module when this branch runs for
+    # real, because `os.path` *is* `ntpath` on Windows -- but only there. On any
+    # other platform `os.path` is `posixpath`, which has no notion of a drive
+    # letter and answers `splitdrive(r"D:\phi\loops.db")` with `('', ...)`, so
+    # this function would return None before asking anything. That is invisible in
+    # production and fatal in a test: two tests that simulate Windows by patching
+    # `platform.system` passed on a win32 developer machine and failed on the Linux
+    # runner, because the simulation could not reach past `os.path`. Naming the
+    # module this branch actually means costs nothing and makes the branch testable
+    # from anywhere.
+    drive = ntpath.splitdrive(db_path)[0]
     if not drive.endswith(":"):
         # No drive letter: a UNC path, or something relative that abspath did
         # not resolve to a local volume. `splitdrive(r"\\\\server\\share\\x")`
@@ -180,7 +191,7 @@ def _bitlocker_protecting(db_path: str) -> str | None:
     system_root = os.environ.get("SystemRoot", "")
     if not system_root:
         return None
-    program = os.path.join(system_root, "System32", "manage-bde.exe")
+    program = ntpath.join(system_root, "System32", "manage-bde.exe")
     if not os.path.isfile(program):
         return None
 

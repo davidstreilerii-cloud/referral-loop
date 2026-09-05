@@ -17,6 +17,7 @@ because it is the first thing they will run.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import socket
 import socketserver
@@ -1404,10 +1405,15 @@ def test_manage_bde_is_invoked_by_absolute_path(monkeypatch):
 
     encryption_check._detect_os_encryption(r"D:\phi\loops.db")
 
+    # `ntpath`, not `os.path`, for the same reason the module under test uses it:
+    # `os.path.isabs(r"C:\Windows\...")` is False on a POSIX runner, and
+    # `os.path.join` there produces forward slashes. Asserting through `os.path`
+    # made this test a win32-only test that claimed to be a general one, and it
+    # failed on CI while passing on the machine it was written on.
     assert calls
     program = calls[0][0]
-    assert os.path.isabs(program), f"{program!r} is resolved by search order, not by path"
-    assert program.lower() == os.path.join(r"C:\Windows", "System32", "manage-bde.exe").lower()
+    assert ntpath.isabs(program), f"{program!r} is resolved by search order, not by path"
+    assert program.lower() == ntpath.join(r"C:\Windows", "System32", "manage-bde.exe").lower()
 
 
 def test_a_windows_volume_that_cannot_be_named_fails_closed(monkeypatch):
