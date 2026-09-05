@@ -23,6 +23,7 @@ the test states.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -1572,6 +1573,40 @@ def read_until_closed(sock: socket.socket, timeout: float = 10.0) -> str:
         buffer += chunk
 
 
+def accepted_once_a_slot_frees(address, message, timeout: float = 10.0):
+    """Connect, retrying until the listener has a slot, and return the live socket.
+
+    A connection cap is released by the *server*, in `shutdown_request`, and a
+    client closing its end does not wait for that to happen. Every test that closes
+    one connection and immediately opens another against `max_connections=1` is
+    therefore racing the release. On an idle developer machine the release wins
+    every time; on a contended CI runner it does not, and the symptom is a refusal
+    of the connection the test expected to be accepted -- one more "Refusing a
+    connection" line in the log than the test has refusals for.
+
+    The socket is returned still open, deliberately. Closing it to reopen a fresh
+    one would re-enter the same race a line later, which is the bug this helper
+    exists to stop being rewritten.
+
+    A listener that is genuinely wedged never yields a slot, so this still fails --
+    it converts a race into a bounded wait, not an assertion into a no-op.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock = socket.create_connection(address, timeout=timeout)
+        try:
+            sock.sendall(message)
+            if "|AA|" in read_ack(sock):
+                return sock
+        except OSError:
+            # A refused connection is closed under the client on Windows, so the
+            # symptom there is a reset rather than an empty read. Both mean "no
+            # slot yet"; neither is a reason to stop retrying.
+            pass
+        sock.close()
+    return None
+
+
 def peer_closed(sock: socket.socket, timeout: float = 10.0) -> bool:
     sock.settimeout(timeout)
     try:
@@ -2486,10 +2521,13 @@ def test_a_slot_is_returned_when_the_connection_ends(handler):
     zero over an afternoon of ordinary traffic -- an outage arriving by way of
     the fix for one."""
     with running_server(handler, max_connections=1) as address:
+        # Retry per iteration: with a cap of one, each close races the next connect,
+        # because the slot comes back on the server's thread and not the client's.
         for index in range(3):
-            with socket.create_connection(address, timeout=10) as sock:
-                sock.sendall(frame(order(f"SEQ{index}", placer=f"P{index}", filler=f"F{index}")))
-                assert "|AA|" in read_ack(sock), f"connection {index} was refused"
+            sock = accepted_once_a_slot_frees(
+                address, frame(order(f"SEQ{index}", placer=f"P{index}", filler=f"F{index}")))
+            assert sock is not None, f"connection {index} was refused"
+            sock.close()
     assert len(loops(handler)) == 3
 
 
@@ -2530,17 +2568,14 @@ def test_a_slot_is_returned_when_the_handler_thread_never_starts(handler, monkey
                 assert peer_closed(doomed, timeout=10)
 
         failing["on"] = False
-        with socket.create_connection(address, timeout=10) as sock:
-            # A refused connection is closed under the client on Windows, so the
-            # symptom of the leak is a reset rather than an empty read. Both are
-            # "no ACK", which is the assertion; catching the OSError here keeps
-            # the failure legible instead of a WinError in a socket helper.
-            try:
-                sock.sendall(frame(order()))
-                ack = read_ack(sock)
-            except OSError:
-                ack = ""
-            assert "|AA|" in ack, (
+        # The three doomed accepts each took a slot in `verify_request` and give it
+        # back in `shutdown_request`, on the server's thread. Retrying absorbs that
+        # lag; a slot that never comes back is the leak, and still fails below.
+        sock = accepted_once_a_slot_frees(address, frame(order()))
+        with contextlib.ExitStack() as stack:
+            if sock is not None:
+                stack.enter_context(contextlib.closing(sock))
+            assert sock is not None, (
                 "the listener is at its connection cap with nothing connected: every "
                 "accept whose thread failed to start kept its slot"
             )
@@ -2573,9 +2608,29 @@ def test_a_refused_connection_does_not_return_a_slot_it_never_took(handler):
                 with socket.create_connection(address, timeout=10) as refused:
                     assert peer_closed(refused, timeout=10), "the cap should have refused this"
 
-        with socket.create_connection(address, timeout=10) as first:
-            first.sendall(frame(order("SECOND", placer="P2", filler="F2")))
-            assert "|AA|" in read_ack(first), "the accept loop did not survive the refusals"
+        # The holder's slot is returned by the *server*, in `shutdown_request`, and
+        # the client closing its end does not wait for that. On an unloaded machine
+        # the release wins the race to the next connect; on a contended CI runner it
+        # does not, and this test failed there while passing here -- the connection
+        # it expects to be accepted was refused because the server had not released
+        # yet. The log showed four refusals where the test makes three.
+        #
+        # So: retry until the slot comes back, bounded, and *hold* the connection
+        # that succeeds. Closing it to open a fresh one would re-enter the same race
+        # one line further down. A genuinely dead accept loop never succeeds and
+        # still fails here, which is the property this test is for.
+        deadline = time.monotonic() + 10.0
+        first = None
+        while first is None and time.monotonic() < deadline:
+            attempt = socket.create_connection(address, timeout=10)
+            attempt.sendall(frame(order("SECOND", placer="P2", filler="F2")))
+            if "|AA|" in read_ack(attempt):
+                first = attempt
+            else:
+                attempt.close()
+        assert first is not None, "the accept loop did not survive the refusals"
+
+        with first:
             with socket.create_connection(address, timeout=10) as second:
                 assert peer_closed(second, timeout=10), (
                     "the cap admitted two connections where it allows one: the refusals "
