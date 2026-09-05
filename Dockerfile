@@ -14,8 +14,11 @@
 # The cost is that base-image security patches now require a deliberate bump
 # rather than arriving on the next build. That is the intended trade: an image
 # holding PHI should change when someone decides it changes. `.github/dependabot.yml`
-# opens a PR when the digest moves, so the decision is prompted rather than
-# forgotten.
+# opens a PR when the digest moves under this tag, so the decision is prompted
+# rather than forgotten -- and it is configured to ignore major and minor bumps of
+# the interpreter, because those are decisions to take on purpose rather than PRs
+# to merge. The first version of that file did not say so, and proposed 3.14 within
+# two minutes of the repository going up.
 FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 
 WORKDIR /app

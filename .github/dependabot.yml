@@ -3,22 +3,43 @@
 # problem into a prompted decision.
 version: 2
 updates:
+  # Digest and patch moves only. The first run of this file proposed
+  # python:3.12-slim -> 3.14-slim within two minutes, which is the opposite of what
+  # the Dockerfile argues for: an image holding PHI should change when someone
+  # decides it changes, and a major interpreter bump is a decision, not a patch.
+  # Ignoring major and minor leaves exactly the case the pin created -- the digest
+  # moving under a tag that has not changed -- which is the one nobody would notice.
+  # A deliberate interpreter upgrade is a thing to do on purpose, not to merge.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
     commit-message:
       prefix: "chore(docker)"
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
 
+  # One runtime dependency, deliberately bounded in pyproject. A major bump there
+  # is a compatibility decision about the only third-party code in the image, so it
+  # is prompted by a security advisory rather than by a release.
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      - dependency-name: "cryptography"
+        update-types:
+          - "version-update:semver-major"
 
   # The workflow pins actions by major tag (actions/checkout@v4). Those move too,
-  # and a compromised action runs with the workflow's permissions.
+  # and a compromised action runs with the workflow's permissions. Majors are left
+  # enabled here on purpose: an action's major bump is usually a runner or Node
+  # change, it is cheap to evaluate, and CI proves it before anything merges.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
